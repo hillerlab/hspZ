@@ -10,12 +10,16 @@
 # Never convert this to `pull_request_target`: that hands over the repo token as well.
 # To GPU-validate a fork contribution, push its branch into this repo
 # (`gh pr checkout N && git push origin HEAD:pr/N`) and let the push trigger run a ref you own.
+#
+# DEACTIVATED: no runner is registered, and GitHub warns that self-hosted runners on public
+# repos can be attacked via fork PRs. push/pull_request triggers are disabled until a runner
+# exists; re-enable by uncommenting, and re-read the SECURITY note above before doing so.
 name: gpu-zluda
 
 on:
-  push:
-    branches: [main]
-  pull_request:
+  # push:
+  #   branches: [main]
+  # pull_request:
   workflow_dispatch:
 
 permissions:
