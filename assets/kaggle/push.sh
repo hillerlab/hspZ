@@ -75,6 +75,7 @@ if [ "${WAIT:-0}" = 1 ]; then
     for _ in $(seq 1 240); do
         sleep 60
         status=$(kaggle kernels status "$KERNEL" 2>&1 || true)
+        status=${status,,}
         echo "  $status"
         case $status in
             *complete*) break ;;
