@@ -28,6 +28,7 @@ import time
 WORK = pathlib.Path("/kaggle/working")
 LOGS = WORK / "logs"
 SRC = pathlib.Path("/kaggle/tmp/hspZ")
+SRCS = {}
 SCRATCH = pathlib.Path("/kaggle/tmp/bench")
 DATASET = pathlib.Path(
     os.environ.get("HSPZ_DATASET", "/kaggle/input/hspz-multigpu-benchmark")
