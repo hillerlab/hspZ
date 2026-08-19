@@ -21,7 +21,6 @@ import os
 import pathlib
 import resource
 import shutil
-import statistics
 import subprocess
 import time
 
@@ -30,6 +29,7 @@ LOGS = WORK / "logs"
 SRC = pathlib.Path("/kaggle/tmp/hspZ")
 SRCS = {}
 SCRATCH = pathlib.Path("/kaggle/tmp/bench")
+SMI_TIME = "%Y/%m/%d %H:%M:%S"
 DATASET = pathlib.Path(
     os.environ.get("HSPZ_DATASET", "/kaggle/input/hspz-multigpu-benchmark")
 )
@@ -368,6 +368,15 @@ def small_workloads():
         )
     print(f"small workloads available: {[w[0] for w in found]}", flush=True)
     return found
+
+
+BENCH = WORK / "benchmark.tsv"
+CORR = WORK / "correctness.tsv"
+BENCH_COLS = ["stage", "arm", "variant", "gpus", "wall_ms", "core_ms", "gpu_ms", "rss_kb",
+              "hsps", "distinct", "digest", "ref_bins", "query_bins", "work_units", "max_hits",
+              "prefetch", "threads", "host_est_mib", "device_seeds", "async_seed_upload",
+              "seed_uploads", "seed_cpu_ms", "seed_exposed_ms", "seed_h2d_ms",
+              "seed_h2d_exposed_ms", "seed_device_ms", "seed_count_ms", "t0", "t1"]
 
 
 def row(**kw):
