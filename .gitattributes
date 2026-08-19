@@ -1,0 +1,8 @@
+*.patch linguist-language=cuda
+*.cu linguist-language=cuda
+*.cuh linguist-language=cuda
+*.cui linguist-language=cuda
+*.cuo linguist-language=cuda
+
+Cargo.toml linguist-language=rust
+Cargo.lock linguist-language=rust

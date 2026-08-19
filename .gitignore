@@ -1,0 +1,26 @@
+/target
+/.oxide-artifacts
+
+# cargo-oxide drops the device IR and PTX next to the manifest
+*.ll
+*.ptx
+
+# benchmark input data and result sets are large generated artifacts
+/bench
+/results
+
+# python bytecode caches
+__pycache__/
+*.pyc
+
+# ruff cache
+.ruff_cache/
+
+# vim swap files
+.*.swp
+
+# local working plan, intentionally untracked
+PLAN.md
+
+# agent worktrees and scratch
+.claude/

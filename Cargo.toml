@@ -1,0 +1,78 @@
+[package]
+name = "hspz"
+authors = ["Alejandro Gonzales-Irribarren <alejandrxgzi@gmail.com>"]
+version = "0.0.1"
+edition = "2024"
+license = "GPL-3.0"
+description = "GPU-accelerated high-scoring ungapped alignment pair backend"
+repository = "https://github.com/alejandrogzi/hspZ"
+homepage = "https://github.com/alejandrogzi/hspZ"
+readme = "README.md"
+keywords = ["bioinformatics", "assembly", "genome", "alignment"]
+
+[workspace]
+
+[[bin]]
+name = "hspZ"
+path = "src/main.rs"
+
+[dependencies]
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git" }
+clap = { version = "4", features = ["derive"] }
+memchr = "2"
+flate2 = "1"
+twobit = "0.2.2"
+tar = "0.4.46"
+
+[features]
+default = ["simd-prelude"]
+
+# Benchmark-only find_hsps counters. Never time a build with this
+# on — per-hit stores and per-tile increments shift register pressure.
+counters = []
+
+# Native-NVIDIA validation variants. The default build is always production
+# behaviour; these are opt-in and meant to be enabled one at a time, each into its
+# own target dir. Every one of them lost or was unreachable under ZLUDA, so none is
+# a production change.
+#
+# Drop the two proven-dead bounds checks in find_num_hits (ZLUDA: +0.7%).
+nvidia-find-num-unchecked = []
+# Skip the dead memsets on d_seeds/d_hit_num (ZLUDA: stage win, run noise).
+nvidia-uninit-seed-buffers = []
+
+# Generate the stable query seed stream on the device. The check variant copies
+# it back and compares every u64 against the CPU oracle. The seeding path is
+# chosen at *runtime* on the worker count, so this no longer gates it — both
+# paths are always compiled. Kept because `device-seeds-check` depends on it and
+# to keep older invocations building.
+device-seeds = []
+device-seeds-check = ["device-seeds"]
+
+# Reject low-scoring hits inside find_hsps with the existing warp-coalesced
+# access pattern before running the full materializer.
+warp-score-gate = []
+
+# Store 8-byte anchors, compact score-gate survivors in stable hit order, and
+# run the unchanged materializer only on that dense list.
+dense-anchors = ["warp-score-gate"]
+
+# Score the first 64 left bases as 32 adjacent pairs.
+left-pair-tile = ["dense-anchors"]
+
+# Score 32 right + 64 left as packed 4-base groups in one warp
+# (lanes 0-7 / 8-23), width-8 and width-16 scans.
+simd-prelude = ["left-pair-tile"]
+
+[profile.release]
+# `debug = 1` used to live here; `strip = true` discards it immediately, so it only cost
+# build time (70 s -> 43 s once removed). The two container integrity gates do not need it:
+# `strings` finds the embedded PTX in .rodata and `nm -D` reads .dynsym, and a stripped
+# binary keeps both. Trade-off accepted with `strip = true`: panic backtraces have no
+# symbol names. `strip = "debuginfo"` keeps them for +308 KB if that is ever wanted.
+lto = true
+opt-level = 3
+codegen-units = 1
+strip = true

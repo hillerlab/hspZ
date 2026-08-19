@@ -1,0 +1,84 @@
+# GPU correctness on a self-hosted AMD box via ZLUDA.
+#
+# This is the only place `assets/tests/parity.sh` can run: it needs the KegAlign oracle binary,
+# which no hosted runner has. It is therefore the only workflow that answers "are the HSPs still
+# identical to the C++ reference", and it is free and unlimited.
+#
+# SECURITY, non-negotiable. A self-hosted runner that executes pull-request code from a fork is
+# arbitrary code execution on the workstation. The job-level `if` below is the control -- not the
+# repository's "require approval" setting, because an approved fork PR would still run here.
+# Never convert this to `pull_request_target`: that hands over the repo token as well.
+# To GPU-validate a fork contribution, push its branch into this repo
+# (`gh pr checkout N && git push origin HEAD:pr/N`) and let the push trigger run a ref you own.
+#
+# DEACTIVATED: no runner is registered, and GitHub warns that self-hosted runners on public
+# repos can be attacked via fork PRs. push/pull_request triggers are disabled until a runner
+# exists; re-enable by uncommenting, and re-read the SECURITY note above before doing so.
+name: gpu-zluda
+
+on:
+  # push:
+  #   branches: [main]
+  # pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-zluda-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zluda:
+    # Same-repo only. A fork PR must never reach the workstation.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: [self-hosted, linux, x64, zluda]
+    timeout-minutes: 120
+    env:
+      CUDACONDA: /home/alejandro/opt/cudaconda
+      ZLUDA: /home/alejandro/opt/zluda
+      HIPFIX: /home/alejandro/opt/zluda-guide/hipfix.so
+      KEGALIGN: /tmp/kegalign/build/kegalign
+      TESTDATA: /tmp/kegalign/test-data
+      # Outside the workspace on purpose: actions/checkout runs `git clean -ffdx`, which would
+      # throw away the incremental build on every run.
+      CARGO_TARGET_DIR: /home/alejandro/.cache/hspZ-ci-target
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: build
+        run: |
+          export CUDA_HOME="$CUDACONDA" LD_LIBRARY_PATH="$ZLUDA:$CUDACONDA/lib"
+          cargo oxide build -- --release --locked
+          strings -n 6 "$CARGO_TARGET_DIR/release/hspZ" | grep -qx '.target sm_80' \
+            || { echo "::error::expected sm_80 PTX -- is .cargo/cuda-oxide.toml present?"; exit 1; }
+
+      # parity.sh runs `cargo oxide test` as its own first check, then 19 in total.
+      #
+      # It can exit 0 while checks did not pass: its ENV class (an intermittent oracle SIGABRT
+      # in Thrust's device_vector destructor at exit) is counted separately and does not set a
+      # failure status. So assert the literal summary line, and retry ONLY when the environment
+      # count is non-zero -- never on a real FAIL.
+      - name: oracle parity (19 checks)
+        run: |
+          export HSPZ="$CARGO_TARGET_DIR/release/hspZ"
+          ok=
+          for try in 1 2; do
+            bash assets/tests/parity.sh 2>&1 | tee /tmp/parity.log
+            if grep -Eq '^19 passed, 0 failed, 0 environment' /tmp/parity.log; then ok=1; break; fi
+            grep -Eq '^[0-9]+ passed, 0 failed, [1-9]' /tmp/parity.log \
+              || { echo "::error::real parity failure"; break; }
+            echo "::warning::oracle environment abort, retry $try"
+          done
+          tail -3 /tmp/parity.log >> "$GITHUB_STEP_SUMMARY"
+          test -n "$ok"
+
+      - name: zluda image + full smoke
+        run: |
+          docker build -f assets/container/Dockerfile --target zluda -t hspz:zluda-ci \
+            --build-arg GIT_SHA="${GITHUB_SHA::7}" .
+          FULL=1 assets/container/smoke.sh zluda hspz:zluda-ci

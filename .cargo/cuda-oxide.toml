@@ -1,0 +1,4 @@
+# sm_80 is a supported cuda-oxide target and exactly what ZLUDA's bundled ptxas
+# expects, so a bare `cargo oxide build` produces an artifact both backends can
+# load. The container build overrides this per stage with an explicit --arch.
+default-arch = "sm_80"

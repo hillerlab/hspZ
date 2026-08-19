@@ -1,0 +1,116 @@
+# GPU correctness on NVIDIA T4s, using the free Kaggle allowance (30 h/week).
+#
+# Releases run `fast` (the six-pair sweep plus a 1,2,2,1 two-GPU set on a 49-work-unit pair).
+# Anything else is opt-in: `workflow_dispatch` on a ref you choose, or a same-repo pull request
+# labelled `kaggle-sweep`.
+#
+# Why not every pull request: the 12-minute figure is compute only. Add the cold cargo-oxide +
+# hspZ build the kernel does from a clean clone (~6.5 min) and Kaggle's queue (over 20 minutes,
+# observed) and a sweep is 30-45 minutes of wall-clock before it says anything. Budget is not the
+# constraint -- ~90 sweeps/week fit -- latency is. `gpu-zluda.yml` on the self-hosted box is the
+# fast PR gate, and it runs the oracle, which Kaggle cannot.
+#
+# Fork pull requests cannot use this and no trick makes it safe: GitHub withholds secrets from
+# fork PRs by design, and `pull_request_target` would hand Kaggle credentials to untrusted code.
+# For a fork contribution, a maintainer runs workflow_dispatch on the merge commit.
+name: gpu-kaggle
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      stage:
+        description: which Kaggle stage to run
+        type: choice
+        default: sweep
+        options: [sweep, fast]
+
+  # Opt-in per PR. Uncomment to enable; the `if` below already restricts it to same-repo
+  # branches carrying the label, so enabling costs nothing else.
+  # pull_request:
+  #   types: [labeled]
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.label.name == 'kaggle-sweep' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    # The kernel slug is ONE mutable resource. Two concurrent pushes clobber each other and
+    # `kernels output` then returns the wrong run's files, so this group is global -- not
+    # per-ref -- and never cancels a run that is already burning quota.
+    concurrency:
+      group: kaggle-kernel
+      cancel-in-progress: false
+    # Secrets live in an environment whose deployment branches are limited to main and v*, so no
+    # branch can spend the weekly allowance by accident.
+    environment: kaggle
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      STAGE: ${{ github.event_name == 'release' && 'fast' || (inputs.stage || 'sweep') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # push.sh refuses a SHA that is on no remote branch (a guard that exists because a kernel
+      # once died 2.4 s in on `git checkout <sha>`), and a fresh CI clone has no refs/remotes/*.
+      - name: give the remote-branch guard something to see
+        run: git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install --no-cache-dir kaggle
+
+      - name: push the kernel, wait, collect
+        run: WAIT=1 assets/kaggle/push.sh "$STAGE"
+
+      # Kaggle reports a kernel "complete" even when its own gates recorded FAIL, because the
+      # kernel records a verdict and keeps going. So read the verdicts, and assert there are
+      # enough of them -- a kernel that died before its first gate would otherwise look clean.
+      - name: gate on the kernel's verdicts
+        run: |
+          d=results/kaggle/$STAGE
+          test -s "$d/correctness.tsv" \
+            || { echo "::error::no correctness.tsv -- the kernel died before any gate ran"; exit 1; }
+          n=$(tail -n +2 "$d/correctness.tsv" | grep -c .)
+          echo "$n verdicts recorded"
+          test "$n" -ge 6 || { echo "::error::only $n verdicts, expected at least 6"; exit 1; }
+          bad=$(awk -F'\t' 'NR>1 && $2!="EXACT" && $2!="PASS"' "$d/correctness.tsv")
+          test -z "$bad" || { printf '%s\n' "$bad"; echo "::error::a non-EXACT verdict"; exit 1; }
+          { echo "### Kaggle $STAGE"; sed -n '1,60p' "$d/report.md"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kaggle-${{ env.STAGE }}
+          path: results/kaggle/${{ env.STAGE }}
+
+  # Move the floating tags only once a real T4 has agreed. Seconds, and no rebuild.
+  promote:
+    if: github.event_name == 'release'
+    needs: gpu
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: promote :latest and :zluda
+        run: |
+          I=ghcr.io/hillerlab/hspz
+          V=${GITHUB_REF_NAME#v}
+          docker buildx imagetools create -t "$I:latest" "$I:$V"
+          docker buildx imagetools create -t "$I:zluda"  "$I:$V-zluda"
