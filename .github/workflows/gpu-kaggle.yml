@@ -52,8 +52,11 @@ jobs:
     # branch can spend the weekly allowance by accident.
     environment: kaggle
     env:
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      # The modern kaggle CLI (>= 2.0) authenticates with the OAuth-style access token
+      # from kaggle.com/settings/api ("Generate New Token"); the legacy username/key
+      # pair is rejected by the API. The token is re-issued on regeneration, so renew
+      # this secret whenever the settings page's token is re-generated.
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       STAGE: ${{ github.event_name == 'release' && 'fast' || (inputs.stage || 'sweep') }}
     steps:
       - uses: actions/checkout@v4
