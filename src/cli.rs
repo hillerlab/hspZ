@@ -16,8 +16,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "hspZ",
-    version,
-    about = "KegAlign Seed + Filter, Rust + cuda-oxide"
+    version = env!("CARGO_PKG_VERSION"),
+    about = "GPU-accelerated high-scoring ungapped alignment pair backend",
+    author = env!("CARGO_PKG_AUTHORS")
 )]
 pub(crate) struct Cli {
     #[command(subcommand)]
