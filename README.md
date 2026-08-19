@@ -1,6 +1,8 @@
 > [!WARNING]
 > This is a preview release, use at your own risk.
 
+---
+
 <p align="center">
   <p align="center">
     <img width=100 align="center" src="./assets/figures/hz.png" >
