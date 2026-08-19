@@ -1,0 +1,29 @@
+KegAlign `find_hsps` reads `r_chr` and `q_chr` before they are ever assigned.
+
+Both are declared once outside the seed-hit loop and only written inside the
+`if (in bounds)` guard, so on each warp's first hit every lane that falls off the
+end of a sequence indexes `count[]` / `count_del[]` with an uninitialised `char`.
+Those arrays are `short[4]`; any index above 3 writes out of bounds and corrupts
+whatever the compiler placed next to them. The corrupted counters feed the
+entropy correction, so a few HSPs come out with scores that depend on register
+residue — adding an unrelated `__shared__` variable is enough to change them.
+
+This is the only behavioural difference between KegAlign and hspz. hspz
+implements the defined behaviour; apply this to make the two agree exactly.
+
+Reproduce: `tests/parity.sh`. Without the patch the `repeat` fixture differs by
+one HSP (3764 vs 3747); with it, every fixture is byte-identical.
+
+--- a/src/seed_filter.cu
++++ b/src/seed_filter.cu
+@@ -263,8 +263,8 @@
+     int temp;
+     short count[4];
+     short count_del[4];
+-    char r_chr;
+-    char q_chr;
++    char r_chr = 0;
++    char q_chr = 0;
+     uint32_t ref_pos;
+     uint32_t query_pos;
+     int pos_offset;

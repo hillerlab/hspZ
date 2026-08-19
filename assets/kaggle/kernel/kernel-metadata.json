@@ -1,0 +1,17 @@
+{
+  "id": "alejandrogzi/hspz-multigpu",
+  "title": "hspz-multigpu",
+  "code_file": "run.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": true,
+  "enable_gpu": true,
+  "enable_internet": true,
+  "dataset_sources": [
+    "alejandrogzi/hspz-multigpu-benchmark",
+    "alejandrogzi/hspz-bench-workloads"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "machine_shape": "NvidiaTeslaT4"
+}
