@@ -1,0 +1,103 @@
+# Publish the container images to GHCR. Releases only.
+#
+# Immutable version tags are pushed as soon as they build. The floating tags -- :latest and
+# :zluda -- are moved separately by `gpu-kaggle.yml`, only after the T4 validation passes.
+#
+# Publishing deliberately does NOT wait on Kaggle. Kaggle is an external queue with a weekly
+# quota; a queued job has been observed sitting for over 20 minutes, and any Kaggle-side flake
+# (quota exhausted, machine_shape silently downgraded, dataset not mounted) would block a release
+# for reasons unrelated to this code. That is how people learn to bypass CI. So: anyone who wants
+# the exact release can pull :0.0.1 in twenty minutes, and nobody following :latest ever gets an
+# image whose GPU validation did not pass.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Hardcoded lowercase: GHCR rejects uppercase, and ${{ github.repository }} is hillerlab/hspZ.
+  IMAGE: ghcr.io/hillerlab/hspz
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: nvidia
+            suffix: ''
+          - target: zluda
+            suffix: '-zluda'
+    steps:
+      - uses: actions/checkout@v4
+      - name: reclaim disk (the ROCm base is large)
+        if: matrix.target == 'zluda'
+        run: sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet
+      - uses: docker/setup-buildx-action@v3
+
+      # Cargo.toml is the source of truth; a release tag that disagrees with it is a mistake
+      # worth catching before a 20-minute build, not after.
+      - id: v
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          if [ "${{ github.event_name }}" = release ]; then
+            test "v$v" = "${{ github.event.release.tag_name }}" \
+              || { echo "::error::tag ${{ github.event.release.tag_name }} != Cargo.toml $v"; exit 1; }
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      # Build and load first; push only after the no-GPU checks pass.
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: assets/container/Dockerfile
+          target: ${{ matrix.target }}
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE }}:${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            HSPZ_VERSION=${{ steps.v.outputs.version }}
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      - name: no-GPU image checks
+        run: |
+          img=${{ env.IMAGE }}:${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          docker run --rm --entrypoint sh "$img" -c \
+            'test -x /usr/local/bin/hspZ && test -s /opt/hspZ/fixtures/repeat.ref.fa \
+             && cat /usr/local/share/hspZ/cuda-oxide.sha'
+          if docker run --rm "$img" --help; then echo "::error::expected a non-zero exit without a GPU"; exit 1; fi
+          docker run --rm "$img" --help 2>&1 | grep -qE 'no NVIDIA driver|/dev/kfd'
+          docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' "$img" \
+            | grep -qx '${{ steps.v.outputs.version }}'
+
+      - uses: docker/login-action@v3
+        if: github.event_name == 'release'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: push the immutable tags
+        if: github.event_name == 'release'
+        run: |
+          v=${{ steps.v.outputs.version }}${{ matrix.suffix }}
+          docker push "${{ env.IMAGE }}:$v"
+          # a sha tag as well, so an image is traceable to a commit even if the tag moves
+          docker tag  "${{ env.IMAGE }}:$v" "${{ env.IMAGE }}:sha-${GITHUB_SHA::7}${{ matrix.suffix }}"
+          docker push "${{ env.IMAGE }}:sha-${GITHUB_SHA::7}${{ matrix.suffix }}"

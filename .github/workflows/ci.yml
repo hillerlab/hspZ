@@ -1,0 +1,139 @@
+# Always-on gate. No GPU anywhere in this file.
+#
+# The toolchain is NOT described here. `assets/container/Dockerfile`'s builder stage already
+# pins the nightly, extracts the cargo-oxide revision out of Cargo.lock, installs the CUDA 12.4
+# redistributables and asserts CUDA_VERSION 12040 — so this workflow builds that stage and runs
+# the checks inside it. Restating any of it in YAML would create a second source of truth that
+# drifts from the image users actually pull, and building the stage means every push proves the
+# container still builds.
+#
+# `fmt` is deliberately split out: it is the gate most likely to trip and the only one that
+# needs no CUDA environment, so it must not cost a 15-minute image build to discover.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: install the pinned toolchain (read from rust-toolchain.toml)
+        run: |
+          ch=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)
+          test -n "$ch"
+          rustup toolchain install --profile minimal --component rustfmt "$ch"
+      - run: cargo fmt --all --check
+
+  version:
+    name: version consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo.toml is the single source of truth. The Dockerfile's ARG default exists so a
+      # manual `docker build` still labels the image correctly; this keeps the two from
+      # drifting, on every PR, when the fix is one line.
+      - run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)
+          d=$(sed -n 's/^ARG HSPZ_VERSION=\(.*\)$/\1/p' assets/container/Dockerfile | sort -u)
+          echo "Cargo.toml=$v  Dockerfile=$d"
+          test "$(printf '%s' "$d" | grep -c .)" -eq 1 || { echo "::error::Dockerfile has conflicting HSPZ_VERSION defaults"; exit 1; }
+          test "$v" = "$d" || { echo "::error::Cargo.toml $v != Dockerfile $d"; exit 1; }
+
+  gate:
+    name: clippy + unit tests
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # Building this stage IS the integrity gate. It re-runs, on every push:
+      #   - CUDA_VERSION 12040 assertion (the ~550 driver floor)
+      #   - cargo-oxide pinned to the SHA inside Cargo.lock, with --locked
+      #   - `strings | grep ".target sm_XX"` per architecture
+      #   - the nm allowlist proving no post-CUDA-4.0 _v2 driver symbol crept in
+      - name: build the builder stage
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: assets/container/Dockerfile
+          target: builder
+          load: true
+          tags: hspz-builder:ci
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      # `cargo oxide` has no clippy subcommand, and plain `cargo clippy` works because check
+      # does not link — the `undefined cuda_oxide_artifact_anchor_*` failure that kills
+      # `cargo build` is a link error. It still needs CUDA_HOME and libclang, because
+      # cuda-bindings' build script runs during check, which is why it runs in the container.
+      - name: clippy
+        run: docker run --rm hspz-builder:ci cargo clippy --all-targets --locked -- -D warnings
+
+      # The 71 unit tests are pure CPU logic, but the binary has libcuda.so.1 as a DT_NEEDED
+      # and the CUDA redistributable ships only the unversioned stub — so without this symlink
+      # the test binary dies in the loader before main(). No GPU is required, only a resolvable
+      # loader path.
+      - name: unit tests
+        run: |
+          docker run --rm hspz-builder:ci bash -euc '
+            s=$(ls -d "$CUDA_HOME"/lib*/stubs | head -1)
+            ln -sf "$s/libcuda.so" "$s/libcuda.so.1"
+            export LD_LIBRARY_PATH="$s:${LD_LIBRARY_PATH:-}"
+            cargo oxide test -- --release --locked'
+
+  images:
+    name: images build
+    needs: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [nvidia, zluda]
+    steps:
+      - uses: actions/checkout@v4
+      - name: reclaim disk (the ROCm base is large)
+        if: matrix.target == 'zluda'
+        run: sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: assets/container/Dockerfile
+          target: ${{ matrix.target }}
+          load: true
+          push: false
+          tags: hspz:${{ matrix.target }}-ci
+          build-args: GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=builder
+          cache-to: type=gha,mode=max,scope=builder
+
+      # The image checks that mean something without a GPU: the binary and the baked fixtures
+      # are present, and the entrypoint refuses a driverless run with a message that says why
+      # rather than a bare loader error.
+      - name: no-GPU image checks
+        run: |
+          img=hspz:${{ matrix.target }}-ci
+          docker run --rm --entrypoint sh "$img" -c \
+            'test -x /usr/local/bin/hspZ && test -s /opt/hspZ/fixtures/repeat.ref.fa \
+             && test -s /opt/hspZ/fixtures/multi.qry.fa && cat /usr/local/share/hspZ/cuda-oxide.sha'
+          if docker run --rm "$img" --help; then echo "::error::expected a non-zero exit without a GPU"; exit 1; fi
+          docker run --rm "$img" --help 2>&1 | grep -qE 'no NVIDIA driver|/dev/kfd'
+          test '${{ matrix.target }}' != zluda || \
+            docker run --rm --entrypoint sh "$img" -c 'test -e /opt/zluda/libcuda.so.1'
