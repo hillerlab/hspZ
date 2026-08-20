@@ -25,11 +25,22 @@ hspZ: no NVIDIA driver in this container (libcuda.so.1 is absent).
 
   The NVIDIA Container Toolkit injects the host driver only when you pass --gpus:
 
-      docker run --rm --gpus all -v "\$PWD:/data" <image> run -r REF.fa -q QRY.fa -o out/
+      docker run --rm --gpus all -v "\$PWD:/data" <image> hspZ run -r REF.fa -q QRY.fa -o out/
+      docker run --rm --gpus all -v "\$PWD:/data" <image>     run -r REF.fa -q QRY.fa -o out/
 
   This image is the NVIDIA build. For AMD via ZLUDA use the :zluda tag, which instead wants
   --device=/dev/kfd --device=/dev/dri --group-add video --group-add render.
 MSG
     exit 1
 fi
-exec hspZ "$@"
+
+# Pass-through dispatch: nextflow launches the container as `bash -c "<task>"`, operators
+# invoke `hspZ run ...` or `run ...`, and the CI checks `--help` — all three must reach the
+# right binary without hspZ being the ENTRYPOINT (an hspZ entrypoint would eat nextflow's
+# `bash` argument and die on "unrecognized subcommand").
+case "${1:-}" in
+    hspZ)                      shift; exec hspZ "$@" ;;
+    run|benchmark|compare|--help|--version|-h|-V)
+                               exec hspZ "$@" ;;
+    *)                         exec "$@" ;;
+esac

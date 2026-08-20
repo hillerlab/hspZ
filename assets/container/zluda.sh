@@ -30,4 +30,14 @@ if [ ! -e /dev/kfd ]; then
     exit 1
 fi
 
-exec hspZ "$@"
+# Pass-through dispatch: nextflow launches the container as `bash -c "<task>"`, operators
+# invoke `hspZ run ...` or `run ...`, and the CI checks `--help` — all three must reach the
+# right binary without hspZ being the ENTRYPOINT (an hspZ entrypoint would eat nextflow's
+# `bash` argument and die on "unrecognized subcommand"). LD_LIBRARY_PATH above is inherited
+# by whatever is exec'd, so the task shell gets ZLUDA's libcuda.so.1 too.
+case "${1:-}" in
+    hspZ)                      shift; exec hspZ "$@" ;;
+    run|benchmark|compare|--help|--version|-h|-V)
+                               exec hspZ "$@" ;;
+    *)                         exec "$@" ;;
+esac

@@ -36,6 +36,24 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.2] — 2026-08-20
+
+Container and nextflow integration fixes.
+
+- **Pass-through entrypoint shims** — `nvidia.sh` and `zluda.sh` no longer
+  `exec hspZ` unconditionally. They keep the driver/KFD checks, then dispatch:
+  a leading `hspZ` is stripped, known hspZ invocations (`run`, `benchmark`,
+  `compare`, `--help`, `--version`) go straight to the binary, and anything
+  else — nextflow's `bash -c "<task>"` launcher, `sh`, ad-hoc shells — is
+  exec'd as-is. hspZ stays a plain `/usr/local/bin/hspZ` binary and is not the
+  container ENTRYPOINT, so pipelines that call `hspZ run ...` inside the
+  container work without `--entrypoint ''` overrides.
+- **smoke.sh** — new `hspZ run` arm on the frozen `repeat` fixture (57 HSPs,
+  digest `d01edd2118cf5fa5`), locking the nextflow-style invocation to the
+  same answer as the bare `run` form.
+- **Formatting** — `assets/container/*` re-wrapped for readability; the
+  Dockerfile change is whitespace-only.
+
 ## [0.0.1] — 2026-08-19
 
 First preview release. hspZ is a standalone, GPU-accelerated replacement for
