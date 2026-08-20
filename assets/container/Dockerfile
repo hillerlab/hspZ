@@ -170,7 +170,7 @@ FROM rocm/dev-ubuntu-24.04:6.2 AS zluda
 ARG ZLUDA_VERSION=v6
 ARG ZLUDA_ASSET=zluda-linux-3fe12063.tar.gz
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.1
+ARG HSPZ_VERSION=0.0.2
 
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
