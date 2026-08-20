@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Container smoke: does this image produce the frozen answer?
 #
-#   assets/image/smoke.sh zluda  hspz:zluda-test
-#   assets/image/smoke.sh nvidia hspz:test
+#   assets/container/smoke.sh zluda  hspz:zluda-test
+#   assets/container/smoke.sh nvidia hspz:test
 #
 # The expected values are NOT frozen from a container's first run (plan amendment A4). They are
 # the answers assets/tests/parity.sh already validates against the C++ CUDA oracle on the same
@@ -41,9 +41,11 @@ drun "$IMAGE" --help > /dev/null 2>&1 && ok "--help" || bad "--help"
 # Anything newer than CUDA 4.0 here means the image silently requires a recent host driver.
 sym=$(drun --entrypoint sh "$IMAGE" -c '
   command -v nm >/dev/null 2>&1 || { echo SKIP; exit 0; }
-  nm -D --undefined-only "$(command -v hspZ)" | grep -oE "cu[A-Za-z]+_v[0-9]+" | grep -vE \
-   "cuDevicePrimaryCtxRelease_v2|cuEventDestroy_v2|cuMemAllocHost_v2|cuMemAlloc_v2|cuMemcpyDtoHAsync_v2|cuMemcpyHtoDAsync_v2|cuMemcpyHtoD_v2|cuMemFree_v2|cuMemGetInfo_v2|cuStreamDestroy_v2" \
-   | sort -u | tr "\n" " "' 2>/dev/null)
+  nm -D --undefined-only "$(command -v hspZ)" \
+      | grep -oE "cu[A-Za-z]+_v[0-9]+" \
+      | grep -vE \
+          "cuDevicePrimaryCtxRelease_v2|cuEventDestroy_v2|cuMemAllocHost_v2|cuMemAlloc_v2|cuMemcpyDtoHAsync_v2|cuMemcpyHtoDAsync_v2|cuMemcpyHtoD_v2|cuMemFree_v2|cuMemGetInfo_v2|cuStreamDestroy_v2" \
+      | sort -u | tr "\n" " "' 2>/dev/null)
 case "$sym" in
     ""|SKIP*) ok "driver symbols: no post-CUDA-4.0 requirement${sym:+ (nm absent, checked at build)}";;
     *) bad "driver symbols: image needs $sym — host drivers below 570 will fail at the first timed event";;
@@ -75,6 +77,24 @@ check() {                       # check <fixture> <expected hsps> <expected sort
 say "frozen fixtures (--max-hits $MAX_HITS)"
 check repeat 57 d01edd2118cf5fa5 1
 check multi   3 0da3bbda656e4f7b 2
+
+# ---- 3a. hspZ-prefixed invocation (nextflow-style) --------------------------------------
+# Nextflow launches the container as `hspZ run ...` — the entrypoint shim must strip the
+# leading binary name and land on the same answer as the bare `run` form above.
+say "hspZ-prefixed invocation"
+d=$(mktemp -d)
+drun -v "$d:/out" "$IMAGE" hspZ run \
+    -r /opt/hspZ/fixtures/repeat.ref.fa -q /opt/hspZ/fixtures/repeat.qry.fa \
+    -o /out --max-hits "$MAX_HITS" > "$d/.stdout" 2> "$d/.stderr"
+n=$(cat "$d"/*.segments 2>/dev/null | wc -l)
+dg=$(cat "$d"/*.segments 2>/dev/null | LC_ALL=C sort | sha256sum | cut -c1-16)
+if [ "$n" = 57 ] && [ "$dg" = d01edd2118cf5fa5 ]; then
+    ok "hspZ run: $n HSPs, $dg"
+else
+    bad "hspZ run: got $n HSPs / $dg, want 57 / d01edd2118cf5fa5"
+    printf '         %s\n' "$(tail -2 "$d/.stderr" 2>/dev/null | tr '\n' ' ' | cut -c1-160)"
+fi
+rm -rf "$d"
 
 # ---- 3b. Phase 9 rows: output modes and input formats (FULL=1) --------------------------
 # Off by default so the routine smoke stays small . These are the acceptance-matrix

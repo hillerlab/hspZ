@@ -24,10 +24,10 @@
 #
 # Canonical A gave the same digest on every device:
 #
-# T4          sm_75 native              4,248 HSPs  852ce647a1f9cd74
-# L4          sm_75 PTX JIT'd to Ada    4,248 HSPs  852ce647a1f9cd74
-# L4          sm_80                     4,248 HSPs  852ce647a1f9cd74
-# RX 6500 XT  sm_75 via ZLUDA/HIP       byte-identical to sm_80
+#   T4          sm_75 native              4,248 HSPs  852ce647a1f9cd74
+#   L4          sm_75 PTX JIT'd to Ada    4,248 HSPs  852ce647a1f9cd74
+#   L4          sm_80                     4,248 HSPs  852ce647a1f9cd74
+#   RX 6500 XT  sm_75 via ZLUDA/HIP       byte-identical to sm_80
 
 # ---------------------------------------------------------------------------- builder
 FROM ubuntu:24.04 AS builder
@@ -56,18 +56,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 ENV CUDA_HOME=/opt/cuda CUDA_TOOLKIT_PATH=/opt/cuda
 RUN set -eux; \
     base=https://developer.download.nvidia.com/compute/cuda/redist; \
-    curl -fsSL "$base/redistrib_${CUDA_REDIST_VER}.json" -o /tmp/redist.json; \
+    curl -fsSL "$base/redistrib_${CUDA_REDIST_VER}.json" \
+        -o /tmp/redist.json; \
     python3 -c "import json;i=json.load(open('/tmp/redist.json'));\
 [print(i[p]['linux-x86_64']['relative_path']) for p in ('cuda_cudart','cuda_nvcc')]" \
         > /tmp/paths.txt; \
-    mkdir -p /tmp/cuda "$CUDA_HOME"; cd /tmp/cuda; \
-    while read -r rel; do curl -fsSL "$base/$rel" -o pkg.tar.xz; tar -xf pkg.tar.xz; \
-        rm pkg.tar.xz; done < /tmp/paths.txt; \
+    mkdir -p /tmp/cuda "$CUDA_HOME"; \
+    cd /tmp/cuda; \
+    while read -r rel; do \
+        curl -fsSL "$base/$rel" -o pkg.tar.xz; \
+        tar -xf pkg.tar.xz; \
+        rm pkg.tar.xz; \
+    done < /tmp/paths.txt; \
     for a in *-archive; do cp -r "$a"/. "$CUDA_HOME"/; done; \
-    cd /; rm -rf /tmp/cuda /tmp/redist.json /tmp/paths.txt; \
+    cd /; \
+    rm -rf /tmp/cuda /tmp/redist.json /tmp/paths.txt; \
     test -f "$CUDA_HOME/include/cuda.h"; \
     grep -q "define CUDA_VERSION 12040" "$CUDA_HOME/include/cuda.h"; \
-    test -f "$CUDA_HOME/lib/stubs/libcuda.so" || test -f "$CUDA_HOME/lib64/stubs/libcuda.so"
+    test -f "$CUDA_HOME/lib/stubs/libcuda.so" \
+        || test -f "$CUDA_HOME/lib64/stubs/libcuda.so"
 
 ENV PATH=$CUDA_HOME/bin:$PATH \
     LIBRARY_PATH=$CUDA_HOME/lib/stubs:$CUDA_HOME/lib64/stubs \
@@ -84,8 +91,10 @@ WORKDIR /src
 # cargo-oxide is pinned to the SHA in Cargo.lock, never to upstream HEAD (plan Phase 1.3).
 COPY Cargo.lock Cargo.toml rust-toolchain.toml ./
 RUN set -eux; \
-    sha=$(grep -m1 -o 'cuda-oxide\.git#[0-9a-f]\{40\}' Cargo.lock | cut -d'#' -f2); \
-    test -n "$sha"; echo "cuda-oxide pin: $sha" | tee /cuda-oxide.sha; \
+    sha=$(grep -m1 -o 'cuda-oxide\.git#[0-9a-f]\{40\}' Cargo.lock \
+        | cut -d'#' -f2); \
+    test -n "$sha"; \
+    echo "cuda-oxide pin: $sha" | tee /cuda-oxide.sha; \
     cargo install cargo-oxide --git https://github.com/NVlabs/cuda-oxide.git \
         --rev "$sha" --locked --root /usr/local
 
@@ -97,13 +106,16 @@ RUN set -eux; \
         CARGO_TARGET_DIR=/build/target-$arch \
             cargo oxide build --arch "$arch" -- --release --locked; \
         cp "/build/target-$arch/release/hspZ" "/build/bin/hspZ-$arch"; \
-        strings -n 6 "/build/bin/hspZ-$arch" | grep -q "\.target $arch" \
+        strings -n 6 "/build/bin/hspZ-$arch" \
+            | grep -q "\.target $arch" \
             || { echo "FATAL: hspZ-$arch does not carry .target $arch PTX" >&2; exit 1; }; \
         bad=$(nm -D --undefined-only "/build/bin/hspZ-$arch" \
-                | grep -oE 'cu[A-Za-z]+_v[0-9]+' | grep -vE \
-                'cuDevicePrimaryCtxRelease_v2|cuEventDestroy_v2|cuMemAllocHost_v2|cuMemAlloc_v2|cuMemcpyDtoHAsync_v2|cuMemcpyHtoDAsync_v2|cuMemcpyHtoD_v2|cuMemFree_v2|cuMemGetInfo_v2|cuStreamDestroy_v2' \
+                | grep -oE 'cu[A-Za-z]+_v[0-9]+' \
+                | grep -vE \
+                    'cuDevicePrimaryCtxRelease_v2|cuEventDestroy_v2|cuMemAllocHost_v2|cuMemAlloc_v2|cuMemcpyDtoHAsync_v2|cuMemcpyHtoDAsync_v2|cuMemcpyHtoD_v2|cuMemFree_v2|cuMemGetInfo_v2|cuStreamDestroy_v2' \
                 || true); \
-        test -z "$bad" || { echo "FATAL: hspZ-$arch needs post-CUDA-4.0 driver symbols: $bad" >&2; exit 1; }; \
+        test -z "$bad" \
+            || { echo "FATAL: hspZ-$arch needs post-CUDA-4.0 driver symbols: $bad" >&2; exit 1; }; \
         ldd "/build/bin/hspZ-$arch" || true; \
     done; \
     ls -la /build/bin
@@ -125,7 +137,7 @@ RUN mkdir -p /build/fixtures && python3 assets/tests/gen_fixtures.py /build/fixt
 FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS nvidia
 ARG HSPZ_NVIDIA_ARCH=sm_75
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.1
+ARG HSPZ_VERSION=0.0.2
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.version="$HSPZ_VERSION" \
@@ -158,7 +170,7 @@ FROM rocm/dev-ubuntu-24.04:6.2 AS zluda
 ARG ZLUDA_VERSION=v6
 ARG ZLUDA_ASSET=zluda-linux-3fe12063.tar.gz
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.1
+ARG HSPZ_VERSION=0.0.2
 
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
@@ -172,13 +184,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
 
 RUN set -eux; \
     curl -fsSL -o /tmp/zluda.tar.gz \
-      "https://github.com/vosen/ZLUDA/releases/download/${ZLUDA_VERSION}/${ZLUDA_ASSET}"; \
+        "https://github.com/vosen/ZLUDA/releases/download/${ZLUDA_VERSION}/${ZLUDA_ASSET}"; \
     mkdir -p /opt/zluda; \
     tar -xzf /tmp/zluda.tar.gz -C /opt/zluda --strip-components=1 \
-      || tar -xzf /tmp/zluda.tar.gz -C /opt/zluda; \
+        || tar -xzf /tmp/zluda.tar.gz -C /opt/zluda; \
     rm /tmp/zluda.tar.gz; \
-    test -e /opt/zluda/libcuda.so.1 || { echo "FATAL: ZLUDA tarball has no libcuda.so.1" >&2; \
-        find /opt/zluda -maxdepth 2 -name "libcuda*" >&2; exit 1; }; \
+    test -e /opt/zluda/libcuda.so.1 \
+        || { echo "FATAL: ZLUDA tarball has no libcuda.so.1" >&2; \
+             find /opt/zluda -maxdepth 2 -name "libcuda*" >&2; exit 1; }; \
     ls /opt/zluda | head
 
 COPY --from=builder /build/bin/hspZ-sm_80 /usr/local/bin/hspZ
