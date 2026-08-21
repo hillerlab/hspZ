@@ -36,12 +36,22 @@ use crate::hsp::SegmentPair;
 use crate::seed::Shape;
 use crate::timing::Phases;
 use cuda_core::{CudaContext, CudaEvent, CudaStream, DeviceBuffer, DriverError, LaunchConfig};
+#[cfg(feature = "find-hits-warp")]
+use kernels::NUM_WARPS;
 use kernels::{BLOCK_SIZE, HSP_BLOCKS, HSP_THREADS, MAX_BLOCKS, MAX_THREADS, SCAN_BLOCK};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// `seed_filter.cu: MAX_HITS_PER_GB`.
 const MAX_HITS_PER_GB: u64 = 4_194_304;
+/// Sparse launches keep the shipped thread-per-seed mapping.
+const FIND_HITS_WARP_MIN_DENSITY: u64 = 16;
+
+#[inline]
+fn use_warp_find_hits(num_hits: u32, num_seeds: u32) -> bool {
+    cfg!(feature = "find-hits-warp")
+        && u64::from(num_hits) >= FIND_HITS_WARP_MIN_DENSITY * u64::from(num_seeds)
+}
 
 /// Result of one `SeedAndFilter` call.
 pub struct FilterOutput {
@@ -61,9 +71,25 @@ pub struct FilterOutput {
 pub struct HitStats {
     /// Seeds with 0, 1, 2-4, 5-32, 33-256, >256 reference hits.
     pub buckets: [u64; 6],
+    /// Hits contributed by each bucket. Seed-weighted buckets alone cannot say
+    /// where the work is: a heavy-tailed reference puts most seeds in the low
+    /// buckets and most hits in the high ones.
+    pub hits: [u64; 6],
     pub max: u32,
     pub total_hits: u64,
     pub nonempty: u64,
+    /// Lane-slots a warp-per-seed `find_hits` would spend: `32 * ceil(r/32)`
+    /// per non-empty seed, since one warp owns one seed. Zero-hit seeds cost
+    /// nothing under that mapping.
+    warp_slots: u64,
+    /// Lane-slots the shipped thread-per-seed mapping spends: `32 * max(r)` per
+    /// aligned group of 32 consecutive seeds, because the warp steps together
+    /// until its longest walk finishes.
+    thread_slots: u64,
+    /// Rolling state for `thread_slots`: seeds in the current group of 32 and
+    /// the longest walk seen in it.
+    group_n: u32,
+    group_max: u32,
     /// Hit counts of every non-empty seed, for the median. Only collected when
     /// [`Engine::collect_hit_stats`] is set.
     pub counts: Vec<u32>,
@@ -82,11 +108,38 @@ impl HitStats {
             _ => 5,
         };
         self.buckets[b] += 1;
+        self.hits[b] += n as u64;
         self.max = self.max.max(n);
         self.total_hits += n as u64;
         if n > 0 {
             self.nonempty += 1;
             self.counts.push(n);
+            self.warp_slots += 32 * n.div_ceil(32) as u64;
+        }
+        // `observe` is called in `d_hit_num` order, which is the order
+        // `find_hits` assigns threads, so 32 consecutive seeds are one warp.
+        self.group_max = self.group_max.max(n);
+        self.group_n += 1;
+        if self.group_n == 32 {
+            self.close_group();
+        }
+    }
+
+    /// Observes one `find_hits` launch. Warp grouping restarts at every launch,
+    /// including launches split by `MAX_HITS`.
+    fn observe_launch(&mut self, counts: &[u32]) {
+        for &n in counts {
+            self.observe(n);
+        }
+        self.close_group();
+    }
+
+    /// Charges the in-progress warp group to `thread_slots`. Idempotent.
+    fn close_group(&mut self) {
+        if self.group_n > 0 {
+            self.thread_slots += 32 * self.group_max as u64;
+            self.group_n = 0;
+            self.group_max = 0;
         }
     }
 
@@ -101,10 +154,41 @@ impl HitStats {
         for (a, &b) in self.buckets.iter_mut().zip(&other.buckets) {
             *a += b;
         }
+        for (a, &b) in self.hits.iter_mut().zip(&other.hits) {
+            *a += b;
+        }
         self.max = self.max.max(other.max);
         self.total_hits += other.total_hits;
         self.nonempty += other.nonempty;
         self.counts.extend_from_slice(&other.counts);
+        // Engines have independent launch streams, so their trailing groups
+        // must be charged separately rather than joined across the merge.
+        self.close_group();
+        self.warp_slots += other.warp_slots;
+        self.thread_slots += other.thread_slots + 32 * other.group_max as u64;
+    }
+
+    /// Share of hits living in seeds long enough to fill a warp (`r >= 33`).
+    /// This, not mean hits/seed, is what a warp-per-seed mapping can coalesce.
+    pub fn hit_share_warp_filling(&self) -> f64 {
+        if self.total_hits == 0 {
+            return 0.0;
+        }
+        (self.hits[4] + self.hits[5]) as f64 / self.total_hits as f64 * 100.0
+    }
+
+    /// Fraction of issued lane-slots that do useful work under each mapping.
+    /// Returns `(thread_per_seed, warp_per_seed)` as percentages.
+    pub fn lane_utilisation(&mut self) -> (f64, f64) {
+        self.close_group();
+        let pct = |slots: u64| {
+            if slots == 0 {
+                0.0
+            } else {
+                self.total_hits as f64 / slots as f64 * 100.0
+            }
+        };
+        (pct(self.thread_slots), pct(self.warp_slots))
     }
 
     /// Mean hits per seed, counting only seeds with at least one hit.
@@ -129,11 +213,14 @@ impl HitStats {
     /// all observed seeds.
     pub fn report(&mut self) -> String {
         let seeds = self.seeds().max(1);
-        let mut out = String::from("  hits/seed      seeds        %\n");
-        for (label, n) in HitStats::LABELS.iter().zip(self.buckets) {
+        let hits = self.total_hits.max(1);
+        let mut out = String::from("  hits/seed      seeds        %          hits        %\n");
+        for (i, (label, n)) in HitStats::LABELS.iter().zip(self.buckets).enumerate() {
             out.push_str(&format!(
-                "  {label:<10} {n:>10} {:>7.2}%\n",
-                n as f64 / seeds as f64 * 100.0
+                "  {label:<10} {n:>10} {:>7.2}%  {:>12} {:>7.2}%\n",
+                n as f64 / seeds as f64 * 100.0,
+                self.hits[i],
+                self.hits[i] as f64 / hits as f64 * 100.0
             ));
         }
         let mean = self.mean_nonempty();
@@ -151,6 +238,12 @@ impl HitStats {
             self.buckets[0],
             self.seeds(),
             self.buckets[0] as f64 / seeds as f64 * 100.0
+        ));
+        let warp_filling = self.hit_share_warp_filling();
+        let (thread_util, warp_util) = self.lane_utilisation();
+        out.push_str(&format!(
+            "  hits in warp-filling seeds (r>=33): {warp_filling:.2}%\n  lane utilisation: \
+             thread-per-seed {thread_util:.2}%  warp-per-seed {warp_util:.2}%\n"
         ));
         out
     }
@@ -1506,19 +1599,20 @@ impl Engine {
         }
         self.end_stage(stage, "find_num_hits")?;
 
-        if self.collect_hit_stats {
+        let hit_counts = if self.collect_hit_stats {
             // Benchmark-only: the raw counts are otherwise never needed on the
             // host, so this full copy stays out of normal runs.
             let t = Instant::now();
             // A persistent buffer holds the high-water capacity, so only the
             // first `num_seeds` entries belong to this batch.
-            let raw = self.buf_hit_num.to_host_vec(&self.stream)?;
+            let mut raw = self.buf_hit_num.to_host_vec(&self.stream)?;
             self.absorb_sync()?;
-            for &n in &raw[..num_seeds as usize] {
-                self.hit_stats.observe(n);
-            }
+            raw.truncate(num_seeds as usize);
             self.phases.add("hit-distribution stats", t.elapsed());
-        }
+            Some(raw)
+        } else {
+            None
+        };
 
         // The cumulative counts stay on the device. A block-local
         // scan plus an add-back turns them into the global inclusive scan, and
@@ -1585,6 +1679,11 @@ impl Engine {
             raw: Vec::new(),
         };
         if num_hits == 0 {
+            if let Some(counts) = hit_counts {
+                let t = Instant::now();
+                self.hit_stats.observe_launch(&counts);
+                self.phases.add("hit-distribution stats", t.elapsed());
+            }
             // `d_block_sums`/`d_offsets` are freed on the way out and
             // `add_block_offsets` may still be queued reading them (hazard 2).
             self.sync_pipeline()?;
@@ -1604,6 +1703,15 @@ impl Engine {
             chunk_limits(&cumulative[..num_seeds as usize], self.max_hits)
         };
         self.phases.add("chunk prep (lower_bound)", t.elapsed());
+
+        if let Some(counts) = hit_counts {
+            let t = Instant::now();
+            for &(start, limit, _, _) in &chunks {
+                self.hit_stats
+                    .observe_launch(&counts[start as usize..=limit as usize]);
+            }
+            self.phases.add("hit-distribution stats", t.elapsed());
+        }
 
         for (start_seed_index, limit_pos, start_hit_val, end_hit_val) in chunks {
             let iter_num_seeds = limit_pos + 1 - start_seed_index;
@@ -1650,7 +1758,8 @@ impl Engine {
             self.phases.add("alloc hit buffers", t.elapsed());
 
             let stage = self.stage();
-            // SAFETY: one thread per seed; every store lands inside
+            let warp_find_hits = use_warp_find_hits(iter_num_hits, iter_num_seeds);
+            // SAFETY: one thread or warp per seed; every store lands inside
             // `0..iter_num_hits` by construction of the prefix offsets.
             #[cfg(not(feature = "dense-anchors"))]
             unsafe {
@@ -1674,6 +1783,45 @@ impl Engine {
             }
             #[cfg(feature = "dense-anchors")]
             unsafe {
+                #[cfg(feature = "find-hits-warp")]
+                if warp_find_hits {
+                    self.module.find_hits_dense_warp(
+                        &self.stream,
+                        LaunchConfig {
+                            grid_dim: (iter_num_seeds.div_ceil(NUM_WARPS as u32), 1, 1),
+                            block_dim: (BLOCK_SIZE, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &self.index_table,
+                        &self.pos_table,
+                        &self.seed_slots[slot],
+                        self.seed_size,
+                        &self.buf_hit_num,
+                        &mut self.buf_anchor,
+                        start_seed_index,
+                        start_hit_val,
+                        iter_num_seeds,
+                    )?;
+                } else {
+                    self.module.find_hits_dense(
+                        &self.stream,
+                        LaunchConfig {
+                            grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                            block_dim: (BLOCK_SIZE, 1, 1),
+                            shared_mem_bytes: 0,
+                        },
+                        &self.index_table,
+                        &self.pos_table,
+                        &self.seed_slots[slot],
+                        self.seed_size,
+                        &self.buf_hit_num,
+                        &mut self.buf_anchor,
+                        start_seed_index,
+                        start_hit_val,
+                        iter_num_seeds,
+                    )?;
+                }
+                #[cfg(not(feature = "find-hits-warp"))]
                 self.module.find_hits_dense(
                     &self.stream,
                     LaunchConfig {
@@ -1692,7 +1840,14 @@ impl Engine {
                     iter_num_seeds,
                 )?;
             }
-            self.end_stage(stage, "find_hits")?;
+            self.end_stage(
+                stage,
+                if warp_find_hits {
+                    "find_hits (warp)"
+                } else {
+                    "find_hits"
+                },
+            )?;
 
             if self.census.is_some() {
                 #[cfg(feature = "dense-anchors")]
@@ -2357,7 +2512,97 @@ impl Stage {
 mod tests {
     #[cfg(feature = "dense-anchors")]
     use super::SCAN_BLOCK;
+    #[cfg(feature = "find-hits-warp")]
+    use super::use_warp_find_hits;
     use super::{HitStats, Lifecycle, chunk_limits};
+
+    #[cfg(feature = "find-hits-warp")]
+    #[test]
+    fn warp_find_hits_cutoff_is_fixed_at_sixteen_hits_per_seed() {
+        assert!(!use_warp_find_hits(15, 1));
+        assert!(use_warp_find_hits(16, 1));
+        assert!(!use_warp_find_hits(159, 10));
+        assert!(use_warp_find_hits(160, 10));
+    }
+
+    /// Two distributions with the same mean hits/seed, seed count and total
+    /// work must come out with very different numbers, or these statistics
+    /// cannot tell uniform density from a repeat tail. Lane utilisation is
+    /// descriptive, not a predictor of which mapping is faster.
+    #[test]
+    fn density_statistics_separate_uniform_density_from_a_repeat_tail() {
+        // Uniformly dense: 64 seeds of 32 hits each. Every warp step is full
+        // under both mappings, so both should read ~100%.
+        let mut uniform = HitStats::default();
+        for _ in 0..64 {
+            uniform.observe(32);
+        }
+        let (t_uni, w_uni) = uniform.lane_utilisation();
+        assert!(
+            t_uni > 99.0,
+            "thread-per-seed wastes nothing here, got {t_uni}"
+        );
+        assert!(
+            w_uni > 99.0,
+            "warp-per-seed wastes nothing here, got {w_uni}"
+        );
+
+        // Same 2048 hits and same 64 seeds, but carried by one repeat bucket:
+        // 63 seeds of 1 hit and one seed of 1985.
+        let mut tailed = HitStats::default();
+        for _ in 0..63 {
+            tailed.observe(1);
+        }
+        tailed.observe(1985);
+        assert_eq!(tailed.total_hits, uniform.total_hits, "same total work");
+        assert_eq!(tailed.seeds(), uniform.seeds(), "same seed count");
+
+        let (t_tail, w_tail) = tailed.lane_utilisation();
+        // Thread-per-seed: both groups of 32 run until the longest walk ends,
+        // so the 1985-hit seed drags 31 idle lanes behind it.
+        assert!(
+            t_tail < 5.0,
+            "thread-per-seed should collapse here, got {t_tail}"
+        );
+        // Warp-per-seed: the 63 one-hit seeds each burn a whole warp step, but
+        // the repeat seed runs at full width, so it recovers most of the loss.
+        assert!(
+            w_tail > t_tail * 4.0,
+            "warp mapping should win at a tail: {w_tail} vs {t_tail}"
+        );
+        assert!(
+            w_tail < 99.0,
+            "the one-hit seeds still waste lanes, got {w_tail}"
+        );
+
+        // The hit-weighted share is what exposes the tail: nearly all the work
+        // sits in warp-filling seeds even though 63 of 64 seeds do not.
+        assert!(tailed.hit_share_warp_filling() > 95.0);
+        assert_eq!(uniform.hit_share_warp_filling(), 0.0, "r=32 is not >=33");
+    }
+
+    /// A trailing partial group must still be charged, or `thread_slots`
+    /// silently drops the last <32 seeds.
+    #[test]
+    fn partial_warp_group_is_charged() {
+        let mut h = HitStats::default();
+        h.observe(10);
+        let (t, w) = h.lane_utilisation();
+        assert_eq!(w, 10.0 / 32.0 * 100.0, "one warp step for one seed");
+        assert_eq!(t, 10.0 / 320.0 * 100.0, "32 lanes stepping 10 times");
+        // Repeated calls must not double-charge.
+        assert_eq!(h.lane_utilisation(), (t, w));
+    }
+
+    #[test]
+    fn thread_lane_slots_restart_at_launch_boundaries() {
+        let mut h = HitStats::default();
+        h.observe_launch(&[1]);
+        h.observe_launch(&[2]);
+        let (thread, warp) = h.lane_utilisation();
+        assert_eq!(thread, 3.0 / 96.0 * 100.0);
+        assert_eq!(warp, 3.0 / 64.0 * 100.0);
+    }
 
     /// The counters exist to catch a reference index rebuilt per work unit
     /// instead of per reference bin — a regression that changes no output and

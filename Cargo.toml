@@ -1,7 +1,7 @@
 [package]
 name = "hspz"
 authors = ["Alejandro Gonzales-Irribarren <alejandrxgzi@gmail.com>"]
-version = "0.0.2"
+version = "0.0.3"
 edition = "2024"
 license = "GPL-3.0"
 description = "GPU-accelerated high-scoring ungapped alignment pair backend"
@@ -58,6 +58,11 @@ warp-score-gate = []
 # Store 8-byte anchors, compact score-gate survivors in stable hit order, and
 # run the unchanged materializer only on that dense list.
 dense-anchors = ["warp-score-gate"]
+
+# One warp owns each seed's dense anchor walk when the launch has at least
+# 16 hits/seed; sparse launches keep thread-per-seed. Opt-in: the default
+# feature set is unchanged.
+find-hits-warp = ["dense-anchors"]
 
 # Score the first 64 left bases as 32 adjacent pairs.
 left-pair-tile = ["dense-anchors"]
