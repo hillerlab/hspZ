@@ -36,6 +36,25 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.3] — 2026-08-21
+
+Warp-per-seed `find_hits` for dense launches, on by default.
+
+- **`find-hits-warp`** — when a `MAX_HITS` launch has at least 16 hits per
+  seed, one warp owns that seed's `pos_table` walk so adjacent lanes read
+  adjacent positions and write adjacent packed anchors. Sparse launches keep
+  the thread-per-seed kernel. Destination indices, `MAX_HITS` chunking, and
+  the HSP set are unchanged. This is a default feature alongside
+  `simd-prelude`; disable with `--no-default-features` if you need the old
+  compile-out.
+- **`--hit-stats`** — the distribution table now reports hit-weighted
+  bucket shares and lane utilisation under both mappings, so a repeat-rich
+  tail is visible even when mean hits/seed looks modest.
+- On an NVIDIA L4 high-density proxy (hg38 × a 250 kb slice of mm39 chr19),
+  the warp path cut `find_hits` by 56% and whole wall by 3.8–4.0% with
+  disjoint reversed rounds and exact hashes. Canonical A/B (sparse) does not
+  regress: those launches stay on the thread path.
+
 ## [0.0.2] — 2026-08-20
 
 Container and nextflow integration fixes.

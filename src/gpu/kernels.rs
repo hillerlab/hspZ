@@ -15,8 +15,9 @@
 //! `align(16)` store and grid 16384, the device-resident count and done-flag
 //! scans, the warp-coalesced score gate and dense-anchor compaction, device
 //! seed generation (`seed_kmers`/`scatter_seeds`), and `find_hits`'
-//! thread-per-seed mapping. Every change stays byte-identical to the oracle at
-//! matched plan and `MAX_HITS`.
+//! thread-per-seed mapping (and a warp-per-seed walk when a launch is dense
+//! enough to fill the warp). Every change stays byte-identical to the oracle
+//! at matched plan and `MAX_HITS`.
 
 use crate::hsp::SegmentPair;
 
@@ -460,6 +461,57 @@ pub mod device {
                     ref_loc as u64 | ((query_loc as u64) << 32);
             }
             j += 1;
+        }
+    }
+
+    /// Adjacent lanes walk adjacent positions for one seed, coalescing both
+    /// the `pos_table` reads and packed-anchor writes. Same prefix-derived
+    /// destinations as `find_hits_dense`.
+    #[cfg(feature = "find-hits-warp")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_dense_warp(
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_hit_num: &[u32],
+        mut anchors: DisjointSlice<u64>,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) {
+        let lane = thread::threadIdx_x() % WARP_SIZE;
+        let warp = thread::threadIdx_x() / WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * NUM_WARPS as u32 + warp;
+        if seed_slot >= num_seeds {
+            return;
+        }
+
+        let seed_offset = seed_offsets[(seed_slot + start_seed_index) as usize];
+        let seed = (seed_offset >> 32) as usize;
+        let end = index_table[seed];
+        let start = if seed > 0 { index_table[seed - 1] } else { 0 };
+        if start == end {
+            return;
+        }
+
+        let query_loc = (seed_offset & 0xFFFF_FFFF) as u32 + seed_size;
+        let prefix = seed_hit_num[(seed_slot + start_seed_index) as usize];
+        let mut j = lane;
+        while start + j < end {
+            let ref_loc = pos_table[(start + j) as usize] + seed_size;
+            let address = prefix
+                .wrapping_sub(1)
+                .wrapping_sub(start_hit_index)
+                .wrapping_sub(j);
+            // SAFETY: lanes partition the same prefix range the thread mapping
+            // owns, so every address is in bounds and written exactly once.
+            unsafe {
+                *anchors.get_unchecked_mut(address as usize) =
+                    ref_loc as u64 | ((query_loc as u64) << 32);
+            }
+            j += WARP_SIZE;
         }
     }
 

@@ -137,7 +137,7 @@ RUN mkdir -p /build/fixtures && python3 assets/tests/gen_fixtures.py /build/fixt
 FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS nvidia
 ARG HSPZ_NVIDIA_ARCH=sm_75
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.2
+ARG HSPZ_VERSION=0.0.3
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.version="$HSPZ_VERSION" \
@@ -170,7 +170,7 @@ FROM rocm/dev-ubuntu-24.04:6.2 AS zluda
 ARG ZLUDA_VERSION=v6
 ARG ZLUDA_ASSET=zluda-linux-3fe12063.tar.gz
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.2
+ARG HSPZ_VERSION=0.0.3
 
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
