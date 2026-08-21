@@ -15,9 +15,9 @@
 //! `align(16)` store and grid 16384, the device-resident count and done-flag
 //! scans, the warp-coalesced score gate and dense-anchor compaction, device
 //! seed generation (`seed_kmers`/`scatter_seeds`), and `find_hits`'
-//! thread-per-seed mapping (with an opt-in warp-per-seed walk when a launch
-//! is dense enough to fill the warp). Every change stays byte-identical to
-//! the oracle at matched plan and `MAX_HITS`.
+//! thread-per-seed mapping (and a warp-per-seed walk when a launch is dense
+//! enough to fill the warp). Every change stays byte-identical to the oracle
+//! at matched plan and `MAX_HITS`.
 
 use crate::hsp::SegmentPair;
 

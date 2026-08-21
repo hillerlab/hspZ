@@ -27,7 +27,7 @@ twobit = "0.2.2"
 tar = "0.4.46"
 
 [features]
-default = ["simd-prelude"]
+default = ["simd-prelude", "find-hits-warp"]
 
 # Benchmark-only find_hsps counters. Never time a build with this
 # on — per-hit stores and per-tile increments shift register pressure.
@@ -60,8 +60,7 @@ warp-score-gate = []
 dense-anchors = ["warp-score-gate"]
 
 # One warp owns each seed's dense anchor walk when the launch has at least
-# 16 hits/seed; sparse launches keep thread-per-seed. Opt-in: the default
-# feature set is unchanged.
+# 16 hits/seed; sparse launches keep thread-per-seed. Default.
 find-hits-warp = ["dense-anchors"]
 
 # Score the first 64 left bases as 32 adjacent pairs.
