@@ -1,0 +1,34 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import tour from "../../../journeys/tour.md?raw"
+---
+
+<DocsLayout
+  title="10-minute algorithm tour"
+  description="Seven small views from whole-genome context to deterministic LASTZ-compatible output."
+  wide
+>
+  <h2>0.0 — Where hspZ sits</h2>
+  <p>
+    hspZ replaces the GPU Seed + Filter stage. It does not perform gapped
+    extension, chaining, or netting.
+  </p>
+  <div class="pipeline" role="img" aria-label="Genomes go through hspZ Seed and Filter, LASTZ gapped extension, chaining, then netting">
+    <span>Genomes</span><b>→</b><span class="active">hspZ<br /><small>Seed + Filter</small></span><b>→</b><span>LASTZ<br /><small>gapped</small></span><b>→</b><span>Chain</span><b>→</b><span>Net</span>
+  </div>
+
+  <AlgorithmJourney markdown={tour} />
+</DocsLayout>
+
+<style>
+  .pipeline { display: flex; align-items: center; gap: 0.7rem; overflow-x: auto; border: 1px solid var(--border); padding: 1rem; }
+  .pipeline span { flex: 1 0 7rem; border: 1px solid var(--border); padding: 0.8rem; text-align: center; }
+  .pipeline .active { border-color: var(--primary); box-shadow: inset 0 0 0 1px var(--primary); }
+  .pipeline small { color: var(--muted-foreground); }
+  .pipeline b { color: var(--muted-foreground); }
+  @media (max-width: 560px) {
+    .pipeline { flex-direction: column; align-items: stretch; }
+    .pipeline b { align-self: center; transform: rotate(90deg); }
+  }
+</style>

@@ -1,0 +1,52 @@
+import DocsLayout from "../../layouts/DocsLayout.astro"
+
+<DocsLayout title="Exactness knobs" description="Block geometry and MAX_HITS are part of the output contract, not performance-only tuning.">
+
+## The rule
+
+hspZ is byte-identical to the C++ oracle when the plan, seed stream, scoring
+parameters, and `MAX_HITS` match. A changed layout gets a new frozen digest; it
+is not compared against a digest from another layout.
+
+| knob | default | why the HSP set can move |
+| --- | --- | --- |
+| `-B`, `--seq-block-size` | 500,000,000 | changes reference bins and, unless overridden, query bins |
+| `--query-block-size` | `-B` | changes query bins and per-unit chunk/dedup scope |
+| `--max-hits` | `4,194,304 × device GiB` | changes hit-stream chunk boundaries |
+| `--kegalign-bins` | off | replaces balanced LPT bins with KegAlign sequential fill |
+
+Within one layout and `MAX_HITS`, one and many GPUs emit byte-identical files,
+including diagonal partitions and tarballs.
+
+## Why layout changes output
+
+```text
+chromosome bins
+      ↓
+reference × query work units
+      ↓
+MAX_HITS chunks
+      ↓
+host dedup scope
+      ↓
+final HSP set
+```
+
+On the frozen 4× RTX 4090 whole-genome run, hg38 chr1–22,X versus mm39
+chr1–19,X,Y produced 15,158,480 HSPs at `-B 1000000000` and 15,157,574 at
+`-B 500000000`. Both are valid outputs for their layouts.
+
+## Memory preflight can refine the plan
+
+`plan_within_budget` silently halves the requested block target until the
+largest work unit fits device memory. If a chromosome is too large to fit
+atomically, hspZ fails before allocation. Use `--time` to inspect the accepted
+`lifecycle:` line and `--dump-plan plan.tsv` to record bin membership.
+
+## Multiplicity verdicts
+
+When comparing HSP sets, `EXACT`, `DUPLICATES-ONLY`, and `CONTAINED-EXTRA` are
+acceptable under the multiplicity gate. Losing a unique anchor is a failure.
+Different layout knobs are compared to their own frozen digest first.
+
+</DocsLayout>

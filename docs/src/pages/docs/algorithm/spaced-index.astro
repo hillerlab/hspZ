@@ -1,0 +1,16 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/spaced-index.md?raw"
+---
+
+<DocsLayout title="B. Spaced-seed index" description="Map full valid windows into stable 12-of-19 reference buckets and an oracle-ordered query seed stream." wide>
+  <p>A spaced shape validates its full width, then packs only the care positions. `T` marks a care position that also permits a transition variant.</p>
+  <pre aria-label="12 of 19 care-bit and bucket layout"><code>{`base       0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18
+12of19    T T T 0 T 0 0 T T 0  0  T  0  T  0  T  T  T  T
+packed     [ twelve ordered 2-bit bases = one k-mer index ]
+
+bucket k   pos_table[index[k-1] .. index[k]]
+            low reference positions  →  high reference positions`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

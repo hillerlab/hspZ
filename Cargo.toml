@@ -5,8 +5,8 @@ version = "0.0.3"
 edition = "2024"
 license = "GPL-3.0"
 description = "GPU-accelerated high-scoring ungapped alignment pair backend"
-repository = "https://github.com/alejandrogzi/hspZ"
-homepage = "https://github.com/alejandrogzi/hspZ"
+repository = "https://github.com/hillerlab/hspZ"
+homepage = "https://hillerlab.github.io/hspZ/"
 readme = "README.md"
 keywords = ["bioinformatics", "assembly", "genome", "alignment"]
 

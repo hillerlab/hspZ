@@ -1,0 +1,36 @@
+import DocsLayout from "../../layouts/DocsLayout.astro"
+
+<DocsLayout title="Outputs" description="KegAlign-compatible segment records, deterministic ordering, and optional partitioned archives.">
+
+## Files
+
+The default sink creates a directory containing non-empty files named:
+
+```text
+tmp<n>.block<query-bin>.r<reference-bin>.plus.segments
+tmp<n>.block<query-bin>.r<reference-bin>.minus.segments
+```
+
+`n` is the one-based query-interval number. `-D` adds `.split1`, `.split2`, …
+before `.segments`; `-Z` writes the same logical entries directly into one
+reproducible `.tar.gz` archive with pinned mtimes.
+
+## Record format
+
+Each tab-separated line has eight fields:
+
+```text
+reference  ref_start  ref_end  query  query_start  query_end  strand  score
+```
+
+Coordinates are chromosome-relative, one-based, and inclusive at both ends.
+Minus-strand records use the reverse-complement query frame and are emitted in
+reverse anchor order, matching KegAlign/LASTZ expectations.
+
+## Ordering and deduplication
+
+Accepted GPU HSPs are stably sorted by diagonal, adjacent contained/duplicate
+records are removed with KegAlign's previous-input semantics, and survivors are
+stably sorted into LASTZ query-major order before coordinate conversion.
+
+</DocsLayout>

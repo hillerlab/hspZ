@@ -1,0 +1,64 @@
+---
+import "../styles/global.css"
+import { DOC_VERSION, withBase } from "../lib/site"
+
+interface Props {
+  title?: string
+  description?: string
+}
+
+const {
+  title = "hspZ — GPU-accelerated HSPs backend",
+  description = "GPU-accelerated HSPs backend",
+} = Astro.props
+const canonical = new URL(Astro.url.pathname, Astro.site)
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content="light dark" />
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/png" href={withBase("images/hz.png")} />
+    <link rel="preload" href={withBase("fonts/OpenTUIMono-Regular.woff2")} as="font" type="font/woff2" crossorigin />
+    <title>{title}</title>
+    <script is:inline>
+      try {
+        const theme = localStorage.getItem("hspz-theme")
+        if (theme === "light" || theme === "dark") document.documentElement.dataset.theme = theme
+      } catch {}
+    </script>
+  </head>
+  <body>
+    <a class="skip-link" href="#content">Skip to content</a>
+    <header class="site-header">
+      <a class="site-brand" href={withBase()}>
+        <img src={withBase("images/hz.png")} alt="" />
+        <br>
+        <span>hspZ: GPU-accelerated HSPs backend</span>
+      </a>
+      <nav class="site-actions" aria-label="Site">
+        <a href={withBase("docs/install/")}>Docs</a>
+        <a href="https://github.com/hillerlab/hspZ">GitHub</a>
+        <button class="theme-toggle" type="button" aria-label="Toggle color theme">◐</button>
+      </nav>
+    </header>
+    <slot />
+    <footer class="site-footer">
+      <span>hspZ {DOC_VERSION} · GPL-3.0</span>
+      <span>Hiller Lab · Senckenberg Society for Nature Research</span>
+    </footer>
+    <script is:inline>
+      document.querySelector(".theme-toggle")?.addEventListener("click", () => {
+        const dark = document.documentElement.dataset.theme === "dark" ||
+          (!document.documentElement.dataset.theme && matchMedia("(prefers-color-scheme: dark)").matches)
+        const next = dark ? "light" : "dark"
+        document.documentElement.dataset.theme = next
+        try { localStorage.setItem("hspz-theme", next) } catch {}
+      })
+    </script>
+  </body>
+</html>

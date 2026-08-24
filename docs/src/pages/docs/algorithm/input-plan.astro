@@ -1,0 +1,14 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/input-plan.md?raw"
+---
+
+<DocsLayout title="A. Input and work planning" description="Preserve record semantics, pack chromosome-atomic bins, and freeze deterministic work before touching a GPU." wide>
+  <p>Input format is not an algorithm knob. Base case, record order, and the split between the seeding and scoring alphabets are.</p>
+  <pre aria-label="Packed sequence and two alphabet views"><code>{`records   chrA        chrB
+packed    A C g T &   N A T &     (final & stored, not in block_len)
+seeding   A C × T ×   × A T ×     (only uppercase A/C/G/T)
+scoring   A C L T E   N A T E     (A C G T L N X E)`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

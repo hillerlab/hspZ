@@ -1,0 +1,171 @@
+/**
+ * React Flow renders `.react-flow__edges` (the SVG edge paths) and
+ * `.react-flow__edgelabel-renderer` (the portal used by EdgeLabelRenderer)
+ * as unstyled siblings inside the viewport. Neither sets an explicit
+ * z-index, so with `z-index: auto` browsers stack them by DOM order —
+ * which places edge paths above edge labels and cuts message lines
+ * straight through the label text. Giving the label-renderer layer an
+ * explicit z-index lifts it above the (auto = level 0) edges layer,
+ * regardless of DOM order, while staying below nodes/controls.
+ */
+.react-flow__edgelabel-renderer {
+  z-index: 1000;
+}
+
+/**
+ * Journey-slide entrance: fade in with a slight rise, staggered per node via
+ * an inline `animation-delay` (see layout.ts `enterDelayOf`). Opt-in only —
+ * applied via the `seq-enter` class when `animateIn` is set.
+ */
+@keyframes seq-enter {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.seq-enter {
+  animation: seq-enter 320ms ease-out both;
+}
+
+/**
+ * Message edge entrance, in two parts, timed to each message's chronological
+ * `enterDelay` (see layout.ts `nextStepDelay`) so messages appear one at a
+ * time like a step-through playback rather than all at once:
+ *
+ * 1. `seq-edge-pop` snaps the line/label to fully visible the instant the
+ *    message's turn arrives — no fade, so it never reads as sluggish.
+ * 2. `seq-edge-dot` flies a small semicircle "packet" along that same path
+ *    (via `offset-path`, set inline per-edge in edges.tsx since each path is
+ *    unique) from source to target, arriving right as the line pops in.
+ *    This is the primary motion cue — it makes the arrival feel immediate
+ *    rather than the previous plain opacity fade.
+ */
+@keyframes seq-edge-pop {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.seq-edge-pop {
+  animation: seq-edge-pop 1ms both;
+}
+
+@keyframes seq-edge-travel {
+  0% {
+    offset-distance: 0%;
+    opacity: 1;
+  }
+  80% {
+    offset-distance: 80%;
+    opacity: 1;
+  }
+  100% {
+    offset-distance: 100%;
+    opacity: 0;
+  }
+}
+
+.seq-edge-dot {
+  offset-distance: 0%;
+  animation-name: seq-edge-travel;
+  animation-timing-function: ease-in;
+  animation-fill-mode: both;
+}
+
+/**
+ * JourneyPlayer mobile layout.
+ *
+ * The player header already allows its outer row to wrap, but the control
+ * cluster inside it is intentionally a single horizontal flex row on desktop.
+ * On narrow screens that row can exceed the viewport and force the entire
+ * walkthrough wider than the page. Keep the desktop layout untouched and let
+ * the control groups wrap into compact rows below the slide title on mobile.
+ */
+@media (max-width: 640px) {
+  [aria-roledescription="carousel"] {
+    min-width: 0;
+    width: 100%;
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  [aria-roledescription="carousel"] > div:first-child {
+    align-items: stretch;
+  }
+
+  [aria-roledescription="carousel"] > div:first-child > div:first-child {
+    width: 100%;
+    min-width: 0;
+  }
+
+  [aria-roledescription="carousel"] > div:first-child > div:last-child {
+    display: flex;
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 0.5rem;
+  }
+
+  [aria-roledescription="carousel"] > div:first-child > div:last-child > div {
+    max-width: 100%;
+    flex-shrink: 0;
+  }
+
+  /* Put slide dots on their own lightweight row and let the actual controls
+     wrap naturally underneath instead of squeezing into one line. */
+  [aria-roledescription="carousel"] > div:first-child > div:last-child > div:first-child {
+    flex-basis: 100%;
+  }
+
+  /* Keep the diagram/code viewport bounded by the phone rather than the
+     desktop-oriented fixed 420px height. Inline height is overridden only on
+     mobile so the public `height` prop still behaves exactly as before on
+     larger screens. */
+  [aria-roledescription="carousel"] > div:nth-child(2) {
+    width: 100%;
+    min-width: 0;
+    height: clamp(300px, 56vh, 380px) !important;
+  }
+
+  [aria-roledescription="carousel"] pre {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  [aria-roledescription="carousel"] pre code {
+    display: block;
+    width: max-content;
+    min-width: 100%;
+  }
+
+  /* Keep the live message caption and slide commentary inside the viewport
+     even when they contain long URLs, identifiers, or code-like tokens. */
+  [aria-roledescription="carousel"] p,
+  [aria-roledescription="carousel"] span {
+    overflow-wrap: anywhere;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .seq-enter,
+  .seq-edge-pop {
+    animation-duration: 1ms;
+    animation-delay: 0ms !important;
+  }
+  .seq-edge-dot {
+    animation: none;
+    opacity: 0;
+  }
+}

@@ -86,7 +86,7 @@ pub(crate) struct RunArgs {
     /// Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall,
     /// about `total_reference_bp / W` (one ref bin per worker) is faster and
     /// a *different* HSP set. Never overwritten from `--gpus`. See
-    /// `assets/guidance/guidance.md`.
+    /// <https://hillerlab.github.io/hspZ/docs/gpus/>.
     #[arg(short = 'B', long, default_value_t = 500_000_000)]
     pub(crate) seq_block_size: u32,
     /// Bin target for the *query* side; defaults to `--seq-block-size`.

@@ -13,7 +13,7 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [master]
   pull_request:
 
 permissions:
@@ -96,6 +96,16 @@ jobs:
             ln -sf "$s/libcuda.so" "$s/libcuda.so.1"
             export LD_LIBRARY_PATH="$s:${LD_LIBRARY_PATH:-}"
             cargo oxide test -- --release --locked'
+
+      - name: generated CLI reference
+        run: |
+          docker run --rm hspz-builder:ci bash -euc '
+            s=$(ls -d "$CUDA_HOME"/lib*/stubs | head -1)
+            ln -sf "$s/libcuda.so" "$s/libcuda.so.1"
+            export LD_LIBRARY_PATH="$s:${LD_LIBRARY_PATH:-}"
+            sh docs/scripts/generate-cli-reference.sh \
+              /build/bin/hspZ-sm_75 /tmp/cli-reference.txt
+            diff -u docs/src/generated/cli-reference.txt /tmp/cli-reference.txt'
 
   images:
     name: images build

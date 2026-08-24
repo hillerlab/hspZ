@@ -1,0 +1,68 @@
+import DocsLayout from "../../layouts/DocsLayout.astro"
+
+<DocsLayout title="Quick start" description="Generate one LASTZ-compatible segment set, then hand it to gapped extension.">
+
+<div className="warning"><strong>Preview release.</strong> This example is deliberately one chromosome pair and one strand. Whole genomes need partition-aware orchestration.</div>
+
+## 1. Generate HSPs
+
+The alignment profile used here is `K=2400, L=3000, H=2000, Y=9400`.
+K belongs to hspZ, so it must be passed explicitly—hspZ's default is 3000.
+
+```bash
+docker run --rm --gpus all \
+  -v "$PWD:/data" \
+  ghcr.io/hillerlab/hspz:0.0.3 \
+  hspZ run \
+    --reference /data/reference.2bit \
+    --query /data/query.2bit \
+    --output /data/segments \
+    --strand plus \
+    --hspthresh 2400 \
+    --time
+```
+
+For a non-empty first interval this writes
+`segments/tmp1.block0.r0.plus.segments`. No output file is created for an
+interval with no accepted HSP.
+
+## 2. Run LASTZ from that segment set
+
+Select the same reference and query records named inside the segment file.
+
+```bash
+lastz reference.2bit/chrRef query.2bit/chrQuery \
+  --segments=segments/tmp1.block0.r0.plus.segments \
+  --strand=plus \
+  --gappedthresh=3000 \
+  --inner=2000 \
+  --ydrop=9400 \
+  --allocate:traceback=1.99G \
+  --format=axt+ \
+  --output=chrRef.chrQuery.plus.axt
+```
+
+The parameter ownership is load-bearing:
+
+| parameter | value | consumer |
+| --- | ---: | --- |
+| K | 2400 | `hspZ run --hspthresh 2400` |
+| L | 3000 | `lastz --gappedthresh=3000` |
+| H | 2000 | `lastz --inner=2000` |
+| Y | 9400 | `lastz --ydrop=9400` |
+
+hspZ short `-H` means `--hspthresh`—LASTZ K—not LASTZ `--inner`.
+
+## Whole genomes
+
+A whole-genome `.segments` directory contains multiple partitions and both
+strands. Run LASTZ once per partition, split mixed files by reference/query
+chromosome pair, select those two 2bit records, and pass the strand encoded in
+the filename/record. Do not feed two whole-genome 2bit files and one mixed
+segment file to a single LASTZ process.
+
+The hspZ backend under development in `make_lastz_chains` is the reference
+orchestration. It becomes the recommended public path only after that backend
+is released there.
+
+</DocsLayout>

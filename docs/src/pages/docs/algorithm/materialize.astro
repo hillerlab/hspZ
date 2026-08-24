@@ -1,0 +1,16 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/materialize.md?raw"
+---
+
+<DocsLayout title="E. X-drop materialization" description="One warp recovers exact right and left maxima, endpoints, score, and the closed HSP interval." wide>
+  <p>The materializer repeats the exact score work for a tiny survivor set so the fast gate never becomes the source of record endpoints.</p>
+  <pre aria-label="One warp tile and first-drop rule"><code>{`warp lane       0   1   2   …  30  31
+sequence base   p   p+1 p+2 … p+30 p+31
+prefix score    ───────── inclusive scan ─────────
+running max     ───────── prefix maximum ─────────
+X-drop ballot   first set lane ends this direction
+endpoint        earliest lane attaining the winning maximum`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

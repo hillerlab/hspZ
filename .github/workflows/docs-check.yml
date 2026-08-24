@@ -1,0 +1,29 @@
+name: docs check
+
+on:
+  pull_request:
+    paths:
+      - docs/**
+      - src/**
+      - .github/workflows/docs-check.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docs-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack pnpm@10.15.0 install --dir docs --frozen-lockfile
+      - name: validate journeys and source links
+        run: corepack pnpm@10.15.0 --dir docs docs:validate -- --sources
+      - run: corepack pnpm@10.15.0 --dir docs build

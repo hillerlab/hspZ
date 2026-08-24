@@ -1,0 +1,10 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/entropy.md?raw"
+---
+
+<DocsLayout title="F. Entropy correction" description="Recount composition only in the score band where low-complexity correction can change acceptance." wide>
+  <p>Entropy is deferred until exact endpoints are known and only for scores in `[K, 3K]`. This preserves KegAlign's result while removing composition bookkeeping from the common path.</p>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

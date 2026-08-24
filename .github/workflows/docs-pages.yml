@@ -1,0 +1,41 @@
+name: docs pages
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    env:
+      HSPZ_DOC_VERSION: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: corepack pnpm@10.15.0 install --dir docs --frozen-lockfile
+      - name: validate journeys and source links
+        run: corepack pnpm@10.15.0 --dir docs docs:validate -- --sources
+      - run: corepack pnpm@10.15.0 --dir docs build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/dist
+      - name: deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
