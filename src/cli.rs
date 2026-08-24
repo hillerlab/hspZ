@@ -16,6 +16,7 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(
     name = "hspZ",
+    bin_name = "hspZ",
     version = env!("CARGO_PKG_VERSION"),
     about = "GPU-accelerated high-scoring ungapped alignment pair backend",
     author = env!("CARGO_PKG_AUTHORS")
@@ -252,6 +253,12 @@ pub(crate) struct Tuning {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn help_uses_public_binary_name() {
+        assert_eq!(Cli::command().get_bin_name(), Some("hspZ"));
+    }
 
     /// The short flags must parse without collisions — clap errors at parse
     /// time if two args in one subcommand share a letter, so this exercises
