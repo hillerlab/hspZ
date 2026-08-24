@@ -1,0 +1,60 @@
+import DocsLayout from "../../layouts/DocsLayout.astro"
+
+<DocsLayout title="Install" description="Run the release container, or build the pinned Rust and CUDA stack from source.">
+
+<div className="warning"><strong>Preview release.</strong> Pin an immutable version and keep a frozen output digest for your layout.</div>
+
+## NVIDIA container
+
+Version `0.0.3` embeds sm_75 PTX for Turing and newer NVIDIA GPUs and was built
+against CUDA 12.4 headers. The host needs an NVIDIA driver from the 550 series
+or newer and the NVIDIA Container Toolkit.
+
+```bash
+docker pull ghcr.io/hillerlab/hspz:0.0.3
+docker run --rm --gpus all \
+  -v "$PWD:/data" \
+  ghcr.io/hillerlab/hspz:0.0.3 \
+  hspZ --version
+```
+
+The mount matters: the image works in `/data`, and output must live in the
+mounted directory if it should survive the container.
+
+## AMD through ZLUDA
+
+The ZLUDA image is a validated correctness backend, not a claim that AMD and
+native NVIDIA have the same performance.
+
+```bash
+docker pull ghcr.io/hillerlab/hspz:0.0.3-zluda
+docker run --rm \
+  --device=/dev/kfd --device=/dev/dri \
+  --group-add video --group-add render \
+  -v "$PWD:/data" \
+  ghcr.io/hillerlab/hspz:0.0.3-zluda \
+  hspZ --version
+```
+
+`--gpus all` is an NVIDIA container flag; it does not expose AMD KFD devices.
+
+## Floating tags
+
+`:latest` and `:zluda` move only after the release passes the Kaggle T4 gate.
+Use `:0.0.3` and `:0.0.3-zluda` when reproducibility matters.
+
+## Build from source
+
+Use the checked-in nightly toolchain and the cuda-oxide revision pinned by
+`Cargo.lock`. Set `CUDA_HOME` to a CUDA toolkit compatible with the target
+driver, install the matching `cargo-oxide`, then build with:
+
+```bash
+cargo oxide build -- --release --locked
+target/release/hspZ --version
+```
+
+Plain `cargo build` does not run the cuda-oxide device build and is not a
+supported production build.
+
+</DocsLayout>

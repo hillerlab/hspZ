@@ -1,0 +1,16 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/hit-discovery.md?raw"
+---
+
+<DocsLayout title="C. Hit discovery" description="Count seed occurrences, preserve MAX_HITS chunk boundaries, and expand reference/query anchors in oracle order." wide>
+  <p>The cumulative hit array is both a total and an address map. It is therefore part of exactness, not temporary bookkeeping.</p>
+  <pre aria-label="Counts, prefixes, and backwards anchor writes"><code>{`seed count       0   3   1   0   5
+inclusive prefix 0   3   4   4   9
+
+seed 1 writes    [2] [1] [0]     ← backwards from prefix 3
+seed 2 writes                [3]
+seed 4 writes    [8] [7] [6] [5] [4]`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

@@ -1,0 +1,32 @@
+---
+import BaseLayout from "../layouts/BaseLayout.astro"
+import { withBase } from "../lib/site"
+---
+
+<BaseLayout>
+  <main id="content">
+    <section class="hero">
+      <img class="hero-logo-center" src={withBase("images/hz.png")} />
+      <br>
+      <p class="tagline">GPU-accelerated HSPs backend</p>
+      <div class="hero-actions">
+        <a class="button primary" href={withBase("docs/install/")}>Install</a>
+        <a class="button" href={withBase("docs/quick-start/")}>Quick start</a>
+        <a class="button" href={withBase("docs/algorithm/tour/")}>Algorithm</a>
+      </div>
+      <p class="hero-proof">NVIDIA and AMD via ZLUDA · 1–N GPU workers · KegAlign-compatible output</p>
+    </section>
+
+    <section class="overview" aria-labelledby="overview-title">
+      <span class="eyebrow">Whole-genome alignment</span>
+      <h2 id="overview-title">hspZ replaces Seed + Filter—not LASTZ.</h2>
+      <ol>
+        <li><strong>Genomes</strong><span>Softmasked FASTA, FASTA.gz, or 2bit.</span></li>
+        <li class="hspz-stage"><strong>hspZ</strong><span>Spaced seeds, X-drop, entropy, deterministic `.segments`.</span></li>
+        <li><strong>LASTZ</strong><span>Gapped extension from accepted HSPs.</span></li>
+        <li><strong>Chain</strong><span>Connect collinear local alignments.</span></li>
+        <li><strong>Net</strong><span>Select the hierarchical genome alignment.</span></li>
+      </ol>
+    </section>
+  </main>
+</BaseLayout>

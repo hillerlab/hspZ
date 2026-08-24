@@ -1,0 +1,50 @@
+import DocsLayout from "../../layouts/DocsLayout.astro"
+
+<DocsLayout title="GPUs and seeding" description="Reference bins are distributed across workers; output is replayed in deterministic work-unit order.">
+
+## Worker model
+
+`--gpus W` creates up to W workers and assigns complete reference bins by
+deterministic longest-processing-time scheduling. Every worker runs all query
+bins against the reference bins it owns. More workers than reference bins
+leave workers idle; more workers than devices time-slice a device and are a
+correctness configuration, not a speed configuration.
+
+GPU completion order never controls output order. Each result carries its
+`WorkUnit.ordinal`, and the emitter replays those ordinals in the planned order.
+
+## Seeder policy
+
+| workers | default query seeder |
+| ---: | --- |
+| 1 | CPU, with pinned asynchronous upload when supported |
+| more than 1 | device |
+
+For controlled measurements only:
+
+```bash
+HSPZ_DEVICE_SEEDS=0 hspZ run ...  # force CPU
+HSPZ_DEVICE_SEEDS=1 hspZ run ...  # force device
+```
+
+## Choosing `-B`
+
+The default 500 Mbp preserves the KegAlign-matched one-GPU digest; hspZ never
+changes it merely because `--gpus` changed.
+
+When a new digest is acceptable, start near the coarsest target that yields at
+least one reference bin per worker:
+
+```text
+--seq-block-size ≈ total reference bp / W
+```
+
+On one measured 4× RTX 4090 host, two bins per worker (`≈ total / 2W`) was 3.2%
+faster than one bin per worker. Treat that as a per-machine refinement, not a
+new default. Finer bins multiply work units and can be much slower.
+
+Use `--query-block-size` to avoid splitting the query merely because the
+reference needs more bins. Any changed block geometry gets its own frozen
+digest.
+
+</DocsLayout>

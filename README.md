@@ -33,6 +33,14 @@
   </span>
 
   <p align="center">
+    GPU-accelerated HSPs backend.<br>
+    <a href="https://hillerlab.github.io/hspZ/">docs</a>
+    · <a href="https://hillerlab.github.io/hspZ/docs/install/">install</a>
+    · <a href="https://hillerlab.github.io/hspZ/docs/algorithm/tour/">algorithm</a>
+    . <a href="https://hillerlab.com">us</a>
+  </p>
+
+  <p align="center">
     <a href="https://github.com/hillerlab/hspZ" reference="_blank">
       <img alt="GitHub License" src="https://img.shields.io/github/license/hillerlab/hspZ?color=blue">
     </a>

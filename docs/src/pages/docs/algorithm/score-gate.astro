@@ -1,0 +1,14 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/score-gate.md?raw"
+---
+
+<DocsLayout title="D. Score gate" description="Reject almost every raw anchor with an exact score-only X-drop pass, then compact the rare survivors stably." wide>
+  <p>The funnel is intentionally extreme. On frozen workload A, the gate preserved the exact oracle output while avoiding full HSP materialization for nearly every hit.</p>
+  <pre aria-label="Measured score-gate funnel"><code>{`162,123,203  raw seed-hit anchors
+     27,342  score-gate survivors  (0.0169%)
+     10,680  accepted raw HSPs
+      4,248  final HSPs after host dedup`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

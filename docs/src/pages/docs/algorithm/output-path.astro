@@ -1,0 +1,14 @@
+---
+import DocsLayout from "../../../layouts/DocsLayout.astro"
+import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
+import journey from "../../../journeys/output.md?raw"
+---
+
+<DocsLayout title="G. Deterministic output" description="Compact, deduplicate, order, convert, partition, and emit the exact segment records LASTZ consumes." wide>
+  <p>Output is a semantic stage: dedup scope, previous-input comparisons, strand traversal, coordinate conversion, and ordinal replay all affect final bytes.</p>
+  <pre aria-label="LASTZ segments record"><code>{`reference  ref_start  ref_end  query  query_start  query_end  strand  score
+chr20      10541      10608    chr19  7731         7798       +       4187
+
+coordinates: chromosome-relative · 1-based · inclusive`}</code></pre>
+  <AlgorithmJourney markdown={journey} />
+</DocsLayout>

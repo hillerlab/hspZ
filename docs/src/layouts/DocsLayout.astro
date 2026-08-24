@@ -1,0 +1,38 @@
+---
+import BaseLayout from "./BaseLayout.astro"
+import { navigation } from "../lib/nav"
+import { DOC_VERSION, withBase } from "../lib/site"
+
+interface Props {
+  title: string
+  description: string
+  wide?: boolean
+}
+
+const { title, description, wide = false } = Astro.props
+const here = Astro.url.pathname.replace(/\/+$/, "/")
+---
+
+<BaseLayout title={`${title} · hspZ`} {description}>
+  <div class="docs-shell">
+    <aside class="docs-nav" aria-label="Documentation">
+      {navigation.map((group) => (
+        <section>
+          <h2>{group.label}</h2>
+          {group.links.map(([label, path]) => {
+            const href = withBase(path)
+            return <a href={href} aria-current={here === href ? "page" : undefined}>{label}</a>
+          })}
+        </section>
+      ))}
+    </aside>
+    <main id="content" class="docs-main">
+      <header class="docs-title">
+        <span class="eyebrow">hspZ {DOC_VERSION}</span>
+        <h1>{title}</h1>
+        <p>{description}</p>
+      </header>
+      <article class:list={["prose", { wide }]}><slot /></article>
+    </main>
+  </div>
+</BaseLayout>
