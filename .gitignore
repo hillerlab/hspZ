@@ -21,6 +21,8 @@ __pycache__/
 
 # local working plan, intentionally untracked
 PLAN.md
+**/PROVENANCE.md
+**/THIRD_PARTY_NOTICES.md
 
 # agent worktrees and scratch
 .claude/
