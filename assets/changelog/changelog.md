@@ -55,6 +55,9 @@ RTX 4090, AMD via ZLUDA), plus the foundation repairs behind them.
   4090 → off, measured). `1`/`0` force a path; `HSPZ_REF_BUCKET_SHIFT=<16..31>`
   pins the window size; cards whose L2 cannot hold the smallest window (T4) stay
   off. `--time` prints the per-block measurements and the decision per engine.
+  The window budget is three quarters of the L2: on an L4 that selects the
+  32 MiB window, measured 2.8–3.0% less GPU time than 16 MiB on two whole-genome
+  work units with identical output.
 - **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits`
   used to copy its whole cumulative hit array to the host (~6.8 MB, pageable) to
   locate two or three chunk boundaries. The walk now fetches only the ≤1 KB block

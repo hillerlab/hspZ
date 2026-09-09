@@ -903,7 +903,7 @@ pub struct Engine {
     /// pass. `HSPZ_REF_BUCKETS=0`/`=1` force it off/on; `=auto` runs
     /// alternating LONG blocks of each production path (OFF, ON x3) and
     /// commits to the faster settled ns/hit; geometry auto-off (a window
-    /// that does not fit 2/3 L2) forces it off before any block. A pinned
+    /// that does not fit 3/4 of L2) forces it off before any block. A pinned
     /// `HSPZ_REF_BUCKET_SHIFT` always reports "fits", which is how it forces
     /// the pass on under `auto` too.
     #[cfg(feature = "ref-loc-buckets")]
@@ -1111,11 +1111,15 @@ const BUCKET_STREAM_BYTES: u64 = 1 << 20;
 /// testable without a device context or env vars.
 ///
 /// Picks the LARGEST window whose reference bytes, plus the sorted bitmask
-/// (`max_hits/8`) and the gate's own resident streams, still fit two thirds of
-/// `l2_bytes` — a bigger window means fewer buckets and a cheaper scatter, and
-/// round 2's bitmask made the flag term 32x smaller, so there is room the
-/// byte-flag version did not have. `B <= 32` is a hard kernel invariant of the
-/// ballot loop, so the search never goes below the smallest legal shift.
+/// (`max_hits/8`) and the gate's own resident streams, still fit three quarters
+/// of `l2_bytes` — a bigger window means fewer buckets and a cheaper scatter,
+/// and round 2's bitmask made the flag term 32x smaller, so there is room the
+/// byte-flag version did not have. Two thirds was the round-83 setting; the L4
+/// (48 MiB) then chose 16 MiB, and forced 32 MiB measured 2.8% less GPU busy
+/// on W1 unit 0 in disjoint reversed pairs (Delta 53956614, 2026-09-09), so the
+/// budget is 3/4: the L4 lands on 32 MiB, the 4090 (72 MiB) and T4 (4 MiB)
+/// choices are unchanged. `B <= 32` is a hard kernel invariant of the ballot
+/// loop, so the search never goes below the smallest legal shift.
 ///
 /// If even that smallest legal window does not fit the budget (a small-L2
 /// card), or `l2_bytes` is 0 (the L2 attribute is unavailable), a bucket
@@ -1128,7 +1132,7 @@ fn ref_bucket_policy(ref_len: u32, max_hits: u32, l2_bytes: u64) -> (u32, u32, b
     let buckets = |s: u32| (ref_len >> s) + 1;
     // `ref_len` is a u32, so `ref_len >> 31 <= 1` and this always lands.
     let min_shift = (16..=31).find(|&s| buckets(s) <= 32).unwrap_or(31);
-    let budget = (l2_bytes / 3) * 2;
+    let budget = (l2_bytes / 4) * 3;
     let overhead = u64::from(max_hits) / 8 + BUCKET_STREAM_BYTES;
     match (min_shift..=31)
         .rev()
@@ -1676,7 +1680,7 @@ impl Engine {
                         "L2 attribute unavailable".to_string()
                     } else {
                         format!(
-                            "{} smallest legal window exceeds the 2/3-L2 budget (L2 {} MiB)",
+                            "{} smallest legal window exceeds the 3/4-L2 budget (L2 {} MiB)",
                             window_desc(shift),
                             l2 >> 20,
                         )
@@ -4317,26 +4321,32 @@ mod tests {
         assert!(use_warp_find_hits(160, 10));
     }
 
-    /// Cycle 4: the smallest legal window (`B <= 32`) for a 427 Mbp reference is
-    /// shift 24 (16 MiB); shift 25 (32 MiB) is legal too but its window alone
-    /// (33,554,432 B) already equals the L4's exact budget, so any positive
-    /// overhead pushes it over and the search settles one step down. The T4-like
-    /// and boundary cases reuse the same `ref_len`/`max_hits` and vary only
-    /// `l2_bytes`, so the only thing under test is the budget arithmetic.
+    /// Cycle 4/5: the smallest legal window (`B <= 32`) for a 427 Mbp reference
+    /// is shift 24 (16 MiB); shift 25 (32 MiB) is legal too. With the 3/4 budget
+    /// the L4's 36 MiB admits 32 MiB + 3 MiB of overhead (measured 2.8% less GPU
+    /// busy than 16 MiB on unit 0); the 4090 keeps 32 MiB (64 MiB + overhead
+    /// exceeds 54 MiB). The T4-like and boundary cases reuse the same
+    /// `ref_len`/`max_hits` and vary only `l2_bytes`, so the only thing under
+    /// test is the budget arithmetic.
     #[cfg(feature = "ref-loc-buckets")]
     #[test]
     fn ref_bucket_policy_auto_offs_a_small_l2() {
         const REF_LEN: u32 = 427_000_000;
         const MAX_HITS: u32 = 16_711_680;
 
-        // L4-like: 48 MiB L2 -> 32 MiB budget. Window 25 (32 MiB) ties the
-        // budget exactly before overhead, so it never fits; window 24 does.
+        // L4-like: 48 MiB L2 -> 36 MiB budget. Window 25 (32 MiB) plus the
+        // ~3 MiB overhead fits; window 26 (64 MiB) does not.
         let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 48 << 20);
         assert!(on, "L4-like L2 must fit a legal window");
-        assert_eq!(shift, 24, "L4-like L2 must land on shift 24");
+        assert_eq!(shift, 25, "L4-like L2 must land on the 32 MiB window");
 
-        // RTX-4090-like: 72 MiB L2 -> 48 MiB budget, wide enough for the 32 MiB
-        // window that L4's budget just missed.
+        // A 40 MiB L2 (A100-like) -> 30 MiB budget: 32 MiB + overhead misses,
+        // so it settles on 16 MiB.
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 40 << 20);
+        assert!(on, "40 MiB L2 must fit a legal window");
+        assert_eq!(shift, 24, "40 MiB L2 must land on shift 24");
+
+        // RTX-4090-like: 72 MiB L2 -> 54 MiB budget: 32 MiB fits, 64 MiB does not.
         let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 72 << 20);
         assert!(on, "4090-like L2 must fit a legal window");
         assert_eq!(shift, 25, "4090-like L2 must land on the 32 MiB window");
