@@ -20,7 +20,7 @@
 //! The port grew well beyond the original single-block stage:
 //!
 //! * **Inputs** — FASTA, FASTA.gz and 2bit, detected by magic bytes, all
-//!   decoding to the same packed representation.
+//!   decoding to the same packed representation (`sequence.rs`, round 16).
 //! * **Planning** — whole chromosomes are binned by the planner (`plan.rs`);
 //!   reference and query block targets are independent (`-B` /
 //!   `--query-block-size`), and `--kegalign-bins` reproduces KegAlign's
@@ -29,7 +29,7 @@
 //!   assigned by deterministic LPT, output replayed in ordinal order so it
 //!   never depends on which GPU finished first. Above one worker the seeds are
 //!   generated on the device, and the seed upload runs on a second stream
-//!   overlapped with the previous batch's compute.
+//!   overlapped with the previous batch's compute (rounds 29–30).
 //! * **Output** — in-memory diagonal partitioning (`-D`, a port of
 //!   `diagonal_partition.py` with exact counts instead of byte estimates) and
 //!   reproducible `.tar.gz` archives (`-Z`, mtime pinned); both are
@@ -47,12 +47,12 @@
 //! block target 500 Mbp (the KegAlign-matched digest layout),
 //! `--query-block-size` (defaults to `-B`), `--max-hits` derived as
 //! `4194304 * device GiB`, `-G/--gpus 1`, `-S` strand, `-x` X-drop 910,
-//! `-H` HSP threshold 3000, `-D`, `-Z`, `-y/--time` (wall-time accounting with
-//! CUDA events), `-u/--cpu-only`, `--threads 0` = available parallelism, split
+//! `-H` HSP threshold 3000, `-D`, `-Z`, `-y/--time` (phase ledger with CUDA
+//! events), `-u/--cpu-only`, `--threads 0` = available parallelism, split
 //! across workers when `--gpus > 1`. `HSPZ_DEVICE_SEEDS` forces the seeder so
 //! 1-GPU vs N-GPU wall is a matched scaling number.
 //!
-//! # Quick benchmark data
+//! # Quick benchmark data (benchmarks/baseline.md, assets/guidance/guidance.md)
 //!
 //! * **Parity** — byte-identical to the C++ oracle wherever plan and
 //!   `MAX_HITS` match: apple/orange 1,226 HSPs, A 4,248, B 8,908, chr1
@@ -60,10 +60,11 @@
 //! * **vs KegAlign** — 2.13–2.23x faster HSP generation on one NVIDIA L4
 //!   (whole-genome pipeline 37.3 s vs 17.5 s), ~2.2x end to end.
 //! * **Multi-GPU** — whole hg38 x mm39 in 11.9 min on 4x RTX 4090
-//!   (`-B 400 Mbp`, R=8); matched-seeder scaling 3.587x of 4 =
+//!   (`-B 400 Mbp`, R=8, round 79); matched-seeder scaling 3.587x of 4 =
 //!   89.7% efficiency.
 //! * **Single-GPU native** — L4 A 447 ms / B 386 ms (6.8x over the original
-//!   ZLUDA baseline); score gate at 1.23 ns/hit.
+//!   ZLUDA baseline); score gate at 1.23 ns/hit; the kernel cycle is closed
+//!   (round 78).
 //! * **Exactness caveat** — block layout and `--max-hits` set the dedup
 //!   scope, so different layouts produce different (not wrong) HSP sets;
 //!   keep a frozen digest per layout.
@@ -78,9 +79,9 @@ mod partition;
 mod plan;
 mod run;
 mod scoring;
+mod sink;
 mod seed;
 mod sequence;
-mod sink;
 mod timing;
 
 use clap::Parser;

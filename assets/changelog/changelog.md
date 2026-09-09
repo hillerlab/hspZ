@@ -36,6 +36,46 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.4] — 2026-09-09
+
+Two exact speed-ups, both byte-identical to 0.0.3 on every device tested (NVIDIA L4,
+RTX 4090, AMD via ZLUDA), plus the foundation repairs behind them.
+
+- **Reference-locality bucketing (`ref-loc-buckets`, default feature).** Between
+  `find_hits` and the score gate, each hit chunk is stably reordered into
+  reference-address buckets so consecutive warps gather from an L2-resident
+  reference window; survivors are restored to their original order before
+  `find_hsps`, so the HSP set and file bytes are unchanged. On a 72 W L4 the
+  lower DRAM traffic lets the SM clock rise (1142 → 1370 MHz) and the whole-genome
+  wall falls **6.5%** (hg38 × mm39, one GPU, disjoint reversed pairs). Cards that
+  already run near their boost clock pay the bucketing pass instead (RTX 4090:
+  +3.7%), so the choice is made at runtime: `HSPZ_REF_BUCKETS` unset means `auto`
+  — each engine alternates both paths in blocks of ≥3 s of gate time, discards
+  each block's first second, and commits to the faster settled path (L4 → on,
+  4090 → off, measured). `1`/`0` force a path; `HSPZ_REF_BUCKET_SHIFT=<16..31>`
+  pins the window size; cards whose L2 cannot hold the smallest window (T4) stay
+  off. `--time` prints the per-block measurements and the decision per engine.
+- **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits`
+  used to copy its whole cumulative hit array to the host (~6.8 MB, pageable) to
+  locate two or three chunk boundaries. The walk now fetches only the ≤1 KB block
+  holding each boundary, producing the same chunks. On two RTX 4090s at whole
+  genome this is **−9.6%** wall (1,634 → 1,480 s, disjoint reversed pairs); on
+  an L4 the copy was hidden under the gate, so nothing changes.
+  `HSPZ_CHUNK_WALK=full` restores the old path.
+- **Foundations.** The `--max-hits` target (semantic, decides chunk boundaries and
+  therefore output) is now separated from the physical hit capacity derived from
+  free VRAM (decides success or failure only); the historical over-cap tail that
+  aborted whole-genome runs is admitted without changing any chunk. `--dump-plan`
+  / `--dump-manifest` / `--from-manifest` freeze and replay a plan (a second node
+  validates fit and fails rather than replanning). The `--time` ledger gained
+  query-pack / swap timers, per-worker GPU-busy and stage-gap notes, and an
+  explicit host-memory budget line. Multi-GPU output is byte-identical to the
+  one-GPU output at the same plan and cap.
+- **Measured but not shipped** (recorded so nobody repeats them): certified
+  query-context rejection (0.19% of hits), nibble-packed reference at genome
+  scale (+0.1%), a 64 M hit cap (+1%), per-chunk and paired-chunk autotuning of
+  the bucketing pass (both misread the clock-mediated L4 win).
+
 ## [0.0.3] — 2026-08-21
 
 Warp-per-seed `find_hits` for dense launches, on by default.

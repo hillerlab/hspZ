@@ -5,10 +5,10 @@
 // Github : alejandrogzi
 // Email  : alejandrxgzi@gmail.com
 
-//! The `benchmark` command. Prepares input and the CUDA context once, warms
-//! up, then times repeated Seed + Filter passes, checking after every one that
-//! the HSP hash is unchanged. The FNV hashes here are the parity check the
-//! whole performance work is built on.
+//! The `benchmark` command: the optimization oracle. Prepares input and the
+//! CUDA context once, warms up, then times repeated Seed + Filter passes,
+//! checking after every one that the HSP hash is unchanged. The FNV hashes
+//! here are the parity check the whole optimization loop is built on.
 
 use crate::Fallible;
 use crate::cli::BenchArgs;
@@ -24,7 +24,29 @@ use std::path::Path;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// benchmark
+// benchmark — PLAN.md Milestone 3
+
+/// One timed warm iteration: its wall elapsed and that same iteration's phase
+/// rows, kept together so a stage table always describes the pass it was
+/// recorded for. `warms` is never reordered in place — statistics select the
+/// median through an index view ([`sorted_sample_indices`]) and JSON reads
+/// `elapsed_ms` and `phases` from the same element, so the ordinal and the
+/// stages stay paired.
+struct WarmSample {
+    elapsed_ms: f64,
+    phases: Phases,
+}
+
+/// Original-order indices sorted by ascending `elapsed_ms`, so statistics and
+/// the test read a sample's stages from the same element its duration came
+/// from. The middle element of the returned order keeps the existing
+/// upper-middle median convention. `warms` itself is never reordered, so JSON
+/// ordinals stay the real execution order.
+fn sorted_sample_indices(warms: &[WarmSample]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..warms.len()).collect();
+    order.sort_by(|&a, &b| warms[a].elapsed_ms.total_cmp(&warms[b].elapsed_ms));
+    order
+}
 
 pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     // The benchmark always wants CUDA-event durations alongside host time.
@@ -40,21 +62,41 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     let ctx = CudaContext::new(0)?;
     cold.add("CUDA context init", t.elapsed());
 
-    let mut engine = Engine::new(&ctx, p.engine_config(run_args), &mut cold)?;
+    let mut contract =
+        gpu::ExecutionContract::resolve(&ctx, run_args.max_hits, run_args.hsp_blocks);
+    // Physical capacity for this prepared single-bin pair under a one-device
+    // budget; same helper and kernel clamp as production. Never replans.
+    {
+        let plan = p.capacity_plan();
+        let budget = gpu::min_free_bytes(1)?;
+        let (shape, transitions) = p.seeding();
+        let candidate = crate::plan::max_hit_capacity(
+            &plan,
+            budget,
+            shape.kmer_size,
+            run_args.step,
+            contract.max_hits,
+            run_args.wga_chunk_size,
+            transitions,
+        )?;
+        contract.hit_capacity =
+            gpu::clamp_hit_capacity(contract.max_hits, candidate, contract.hsp_blocks)?;
+    }
+    let mut engine = Engine::new(&ctx, p.engine_config(run_args, &contract), &mut cold)?;
     // Single-worker driver, so this is the env override or false — but it must go
     // through the same function the executor uses, or the two disagree silently.
     engine.device_seeds = device_seeds_for(1);
-    // Reference-only construction, so the query enters via swap_query exactly
-    // as it will for every bin in a multi-bin plan.
+    // AM-B1: reference-only construction, so the query enters via swap_query
+    // exactly as it will for every bin in a multi-bin plan.
     let (fwd, rc) = p.encoded_query();
     engine.swap_query(fwd, rc)?;
     engine.collect_hit_stats = true;
     engine.persistent_seed_buffers = !run_args.no_persistent_seed_buffers;
     engine.async_stages = !run_args.no_async_stages;
 
-    // -D / -Z put partition/format/archive on the critical path; without them
-    // the benchmark never touches the output layer, so the core numbers stay
-    // identical to before.
+    // -D / -Z put partition/format/archive on the critical path (PLAN.md §15/§22);
+    // without them the benchmark never touches the output layer, so the core
+    // numbers stay identical to before.
     let output_mode = run_args.tarball.is_some() || run_args.diagonal_partition;
 
     // Cold: first pass, paying every one-time cost.
@@ -107,14 +149,16 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
         }
     }
 
-    // Warm: repeated Seed + Filter with everything already resident.
-    let mut samples = Vec::with_capacity(args.iterations as usize);
-    let mut warm_phases = Phases::new();
+    // Warm: one record per iteration so the median elapsed is paired with *that*
+    // iteration's stages, not the last pass vs a sorted elapsed sample. The
+    // record type lives at module scope ([`WarmSample`]), so the no-GPU
+    // regression test drives the same selection/serialization path.
+    let mut warms = Vec::with_capacity(args.iterations as usize);
     let mut out_sum = OutputReport::default();
     let mut out_iters = 0usize;
     for _ in 0..args.iterations {
         engine.phases = Phases::new();
-        // The gap accumulator is per-pass, like `phases`, or it is quoted
+        // Round 71: the gap accumulator is per-pass, like `phases`, or it is quoted
         // against a wall it does not cover.
         engine.reset_gaps();
         let t = Instant::now();
@@ -129,12 +173,11 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
                 resolve_threads(run_args.threads),
             )?
         };
-        samples.push(t.elapsed().as_secs_f64() * 1000.0);
         if hash_pass(&pass) != reference_hash {
             return Err("benchmark iteration produced different HSPs".into());
         }
         if output_mode {
-            let r = write_outputs(run_args, &p, &pass, &mut Phases::new())?;
+            let r = write_outputs(run_args, &p, &pass, &mut engine.phases)?;
             out_sum.partition_ms += r.partition_ms;
             out_sum.format_ms += r.format_ms;
             out_sum.archive_ms += r.archive_ms;
@@ -143,13 +186,23 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
             out_sum.bytes_out += r.bytes_out;
             out_iters += 1;
         }
-        warm_phases = std::mem::take(&mut engine.phases);
+        warms.push(WarmSample {
+            elapsed_ms: t.elapsed().as_secs_f64() * 1000.0,
+            phases: std::mem::take(&mut engine.phases),
+        });
     }
-    samples.sort_by(f64::total_cmp);
-
-    let median = samples[samples.len() / 2];
-    let mean = samples.iter().sum::<f64>() / samples.len() as f64;
-    let p95 = samples[((samples.len() as f64 * 0.95) as usize).min(samples.len() - 1)];
+    // Statistics sort an *index* view so each sample's elapsed stays paired with
+    // its own stages; `warms` keeps original execution order for JSON ordinals.
+    let order = sorted_sample_indices(&warms);
+    let sorted: Vec<f64> = order.iter().map(|&i| warms[i].elapsed_ms).collect();
+    let mid = sorted.len() / 2;
+    let median = sorted[mid];
+    let mean = sorted.iter().sum::<f64>() / sorted.len() as f64;
+    let p95 = sorted[((sorted.len() as f64 * 0.95) as usize).min(sorted.len() - 1)];
+    // The sample whose *own* elapsed is the median — its stages, not a sorted
+    // neighbour's, are what the WARM STAGES table and the JSON median show.
+    let median_idx = order[mid];
+    let median_iteration = median_idx + 1;
 
     println!("PARITY");
     println!("  final HSP hash    {reference_hash:016x}");
@@ -162,14 +215,15 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     println!("  warm p95          {p95:9.2}");
     println!(
         "  warm min/max      {:9.2} / {:.2}",
-        samples[0],
-        samples[samples.len() - 1]
+        sorted[0],
+        sorted[sorted.len() - 1]
     );
     println!("  iterations        {:9}", args.iterations);
     println!("\nCOLD BREAKDOWN\n{}", cold.report(cold_total));
     println!(
-        "WARM STAGES (last iteration)\n{}",
-        warm_phases.report(median)
+        "WARM STAGES (median iteration {median_iteration} of {})\n{}",
+        args.iterations,
+        warms[median_idx].phases.report(median)
     );
     println!("LAUNCH OVERHEAD");
     println!(
@@ -186,8 +240,7 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
         write_json_records(
             args,
             path,
-            &samples,
-            &warm_phases,
+            &warms,
             &first,
             &engine,
             launch_ms,
@@ -234,8 +287,8 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     }
     let (gap_ms, gap_n, gap_max, (ga, gb)) = engine.stage_gaps();
     if gap_n > 0 {
-        // GPU-timeline idle between one stage's end and the next stage's start,
-        // which is the only place a host round trip inside the chunk loop can
+        // Round 71: GPU-timeline idle between one stage's end and the next stage's
+        // start, which is the only place a host round trip inside the chunk loop can
         // show up. The phase rows cannot recover it.
         println!(
             "  stage gaps        {gap_ms:9.2} ms over {gap_n} pairs, largest {gap_max:.3} ms \
@@ -265,46 +318,46 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     Ok(())
 }
 
-/// One JSON record per warm iteration, appended so a whole matrix
+/// One JSON record per warm iteration (PLAN.md §6), appended so a whole matrix
 /// lands in a single `results.jsonl`. Hand-rolled rather than pulling in serde:
 /// this is the only JSON the binary emits and every value is a number, a bool,
 /// or one of our own label strings.
+///
+/// The wrapper is the only code that touches GPU/run state: it gathers the
+/// engine facts and device memory, folds them into `common_fields` once, and
+/// delegates the per-iteration emission to the GPU-free [`write_json_samples`].
+/// Every record still derives its `whole_ms`, `stages`, and `counts.batches`
+/// from the *same* [`WarmSample`] it is numbered after, and `first` is
+/// run-level — every pass is hash-checked identical.
 #[allow(clippy::too_many_arguments)]
 fn write_json_records(
     args: &BenchArgs,
     path: &Path,
-    samples: &[f64],
-    warm: &Phases,
+    warms: &[WarmSample],
     first: &Pass,
     engine: &Engine,
     launch_ms: f64,
     segments_hash: u64,
 ) -> Fallible<()> {
-    use std::io::Write;
+    // This function is only reached when --json is requested, so the device
+    // query belongs here rather than in the caller where it would run even for
+    // a plain benchmark.
     let (_, total_mem) = gpu::device_memory();
-    let stages = warm.json_stages();
-    let counts = format!(
-        "{{\"seeds\":{},\"seed_hits\":{},\"raw_hsps\":{},\"hsps\":{},\"batches\":{}}}",
-        first.stats.seeds,
-        first.stats.seed_hits,
-        first.stats.raw_hsps,
-        first.stats.hsps,
-        warm.calls("find_hsps"),
-    );
     let parity = format!(
         "{{\"hsp_hash\":\"{:016x}\",\"segments_hash\":\"{:016x}\"}}",
         hash_pass(first),
         segments_hash,
     );
-    // Every variant must prove its mechanism activated before any timing delta
-    // is read — a full performance table was once produced from six arms that
-    // had all silently run the baseline config. These are recorded per run and
-    // `report.py` marks a mismatch VOID rather than PASS/FAIL/INCONCLUSIVE.
+    // PLAN.md §1.2: every variant must prove its mechanism activated before any
+    // timing delta is read. Job 49359833 produced a full performance table from
+    // six arms that had all silently run the baseline config, so these are
+    // recorded per run and `report.py` marks a mismatch VOID rather than
+    // PASS/FAIL/INCONCLUSIVE.
     let mechanisms = format!(
         "{{\"pinned_seeds\":{},\"persistent_seed_buffers\":{},\"entropy_unpacked\":false,\
          \"segment_align16\":{},\"find_num_unchecked\":{},\"async_seed_upload\":{},\
          \"device_seeds\":{},\"device_seed_check\":{},\"warp_score_gate\":{},\"dense_anchors\":{},\
-         \"left_pair_tile\":{},\"simd_prelude\":{},\"hsp_blocks\":{},\
+         \"left_pair_tile\":{},\"simd_prelude\":{},\"hsp_blocks\":{},\"hit_capacity\":{},\
          \"stage_syncs\":{},\"pipeline_syncs\":{}}}",
         engine.pinned_seeds_active(),
         !args.run.no_persistent_seed_buffers,
@@ -318,6 +371,7 @@ fn write_json_records(
         cfg!(feature = "left-pair-tile"),
         cfg!(feature = "simd-prelude"),
         engine.hsp_blocks(),
+        engine.hit_capacity(),
         engine.stage_syncs(),
         engine.pipeline_syncs(),
     );
@@ -338,30 +392,58 @@ fn write_json_records(
         args.env_json.trim(),
     );
 
+    // Run-level record fields, once, without outer braces: variant, workload,
+    // launch overhead, peak VRAM, and the three run-level objects.
+    let common_fields = format!(
+        "\"variant\":\"{}\",\"workload\":\"{}\",\"launch_ms\":{:.6},\"peak_vram_mib\":{:.1},\
+         \"parity\":{},\"mechanisms\":{},\"environment\":{}",
+        timing::json_key(&args.variant),
+        timing::json_key(&args.workload),
+        launch_ms,
+        engine.peak_used as f64 / 1048576.0,
+        parity,
+        mechanisms,
+        env,
+    );
+
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    for (i, ms) in samples.iter().enumerate() {
+    write_json_samples(&mut f, warms, first, &common_fields)?;
+    Ok(())
+}
+
+/// Emits one complete JSON object per warm iteration in original execution
+/// order onto `out`. All run-level fields arrive pre-rendered in
+/// `common_fields` — a leading field list without outer braces — and each
+/// record appends its own `iteration`, `whole_ms`, `stages`, and `counts`, all
+/// read from the same [`WarmSample`], so the ordinal and the stages stay
+/// paired. GPU-free: the benchmark writes to the JSON file, the regression test
+/// to a `Vec<u8>`.
+fn write_json_samples(
+    out: &mut impl std::io::Write,
+    samples: &[WarmSample],
+    first: &Pass,
+    common_fields: &str,
+) -> std::io::Result<()> {
+    for (i, s) in samples.iter().enumerate() {
+        let stages = s.phases.json_stages();
+        let counts = format!(
+            "{{\"seeds\":{},\"seed_hits\":{},\"raw_hsps\":{},\"hsps\":{},\"batches\":{}}}",
+            first.stats.seeds,
+            first.stats.seed_hits,
+            first.stats.raw_hsps,
+            first.stats.hsps,
+            s.phases.calls("find_hsps"),
+        );
         writeln!(
-            f,
-            "{{\"variant\":\"{}\",\"workload\":\"{}\",\"iteration\":{},\
-             \"whole_ms\":{:.4},\"launch_ms\":{:.6},\"peak_vram_mib\":{:.1},\
-             \"stages\":{},\"counts\":{},\"parity\":{},\"mechanisms\":{},\
-             \"environment\":{}}}",
-            timing::json_key(&args.variant),
-            timing::json_key(&args.workload),
+            out,
+            "{{{common_fields},\"iteration\":{},\"whole_ms\":{:.4},\"stages\":{},\"counts\":{}}}",
             i + 1,
-            ms,
-            launch_ms,
-            engine.peak_used as f64 / 1048576.0,
-            // Stages are the last warm iteration's; per-iteration phase capture
-            // would double the timing overhead for no decision value.
+            s.elapsed_ms,
             stages,
             counts,
-            parity,
-            mechanisms,
-            env,
         )?;
     }
     Ok(())
@@ -438,11 +520,67 @@ fn hash_segments(p: &Prepared, pass: &Pass) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn fnv_distinguishes_records() {
         let a = fnv1a(b"abc", FNV_OFFSET);
         assert_ne!(a, fnv1a(b"abd", FNV_OFFSET));
         assert_eq!(a, fnv1a(b"abc", FNV_OFFSET), "stable");
+    }
+
+    /// F5 regression: durations are out of order and each sample carries
+    /// distinct phase timings and `find_hsps` call counts, so any cross-
+    /// iteration mispair — a wrong sample's elapsed, stages, or batch count —
+    /// fails its line's assertions. Drives the real selection
+    /// ([`sorted_sample_indices`]) and serialization ([`write_json_samples`])
+    /// with no GPU and no temporary file.
+    #[test]
+    fn json_records_keep_each_iterations_stages_paired_with_its_elapsed() {
+        let mk = |elapsed: f64, stage: &str, stage_ms: u64, find_calls: u32| -> WarmSample {
+            let mut p = Phases::new();
+            p.add(stage, Duration::from_millis(stage_ms));
+            for _ in 0..find_calls {
+                p.add_gpu("find_hsps", Duration::from_millis(3), 2.0);
+            }
+            WarmSample {
+                elapsed_ms: elapsed,
+                phases: p,
+            }
+        };
+        // Original order 100 / 50 / 75 ms: the 75 ms median is the *last*
+        // sample (index 2), not the middle position, so a naive middle-sample
+        // selection (50 ms) is caught.
+        let warms = vec![
+            mk(100.0, "alpha", 20, 1),
+            mk(50.0, "beta", 10, 5),
+            mk(75.0, "gamma", 30, 9),
+        ];
+        let order = sorted_sample_indices(&warms);
+        assert_eq!(order, vec![1usize, 2, 0]);
+        assert_eq!(order[warms.len() / 2], 2, "median is the 75 ms sample");
+
+        // Run-level fields arrive pre-rendered; the helper only appends each
+        // iteration's own fields, so this checks the wiring, not metadata.
+        let common = "\"variant\":\"bench\",\"workload\":\"hsps\",\"launch_ms\":0.000000,\
+                      \"peak_vram_mib\":0.0,\"parity\":{},\"mechanisms\":{},\"environment\":{}";
+        let mut out = Vec::new();
+        write_json_samples(&mut out, &warms, &Pass::default(), common).unwrap();
+        let lines: Vec<&str> = std::str::from_utf8(&out).unwrap().lines().collect();
+        assert_eq!(lines.len(), warms.len(), "one record per warm iteration");
+        for (i, s) in warms.iter().enumerate() {
+            let line = lines[i];
+            let stages = s.phases.json_stages();
+            assert!(line.contains(&format!("\"iteration\":{}", i + 1)), "{line}");
+            assert!(
+                line.contains(&format!("\"whole_ms\":{:.4}", s.elapsed_ms)),
+                "{line}"
+            );
+            assert!(line.contains(&format!("\"stages\":{stages}")), "{line}");
+            assert!(
+                line.contains(&format!("\"batches\":{}", s.phases.calls("find_hsps"))),
+                "{line}"
+            );
+        }
     }
 }

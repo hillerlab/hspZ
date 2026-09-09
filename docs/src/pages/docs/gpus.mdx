@@ -27,6 +27,16 @@ HSPZ_DEVICE_SEEDS=0 hspZ run ...  # force CPU
 HSPZ_DEVICE_SEEDS=1 hspZ run ...  # force device
 ```
 
+## Runtime tuning knobs (0.0.4)
+
+Both knobs are exact: every mode produces the same HSP set and the same bytes.
+
+| variable | default | what it does |
+| --- | --- | --- |
+| `HSPZ_REF_BUCKETS=auto\|1\|0` | `auto` | Reference-locality bucketing before the score gate. It wins where lower DRAM traffic lets a power-capped GPU raise its clock (L4: −6.5% whole-genome wall) and loses where the card already runs near its boost clock (RTX 4090: +3.7%). `auto` measures both paths per engine in blocks of ≥3 s, discards each block's first second, and keeps the faster one; `--time` prints the blocks and the decision. Cards whose L2 cannot hold the smallest window (T4) stay off. |
+| `HSPZ_REF_BUCKET_SHIFT=<16..31>` | derived from L2 | Pins the bucket window size (implies on). |
+| `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array per seed batch (rollback only). |
+
 ## Choosing `-B`
 
 The default 500 Mbp preserves the KegAlign-matched one-GPU digest; hspZ never

@@ -10,14 +10,15 @@
 //! Where parity is load-bearing the kernels stay literal transcriptions — warp
 //! mapping and all — and the two X-drop extension loops stay duplicated because
 //! they are duplicated upstream. Almost everything else has been measured and
-//! reworked: ballot X-drop termination and deferred entropy in `find_hsps`, the
-//! score-only prefix max, peeled entry checks and unchecked bounds, the
-//! `align(16)` store and grid 16384, the device-resident count and done-flag
-//! scans, the warp-coalesced score gate and dense-anchor compaction, device
-//! seed generation (`seed_kmers`/`scatter_seeds`), and `find_hits`'
-//! thread-per-seed mapping (and a warp-per-seed walk when a launch is dense
-//! enough to fill the warp). Every change stays byte-identical to the oracle
-//! at matched plan and `MAX_HITS`.
+//! reworked: ballot X-drop termination and deferred entropy in `find_hsps`
+//! (rounds 4, 3b), the score-only prefix max (round 5), peeled entry checks and
+//! unchecked bounds (rounds 6b, 7), the `align(16)` store and grid 16384
+//! (rounds 13, 6), the device-resident count and done-flag scans (rounds 8, 10),
+//! the warp-coalesced score gate and dense-anchor compaction (rounds 44–47),
+//! device seed generation (`seed_kmers`/`scatter_seeds`, round 68), and
+//! `find_hits`' thread-per-seed mapping (round 1). Every change stays
+//! byte-identical to the oracle at matched plan and `MAX_HITS`; the full ledger
+//! is benchmarks/baseline.md.
 
 use crate::hsp::SegmentPair;
 
@@ -41,6 +42,14 @@ pub const HSP_BLOCKS: u32 = 16384;
 pub const HSP_THREADS: u32 = NUM_WARPS as u32 * 32;
 /// Threads per block for the two device-scan kernels, one element per thread.
 pub const SCAN_BLOCK: u32 = 256;
+/// Round 83 round 2 (`ref-loc-buckets`): threads in the single-block kernels
+/// (`scan_exclusive_one_block`, `sort_survivors`), and the largest survivor
+/// list the device bitonic sort can restore to ascending order. 4096 `u32` is
+/// 16 KiB of shared memory; longer lists go back to the host.
+#[cfg(feature = "ref-loc-buckets")]
+pub const ONE_BLOCK_THREADS: u32 = 1024;
+#[cfg(feature = "ref-loc-buckets")]
+pub const SORT_MAX: u32 = 4096;
 
 const WARP_SIZE: u32 = 32;
 const FULL_MASK: u32 = 0xFFFF_FFFF;
@@ -53,7 +62,7 @@ pub mod device {
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, thread, warp};
 
     /// Does nothing. Launched in a loop to price a launch under ZLUDA, where
-    /// every dispatch pays PTX-to-HIP translation. The
+    /// every dispatch pays PTX-to-HIP translation (PLAN.md Milestone 2). The
     /// single argument keeps some marshalling in the measurement; a kernel with
     /// twelve arguments costs more, so treat this as a floor.
     #[kernel]
@@ -79,7 +88,7 @@ pub mod device {
 
         while id < num_seeds {
             let i = id as usize;
-            // Both checks the safe path emits are provably
+            // N4 (PLAN.md §5). Both checks the safe path emits are provably
             // dead: `id < num_seeds` is the loop condition and the host sizes
             // `seed_offsets` from `seeds.len()`; `seed` is a k-mer index, so
             // `seed < 4^kmer_size == index_table.len()` (`seed.rs: kmer_at`
@@ -115,7 +124,7 @@ pub mod device {
     }
 
     /// Block-local inclusive scan of the per-seed hit counts, in place, plus
-    /// this block's total into `block_sums`.
+    /// this block's total into `block_sums` (PLAN.md M8.3).
     ///
     /// Hand-rolled from `shuffle_up_sync` + shared memory rather than
     /// cooperative-groups `block_scan`: these are the primitives already proven
@@ -252,6 +261,242 @@ pub mod device {
         }
     }
 
+    /// Round 83 round 2: the popcount half of `count_survivors`, over the
+    /// sorted bitmask the reordered gate writes (one `u32` per 32 gate slots).
+    /// One word per thread, so a block covers `32 * SCAN_BLOCK` hits and the
+    /// survivor scan gets 32x fewer block sums than the byte-flag path.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn count_bits(bits: &[u32], mut block_sums: DisjointSlice<u32>, n_words: u32) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        // Every thread stays active through the shuffles: the tail contributes 0.
+        let mut c = if i < n_words {
+            bits[i as usize].count_ones()
+        } else {
+            0
+        };
+        let mut off = WARP_SIZE / 2;
+        while off > 0 {
+            c += warp::shuffle_down_sync(FULL_MASK, c, off);
+            off >>= 1;
+        }
+        if lane == 0 {
+            unsafe { WARP_COUNTS[warp_id] = c };
+        }
+        thread::sync_threads();
+
+        if tid == 0 {
+            let mut total = 0u32;
+            for w in 0..WARPS {
+                total += unsafe { WARP_COUNTS[w] };
+            }
+            // SAFETY: one slot per launched block.
+            unsafe { *block_sums.get_unchecked_mut(bid as usize) = total };
+        }
+    }
+
+    /// Round 83 round 2: `emit_survivors` over the sorted bitmask. Set bits are
+    /// enumerated in ascending bit order, so slots come out in ascending SORTED
+    /// order and `sorted_idx` maps each to its raw hit id. `sort_survivors`
+    /// restores ascending raw order afterwards. Nothing is cleared: the gate
+    /// overwrites every active word of every chunk.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn emit_bits(
+        bits: &[u32],
+        offsets: &[u32],
+        sorted_idx: &[u32],
+        mut survivor_ids: DisjointSlice<u32>,
+        n_words: u32,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let word = if i < n_words { bits[i as usize] } else { 0 };
+        let c = word.count_ones();
+
+        // Inclusive warp scan of the per-word counts: `s - c` is how many
+        // survivors the lower lanes of this warp emit.
+        let mut s = c;
+        let mut off = 1;
+        while off < WARP_SIZE {
+            let up = warp::shuffle_up_sync(FULL_MASK, s, off);
+            if lane >= off {
+                s += up;
+            }
+            off <<= 1;
+        }
+        if lane == WARP_SIZE - 1 {
+            unsafe { WARP_COUNTS[warp_id] = s };
+        }
+        thread::sync_threads();
+
+        if tid == 0 {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_COUNTS[w] };
+                unsafe { WARP_COUNTS[w] = prefix };
+                prefix += count;
+            }
+        }
+        thread::sync_threads();
+
+        let mut out = offsets[bid as usize] + unsafe { WARP_COUNTS[warp_id] } + (s - c);
+        let mut m = word;
+        while m != 0 {
+            let slot = i * WARP_SIZE + m.trailing_zeros();
+            // SAFETY: the block prefixes and per-word ranks cover exactly the
+            // allocated survivor range, once each; a set bit implies the gate
+            // wrote that slot, so `slot < n` indexes `sorted_idx`.
+            unsafe { *survivor_ids.get_unchecked_mut(out as usize) = sorted_idx[slot as usize] };
+            out += 1;
+            m &= m - 1;
+        }
+    }
+
+    /// Round 83 round 2: restores ascending raw-hit order in the survivor list.
+    /// One block, bitonic sort in shared memory, `n <= SORT_MAX`; the padding is
+    /// `u32::MAX`, which no hit id can take (`n_hits <= max_hits < u32::MAX`),
+    /// so the first `n` slots come out as the ids in ascending order. Downstream
+    /// (`find_hsps`, `dump_raw`, the census walk, dedup ties) needs that order.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn sort_survivors(mut ids: DisjointSlice<u32>, n: u32) {
+        const T: u32 = super::ONE_BLOCK_THREADS;
+        static mut S: SharedArray<u32, { super::SORT_MAX as usize }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let mut i = tid;
+        while i < super::SORT_MAX {
+            // SAFETY: `i < SORT_MAX` indexes the shared array; the caller
+            // guarantees `n <= SORT_MAX` allocated ids.
+            unsafe {
+                S[i as usize] = if i < n {
+                    *ids.get_unchecked_mut(i as usize)
+                } else {
+                    u32::MAX
+                }
+            };
+            i += T;
+        }
+        thread::sync_threads();
+
+        let mut k = 2u32;
+        while k <= super::SORT_MAX {
+            let mut j = k >> 1;
+            while j > 0 {
+                let mut t = tid;
+                while t < super::SORT_MAX {
+                    let l = t ^ j;
+                    // Only the lower index of each pair swaps, so every slot is
+                    // written by exactly one thread in this step.
+                    if l > t {
+                        let a = unsafe { S[t as usize] };
+                        let b = unsafe { S[l as usize] };
+                        if (a > b) == ((t & k) == 0) {
+                            unsafe {
+                                S[t as usize] = b;
+                                S[l as usize] = a;
+                            };
+                        }
+                    }
+                    t += T;
+                }
+                thread::sync_threads();
+                j >>= 1;
+            }
+            k <<= 1;
+        }
+
+        let mut i = tid;
+        while i < n {
+            // SAFETY: `i < n <= SORT_MAX`, one id per slot.
+            unsafe { *ids.get_unchecked_mut(i as usize) = S[i as usize] };
+            i += T;
+        }
+    }
+
+    /// Round 83 round 2: exclusive prefix scan of an array in place, in ONE
+    /// block, so the bucket histogram's block sums never cross the bus. Any
+    /// length: 1024 threads walk the array in tiles carrying the running total
+    /// in shared memory. Exact while the total fits `u32`, which it does — the
+    /// sums count hits and `n_hits <= u32::MAX`.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn scan_exclusive_one_block(mut v: DisjointSlice<u32>, n: u32) {
+        const T: u32 = super::ONE_BLOCK_THREADS;
+        const WARPS: usize = (T / WARP_SIZE) as usize;
+        static mut WARP_TOTALS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+        static mut CARRY: SharedArray<u32, 1> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let warp = (tid / WARP_SIZE) as usize;
+        if tid == 0 {
+            unsafe { CARRY[0] = 0 };
+        }
+        thread::sync_threads();
+
+        // `n` and `base` are block-uniform, so every thread runs every tile and
+        // reaches every barrier.
+        let mut base = 0u32;
+        while base < n {
+            let i = base + tid;
+            // SAFETY: guarded by `i < n`; the tail reads nothing past the end.
+            let x = if i < n {
+                unsafe { *v.get_unchecked_mut(i as usize) }
+            } else {
+                0
+            };
+            let mut s = x;
+            let mut off = 1;
+            while off < WARP_SIZE {
+                let up = warp::shuffle_up_sync(FULL_MASK, s, off);
+                if lane >= off {
+                    s += up;
+                }
+                off <<= 1;
+            }
+            if lane == WARP_SIZE - 1 {
+                unsafe { WARP_TOTALS[warp] = s };
+            }
+            thread::sync_threads();
+
+            // Thirty-two values plus the carry: one thread walking them serially.
+            if tid == 0 {
+                let mut acc = unsafe { CARRY[0] };
+                for w in 0..WARPS {
+                    let total = unsafe { WARP_TOTALS[w] };
+                    unsafe { WARP_TOTALS[w] = acc };
+                    acc += total;
+                }
+                unsafe { CARRY[0] = acc };
+            }
+            thread::sync_threads();
+
+            if i < n {
+                let excl = unsafe { WARP_TOTALS[warp] } + s - x;
+                // SAFETY: guarded by `i < n`.
+                unsafe { *v.get_unchecked_mut(i as usize) = excl };
+            }
+            // Before the next tile overwrites `WARP_TOTALS`.
+            thread::sync_threads();
+            base += T;
+        }
+    }
+
     /// Adds each block's exclusive prefix, turning the block-local scans into
     /// the global inclusive scan `find_hits` expects.
     #[kernel]
@@ -264,12 +509,10 @@ pub mod device {
         }
     }
 
-    /// Validate each query window and materialize its k-mer plus the
+    /// PLAN #2: validate each query window and materialize its k-mer plus the
     /// number of stable output slots it owns. The encoded query uses 0..3 for
     /// uppercase ACGT and >=4 for every byte CPU seeding rejects.
     #[kernel]
-    // a kernel launch signature, not a design to refactor
-    #[allow(clippy::too_many_arguments)]
     pub fn seed_kmers(
         query: &[u8],
         shape_pos: &[u32],
@@ -312,7 +555,7 @@ pub mod device {
         }
     }
 
-    /// Stable scatter. The scanned count is an inclusive prefix, so
+    /// Stable scatter for PLAN #2. The scanned count is an inclusive prefix, so
     /// each valid query position writes the exact CPU order: base k-mer first,
     /// then transition variants in ascending care-position index.
     #[kernel]
@@ -365,8 +608,8 @@ pub mod device {
     /// all idle launch. Block- and warp-per-seed were both implemented and
     /// benchmarked, on apple/orange and on an hg38xmm39 block, then deleted:
     /// thread-per-seed wins by 4.9x on the sparse workload and loses by only
-    /// 0.9% end-to-end on the dense one, which is inside noise.
-    ///
+    /// 0.9% end-to-end on the dense one, which is inside noise
+    /// (benchmarks/baseline.md).
     #[cfg(not(feature = "dense-anchors"))]
     #[kernel]
     #[allow(clippy::too_many_arguments)]
@@ -464,9 +707,8 @@ pub mod device {
         }
     }
 
-    /// Adjacent lanes walk adjacent positions for one seed, coalescing both
-    /// the `pos_table` reads and packed-anchor writes. Same prefix-derived
-    /// destinations as `find_hits_dense`.
+    /// Round 82: adjacent lanes walk adjacent positions for one seed,
+    /// coalescing both the `pos_table` reads and packed-anchor writes.
     #[cfg(feature = "find-hits-warp")]
     #[kernel]
     #[allow(clippy::too_many_arguments)]
@@ -515,12 +757,139 @@ pub mod device {
         }
     }
 
-    /// Runs only the score gate and writes one byte for every hit.
+    /// Round 83, `ref-loc-buckets`: per-block histogram of the reference
+    /// address bucket `(anchor as u32) >> shift`, laid out bucket-major and
+    /// block-minor so one inclusive scan of `counts` gives every block its
+    /// slice of every bucket. `n_buckets <= 32` is a host invariant.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn bucket_count(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        mut counts: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        // `u32::MAX` for the tail keeps those lanes out of every ballot. The
+        // clamp only matters if a reference address ever exceeded `ref_len`;
+        // any assignment inside `0..n_buckets` still yields a valid stable
+        // permutation, so it cannot corrupt the output.
+        let b = if i < n {
+            let raw = (anchors[i as usize] as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            u32::MAX
+        };
+
+        let mut v = 0u32;
+        while v < n_buckets {
+            let mask = warp::ballot_sync(FULL_MASK, b == v);
+            if lane == 0 {
+                unsafe { WARP_COUNTS[warp_id * 32 + v as usize] = mask.count_ones() };
+            }
+            v += 1;
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut total = 0u32;
+            for w in 0..WARPS {
+                total += unsafe { WARP_COUNTS[w * 32 + tid as usize] };
+            }
+            // SAFETY: `n_buckets * n_blocks` slots, one per (bucket, block).
+            unsafe { *counts.get_unchecked_mut((tid * n_blocks + bid) as usize) = total };
+        }
+    }
+
+    /// Round 83: the scatter half of the stable counting sort. `incl` is the
+    /// global inclusive scan of `bucket_count`'s output, so subtracting this
+    /// block's own count gives the base of its slice. Bucket-major, and inside
+    /// a bucket the original hit order — deterministic, and no atomics.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_scatter(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        incl: &[u32],
+        mut sorted_anchor: DisjointSlice<u64>,
+        mut sorted_idx: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_PREFIX: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+        static mut BLOCK_TOTAL: SharedArray<u32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let anchor = if i < n { anchors[i as usize] } else { 0 };
+        let b = if i < n {
+            let raw = (anchor as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            u32::MAX
+        };
+
+        // The same ballots `bucket_count` ran, plus this lane's own one kept.
+        let mut my_mask = 0u32;
+        let mut v = 0u32;
+        while v < n_buckets {
+            let mask = warp::ballot_sync(FULL_MASK, b == v);
+            if lane == 0 {
+                unsafe { WARP_PREFIX[warp_id * 32 + v as usize] = mask.count_ones() };
+            }
+            if b == v {
+                my_mask = mask;
+            }
+            v += 1;
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_PREFIX[w * 32 + tid as usize] };
+                unsafe { WARP_PREFIX[w * 32 + tid as usize] = prefix };
+                prefix += count;
+            }
+            unsafe { BLOCK_TOTAL[tid as usize] = prefix };
+        }
+        thread::sync_threads();
+
+        if i < n {
+            let bu = b as usize;
+            let rank = (my_mask & warp::lanemask_lt()).count_ones();
+            let block_base = incl[(b * n_blocks + bid) as usize] - unsafe { BLOCK_TOTAL[bu] };
+            let out = block_base + unsafe { WARP_PREFIX[warp_id * 32 + bu] } + rank;
+            // SAFETY: the block bases and local ranks partition `0..n` exactly,
+            // one slot per hit.
+            unsafe {
+                *sorted_anchor.get_unchecked_mut(out as usize) = anchor;
+                *sorted_idx.get_unchecked_mut(out as usize) = i;
+            }
+        }
+    }
+
+    /// Runs only the promoted score gate and writes one byte for every hit.
     /// The rare survivors are materialized later from a stable compacted ID
     /// list, so the common reject path writes neither an HSP nor a `u32` flag.
     #[cfg(feature = "dense-anchors")]
-    // `ptxas` sizes registers for an unknown block without this, and the gate
-    // is 87% of device time on the whole-genome pair. `HSP_THREADS` is the only
+    // Round 56: `ptxas` sizes registers for an unknown block without this, and the
+    // gate is 87% of device time on the whole-genome pair. `HSP_THREADS` is the only
     // shape it is ever launched with.
     #[kernel]
     #[launch_bounds(super::HSP_THREADS)]
@@ -537,11 +906,94 @@ pub mod device {
         anchors: &[u64],
         mut flags: DisjointSlice<u8>,
     ) {
-        // The anchor does not travel through shared memory: the warp fetches
-        // its whole chunk coalesced and broadcasts by shuffle.
+        // `reordered` is a literal and the body is `inline(always)`, so the
+        // permuted path — including the bitmask store, whose pointer is null
+        // here and never dereferenced — folds away and this kernel keeps its
+        // pre-feature shape. `thread_id` is read here, inside the kernel, so the
+        // `launch_bounds` range on `%tid.x` still reaches the body after
+        // inlining.
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            flags.as_mut_ptr(),
+            core::ptr::null_mut(),
+        );
+    }
+
+    /// The same gate over anchors permuted into reference-address buckets.
+    /// Round 83 round 2: instead of scattering a flag byte to the raw hit id,
+    /// each warp accumulates its chunk's 32 keep bits and lane 0 stores ONE
+    /// `u32` at the chunk's own sorted slot — coalesced, 1/32 of the bytes, and
+    /// the gate no longer reads the `orig` map at all. `emit_bits` maps sorted
+    /// slots back through `sorted_idx` and `sort_survivors` restores ascending
+    /// raw order, so `find_hsps` is untouched.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+        );
+    }
+
+    /// Body of the score gate, shared by the plain and the reordered kernel.
+    #[cfg(feature = "dense-anchors")]
+    #[inline(always)]
+    #[allow(clippy::too_many_arguments)]
+    fn score_gate(
+        thread_id: u32,
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        reordered: bool,
+        flags: *mut u8,
+        // Round 83 round 2: one `u32` of keep bits per 32-slot chunk, written at
+        // the chunk's sorted slot. Null and unused unless `reordered`.
+        flags_bits: *mut u32,
+    ) {
+        // The anchor no longer travels through shared memory (round 58): the warp
+        // fetches its whole chunk coalesced and broadcasts by shuffle.
         static mut SUB: SharedArray<i32, { NUC * NUC }> = SharedArray::UNINIT;
 
-        let thread_id = thread::threadIdx_x();
         let lane_id = thread_id % WARP_SIZE;
         let w = ((thread_id - lane_id) / WARP_SIZE) as usize;
         if (thread_id as usize) < NUC * NUC {
@@ -549,16 +1001,35 @@ pub mod device {
         }
         thread::sync_threads();
 
-        // A warp owns CHUNK consecutive anchors so the query side can be reused
-        // across the ones that share `query_start`. 32 was measured against 4, 8,
+        // A warp owns CHUNK consecutive anchors so the query side can be reused across
+        // the ones that share `query_start` (round 53). 32 was measured against 4, 8,
         // 16 and 64: A prefers 32 because its runs are ~20 long and a longer chunk only
         // adds serialisation, while F (runs ~94) still gains at 64. 32 is the value
         // whose worst per-workload loss is ~0.5 points.
         const CHUNK: u32 = 32;
 
-        let stride = NUM_WARPS as u32 * thread::gridDim_x() * CHUNK;
-        let mut base = (thread::blockIdx_x() * NUM_WARPS as u32 + w as u32) * CHUNK;
-        while base < num_hits {
+        // Grid-stride for the production kernel. The reordered kernel instead gives
+        // each block one CONTIGUOUS range: with grid-stride a resident block sweeps
+        // windows 2 M hits apart, so the wave of resident blocks touches ~8 different
+        // reference buckets at once and the L2 never holds one (cycle 3). `per_block`
+        // is a multiple of CHUNK, so a warp's chunk never straddles two blocks.
+        let (mut base, limit, stride) = if reordered {
+            let per_block = num_hits.div_ceil(thread::gridDim_x()).div_ceil(CHUNK) * CHUNK;
+            let start = thread::blockIdx_x() * per_block;
+            let end = if start < num_hits && num_hits - start > per_block {
+                start + per_block
+            } else {
+                num_hits
+            };
+            (start + w as u32 * CHUNK, end, NUM_WARPS as u32 * CHUNK)
+        } else {
+            (
+                (thread::blockIdx_x() * NUM_WARPS as u32 + w as u32) * CHUNK,
+                num_hits,
+                NUM_WARPS as u32 * thread::gridDim_x() * CHUNK,
+            )
+        };
+        while base < limit {
             // Cached query window for this warp's current run. `q_have` is uniform
             // across the warp: every lane walks the same anchors in the same order.
             let mut q_valid = false;
@@ -572,7 +1043,7 @@ pub mod device {
             // reads it with two 32-bit shuffles. What this removes is a *global load
             // at the head of every hit's dependency chain* — the old path had lane 0
             // load the anchor, write it to shared, sync the warp and have every lane
-            // read it back, with nothing to overlap the load latency.
+            // read it back, with nothing to overlap the load latency. Round 58.
             let my_idx = base + lane_id;
             let my_anchor = if my_idx < num_hits {
                 anchors[my_idx as usize]
@@ -582,6 +1053,9 @@ pub mod device {
             let my_lo = my_anchor as u32;
             let my_hi = (my_anchor >> 32) as u32;
 
+            // Keep bits of this chunk, bit `s` for slot `s`; slots past
+            // `num_hits` stay 0. Lane 0 owns it and stores it once below.
+            let mut chunk_bits = 0u32;
             let mut slot = 0u32;
             while slot < CHUNK {
                 let hid = base + slot;
@@ -597,7 +1071,7 @@ pub mod device {
                 #[cfg(feature = "simd-prelude")]
                 {
                     let is_right = lane_id < 8;
-                    let is_left = (8..24).contains(&lane_id);
+                    let is_left = lane_id >= 8 && lane_id < 24;
                     let gl = if is_left { lane_id - 8 } else { lane_id };
 
                     let mut s0 = 0i32;
@@ -623,10 +1097,12 @@ pub mod device {
                         if last_r >= ref_loc && last_r < ref_len && q_fast {
                             let rw = unsafe { ld_u32(ref_seq, ref_loc + off, ref_len) };
                             let qw = q_word;
-                            let b0 = (rw & 0xff) as usize;
-                            let b1 = ((rw >> 8) & 0xff) as usize;
-                            let b2 = ((rw >> 16) & 0xff) as usize;
-                            let b3 = ((rw >> 24) & 0xff) as usize;
+                            let (b0, b1, b2, b3) = (
+                                (rw & 0xff) as usize,
+                                ((rw >> 8) & 0xff) as usize,
+                                ((rw >> 16) & 0xff) as usize,
+                                ((rw >> 24) & 0xff) as usize,
+                            );
                             let c0 = (qw & 0xff) as usize;
                             let c1 = ((qw >> 8) & 0xff) as usize;
                             let c2 = ((qw >> 16) & 0xff) as usize;
@@ -673,10 +1149,12 @@ pub mod device {
                             let qw = q_word;
                             // bytes [0,1,2,3] sit at offsets last_off .. last_off-3;
                             // extension order is last_off-3 .. last_off → reverse.
-                            let b0 = ((rw >> 24) & 0xff) as usize;
-                            let b1 = ((rw >> 16) & 0xff) as usize;
-                            let b2 = ((rw >> 8) & 0xff) as usize;
-                            let b3 = (rw & 0xff) as usize;
+                            let (b0, b1, b2, b3) = (
+                                ((rw >> 24) & 0xff) as usize,
+                                ((rw >> 16) & 0xff) as usize,
+                                ((rw >> 8) & 0xff) as usize,
+                                (rw & 0xff) as usize,
+                            );
                             let c0 = ((qw >> 24) & 0xff) as usize;
                             let c1 = ((qw >> 16) & 0xff) as usize;
                             let c2 = ((qw >> 8) & 0xff) as usize;
@@ -790,9 +1268,8 @@ pub mod device {
                     // The two end broadcasts feed the continuation loops only, and those
                     // run for ~8% of hits. `right_done`/`left_done` are warp-uniform, so
                     // the shuffles sink into the branches: two dependent shuffles removed
-                    // from the 92% that resolve inside the prelude. The gate
-                    // stalls on dependencies, so a shuffle skipped is latency
-                    // skipped.
+                    // from the 92% that resolve inside the prelude. Round 57 — the gate
+                    // stalls on dependencies, so a shuffle skipped is latency skipped.
                     if right_done {
                         total += right_max;
                     } else {
@@ -1048,9 +1525,22 @@ pub mod device {
                 if hid < num_hits && lane_id == 0 {
                     // Production rounds through f32 before this comparison.
                     let keep = ((total as f32 as f64) as i32 >= hspthresh) as u8;
-                    unsafe { *flags.get_unchecked_mut(hid as usize) = keep };
+                    if reordered {
+                        chunk_bits |= (keep as u32) << slot;
+                    } else {
+                        // SAFETY: `hid < num_hits`, one thread per flag byte.
+                        unsafe { *flags.add(hid as usize) = keep };
+                    }
                 }
                 slot += 1;
+            }
+            // One store per chunk. `base` is a multiple of CHUNK == 32 for both
+            // traversals, so each word has exactly one owning warp and every
+            // word of `ceil(num_hits/32)` is overwritten — no stale bits.
+            if reordered && lane_id == 0 {
+                // SAFETY: `base < limit <= num_hits`, so the word index is
+                // inside the `ceil(num_hits/32)` the host allocated.
+                unsafe { *flags_bits.add((base / CHUNK) as usize) = chunk_bits };
             }
             base += stride;
         }
@@ -1116,8 +1606,8 @@ pub mod device {
         while hid0 < num_hits {
             #[cfg(feature = "counters")]
             let (mut right_tiles, mut left_tiles, mut term) = (0u64, 0u64, 0u64);
-            // Where the first X-drop lands, in the first tile of each direction
-            // — the class that owns ~91% of right terminations.
+            // PLAN §4: where the first X-drop lands, in the first tile of each
+            // direction — the class that owns ~91% of right terminations.
             #[cfg(feature = "counters")]
             let (mut first_drop_r, mut first_drop_l) = (63u64, 63u64);
             #[cfg(feature = "counters")]
@@ -1149,15 +1639,15 @@ pub mod device {
             }
             warp::sync_mask(FULL_MASK);
             // Invariant for the whole hit, yet re-loaded from shared by every
-            // lane on every tile. Shared-state loads are ~13% of per-tile
-            // instructions and the kernel runs at ~73% of issue peak, so these
-            // are the cheapest instructions to remove — and unlike a scan, this
-            // needs no commit restructuring: the value never changes.
+            // lane on every tile. M13's census: shared-state loads are ~13% of
+            // per-tile instructions and the kernel runs at ~73% of issue peak,
+            // so these are the cheapest instructions to remove. Unlike M8 this
+            // needs no commit restructuring — the value never changes.
             let hit_ref_loc = unsafe { REF_LOC[w] };
             let hit_query_loc = unsafe { QUERY_LOC[w] };
 
-            // Score both extensions with the production warp mapping, but keep
-            // only the state needed for X-drop and the maximum score.
+            // PLAN #1: score both extensions with the production warp mapping,
+            // but keep only the state needed for X-drop and the maximum score.
             // The overwhelmingly common failing hit avoids position recovery,
             // extent tracking, entropy, and output construction below. A rare
             // survivor is recomputed by the unchanged materializer, preserving
@@ -1577,13 +2067,13 @@ pub mod device {
                 // of four, with less live state in the hottest kernel. That is
                 // why the packed form is kept.
                 //
-                // The packed form doubles as a workaround: the four-accumulator,
+                // It also happens to be a workaround: the four-accumulator,
                 // four-scan version produced PTX that `ptxas` accepted but the
-                // pinned ZLUDA backend refused to load with `DriverError(500)`,
-                // bisected to that construct — not the loop, not the indexing.
-                // It is retained on its own merits; if native NVIDIA measurement
-                // ever shows the unpacked form wins there, that is when
-                // specialization gets earned.
+                // pinned ZLUDA backend refused to load with `DriverError(500)`.
+                // Bisected to that construct — not the loop, not the indexing.
+                // The packed form is retained on its own merits; if native
+                // NVIDIA measurement ever shows the unpacked form wins there,
+                // that is when specialization gets earned.
                 //
                 // each field holds at most 65535. Overflow would
                 // carry into the neighbouring base's count, so the ceiling is
@@ -1597,12 +2087,14 @@ pub mod device {
                 // is branchless and the warp reduction is a single scan instead
                 // of four, with less live state in the hottest kernel.
                 //
-                // The four-counter/four-scan alternative was implemented and
-                // measured on an NVIDIA L4: `find_hsps` +1.90% (A), +1.36% (B),
-                // +0.50% (apple) — worse on every workload. The codegen census
-                // said why: 42 shuffles vs 22, 9/6 local stores/loads vs 4/1,
-                // and 53 more 32-bit registers, because `c[r]` with a runtime
-                // index spills. Packed wins on native CUDA on its own merits.
+                // The four-counter/four-scan alternative (N6) was implemented
+                // and measured on an NVIDIA L4: `find_hsps` +1.90% (A), +1.36%
+                // (B), +0.50% (apple) — worse on every workload. The codegen
+                // census said why: 42 shuffles vs 22, 9/6 local stores/loads vs
+                // 4/1, and 53 more 32-bit registers, because `c[r]` with a
+                // runtime index spills. Packed wins on native CUDA on its own
+                // merits, not just as the ZLUDA workaround it originally was
+                // (benchmarks/baseline.md, round 15).
                 //
                 // each field holds at most 65535. Overflow would
                 // carry into the neighbouring base's count, so the ceiling is
@@ -1653,8 +2145,6 @@ pub mod device {
                 if last_lane && total_count >= 20 {
                     let denom = (unsafe { EXTENT[w] } + 1) as f64;
                     let mut entropy = 0.0f64;
-                    // lane index, mirrored from the device scan
-                    #[allow(clippy::needless_range_loop)]
                     for i in 0..4 {
                         let p = count[i] as f64 / denom;
                         entropy += p * if count[i] != 0 { ln(p) } else { 0.0 };
@@ -1706,7 +2196,7 @@ pub mod device {
                 unsafe {
                     // Two words per candidate: the tile/termination record, and
                     // the anchor, from which the host derives the diagonal and
-                    // the tile-quantized evaluated interval.
+                    // the tile-quantized evaluated interval (PLAN.md M8.1).
                     *stats.get_unchecked_mut(2 * hid as usize) = (right_tiles & 0xF_FFFF)
                         | ((left_tiles & 0xF_FFFF) << 20)
                         | term
@@ -1794,9 +2284,9 @@ pub mod device {
     /// gives every lane its prefix sum *and* the running maximum over all prefixes,
     /// which is what the two serial scans produce.
     ///
-    /// Removing 9 of 22 prelude shuffles changed nothing (+0.00%), while adding
-    /// 8 *on the dependency chain* cost 3% — depth is the thing to cut. Same
-    /// shuffle count here, half the dependent depth.
+    /// Round 51 measured why depth is the thing to cut: removing 9 of 22 prelude
+    /// shuffles changed nothing (+0.00%), while adding 8 *on the dependency chain* cost
+    /// 3%. Same shuffle count here, half the dependent depth.
     #[inline(always)]
     fn dual_prefix_sum_max(
         lane_id: u32,
@@ -1910,10 +2400,103 @@ pub mod device {
 
 /// Host models of the per-tile maximum logic, used to prove that carrying the
 /// position through the prefix scan and recovering it once at the end agree on
-/// every tie case before any of it reaches the GPU.
+/// every tie case (PLAN.md M7.1) before any of it reaches the GPU.
 #[cfg(test)]
 mod tests {
     const W: usize = 32;
+
+    /// Round 83 round 2 (`ref-loc-buckets`): host mirrors of `emit_bits`'
+    /// ascending bit enumeration and of `sort_survivors`' bitonic network, over
+    /// both survivor orders, a masked tail word, an all-zero and an all-one
+    /// bitmask. Both device paths are exact algorithms, so the mirror is the
+    /// specification: the emitted list is the raw ids at the set bits in
+    /// ascending SORTED-slot order, and the restored list must be ascending RAW
+    /// order — what `dump_raw`, the census walk and dedup ties read. Above
+    /// `SORT_MAX` the fallback is `sort_unstable`, which must agree with it.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn sorted_bitmask_emits_ascending_slots_and_restores_ascending_ids() {
+        use super::SORT_MAX;
+
+        // `emit_bits`: ascending bits inside a word, ascending words.
+        fn emit(bits: &[u32], sorted_idx: &[u32], n: u32) -> Vec<u32> {
+            let mut out = Vec::new();
+            for (w, &word) in bits.iter().enumerate() {
+                let mut m = word;
+                while m != 0 {
+                    let slot = w as u32 * 32 + m.trailing_zeros();
+                    assert!(slot < n, "set bit at slot {slot} past {n} hits");
+                    out.push(sorted_idx[slot as usize]);
+                    m &= m - 1;
+                }
+            }
+            out
+        }
+
+        // `sort_survivors`: one block, bitonic over SORT_MAX slots padded with
+        // `u32::MAX` (no hit id can take that value).
+        fn bitonic(ids: &[u32]) -> Vec<u32> {
+            let mut s = vec![u32::MAX; SORT_MAX as usize];
+            s[..ids.len()].copy_from_slice(ids);
+            let mut k = 2usize;
+            while k <= SORT_MAX as usize {
+                let mut j = k / 2;
+                while j > 0 {
+                    for t in 0..SORT_MAX as usize {
+                        let l = t ^ j;
+                        if l > t && (s[t] > s[l]) == ((t & k) == 0) {
+                            s.swap(t, l);
+                        }
+                    }
+                    j >>= 1;
+                }
+                k <<= 1;
+            }
+            s.truncate(ids.len());
+            s
+        }
+
+        let n: u32 = 100; // 3 full words plus a 4-bit tail
+        let words = n.div_ceil(32) as usize;
+        // Slot -> raw id: the identity permutation, and the reversal, which is
+        // the worst case for the restoration.
+        let ident: Vec<u32> = (0..n).collect();
+        let rev: Vec<u32> = (0..n).rev().collect();
+
+        // All zero: nothing emitted, nothing to sort.
+        let zero = vec![0u32; words];
+        assert!(emit(&zero, &ident, n).is_empty());
+
+        // All one with the tail masked, both permutations.
+        let mut ones = vec![u32::MAX; words];
+        ones[words - 1] = (1u32 << (n % 32)) - 1;
+        for map in [&ident, &rev] {
+            let got = emit(&ones, map, n);
+            assert_eq!(got.len() as u32, n, "every hit survives");
+            assert_eq!(got, map[..n as usize].to_vec(), "ascending slot order");
+            let sorted = bitonic(&got);
+            assert_eq!(sorted, ident, "restored to ascending raw ids");
+            let mut host = got.clone();
+            host.sort_unstable();
+            assert_eq!(host, sorted, "host fallback agrees with the network");
+        }
+
+        // A scattered pattern, including the tail word.
+        let slots: Vec<u32> = vec![0, 1, 31, 32, 63, 64, 96, 99];
+        let mut bits = vec![0u32; words];
+        for &sl in &slots {
+            bits[(sl / 32) as usize] |= 1 << (sl % 32);
+        }
+        for map in [&ident, &rev] {
+            let got = emit(&bits, map, n);
+            let expect: Vec<u32> = slots.iter().map(|&sl| map[sl as usize]).collect();
+            assert_eq!(got, expect, "ascending slot order, not raw order");
+            let sorted = bitonic(&got);
+            let mut expect_sorted = expect.clone();
+            expect_sorted.sort_unstable();
+            assert_eq!(sorted, expect_sorted, "restored to ascending raw ids");
+        }
+    }
 
     /// Hillis-Steele prefix max over `(score, pos)`, taking the earlier lane on
     /// ties — exactly what `prefix_max` does, since `shuffle_up` reads lane
@@ -2314,8 +2897,6 @@ mod tests {
     /// The tie rule itself, pinned: `shuffle_up` reads the *earlier* lane, so
     /// `>=` keeps the earliest position among equal maxima.
     #[test]
-    // step distance in the host reimplementation of the warp scan
-    #[allow(clippy::needless_range_loop)]
     fn ties_resolve_to_the_earliest_lane() {
         let mut v = [(0i32, 0i32); W];
         for l in 0..W {
@@ -2395,14 +2976,10 @@ mod tests {
         prev_score: i32,
         prev_max: i32,
     ) -> (usize, i32, i32) {
-        // lane index, mirrored from the device scan
-        #[allow(clippy::needless_range_loop)]
         let n_bases = n_lanes * 4;
         let mut seg = vec![0i32; n_lanes];
         let mut base = vec![[0i32; 4]; n_lanes];
         for lane in 0..n_lanes {
-            // lane index, mirrored from the device scan
-            #[allow(clippy::needless_range_loop)]
             for k in 0..4 {
                 let idx = lane * 4 + k;
                 base[lane][k] = if idx < valid { scores[idx] } else { 0 };

@@ -13,12 +13,13 @@
 //!     bucket `k` spans `index_table[k-1] .. index_table[k]`;
 //!   * `pos_table` — the reference positions, grouped by bucket.
 //!
-//! `SeedTable::build_parallel` is the two-pass, lock-free parallel builder:
-//! workers count into private tables, a two-level scan turns
+//! `SeedTable::build_parallel` is the two-pass, lock-free parallel builder
+//! (rounds 19–20): workers count into private tables, a two-level scan turns
 //! them into disjoint write cursors, and pass 2 rescans and scatters, so
 //! within-bucket order — which fixes `MAX_HITS` chunking — is preserved
 //! bit-for-bit. Query-side seeds are generated per work unit; the device-side
-//! seed kernels live in `gpu/kernels.rs` (`seed_kmers`/`scatter_seeds`).
+//! seed kernels live in `gpu/kernels.rs` (`seed_kmers`/`scatter_seeds`,
+//! round 68).
 
 use crate::sequence::{N_NT, nt_char_to_int};
 
@@ -181,8 +182,8 @@ impl SeedTable {
 
     /// [`build`](Self::build) across `threads` workers, byte-identical to it.
     ///
-    /// The serial builder is 11.4 s on hg38 chr1 — 10.1% of that run's wall
-    /// time and its largest CPU stage — which is what earned this.
+    /// PLAN.md M7. The serial builder is 11.4 s on hg38 chr1 — 10.1% of that
+    /// run's wall time and its largest CPU stage — which is what earned this.
     ///
     /// Two passes over the same strided seed-start sequence, no atomics, no
     /// locks, no final sort:
@@ -193,8 +194,8 @@ impl SeedTable {
     ///    worker a disjoint write cursor per k-mer, and each worker rescans its
     ///    own range and scatters positions directly.
     ///
-    /// Why the bucket order comes out identical (byte-identity, not just the
-    /// same multiset — hit order feeds `MAX_HITS` chunk boundaries,
+    /// Why the bucket order comes out identical (AM-B requires byte-identity,
+    /// not just the same multiset — hit order feeds `MAX_HITS` chunk boundaries,
     /// so a reordering would move HSPs without changing any count): worker
     /// ranges are contiguous and ascending in `i`, and for every k-mer worker
     /// `t`'s cursor region precedes worker `t+1`'s. Positions therefore land in
@@ -218,9 +219,8 @@ impl SeedTable {
         }
 
         let per = num_steps.div_ceil(threads);
-        let ranges: Vec<(usize, usize)> = (0..threads)
-            .map(|t| (t * per, ((t + 1) * per).min(num_steps)))
-            .collect();
+        let ranges: Vec<(usize, usize)> =
+            (0..threads).map(|t| (t * per, ((t + 1) * per).min(num_steps))).collect();
 
         // Pass 1: private counts per worker, indexed by kmer (no +1 shift yet).
         let counts: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -239,10 +239,7 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("seed count worker panicked"))
-                .collect()
+            handles.into_iter().map(|h| h.join().expect("seed count worker panicked")).collect()
         });
 
         // Prefix across workers, two-level so it does not become the new
@@ -255,9 +252,8 @@ impl SeedTable {
         // serially, then convert counts to absolute cursors in parallel.
         let nk = table_size - 1;
         let kper = nk.div_ceil(threads);
-        let kranges: Vec<(usize, usize)> = (0..threads)
-            .map(|c| (c * kper, ((c + 1) * kper).min(nk)))
-            .collect();
+        let kranges: Vec<(usize, usize)> =
+            (0..threads).map(|c| (c * kper, ((c + 1) * kper).min(nk))).collect();
 
         let chunk_totals: Vec<u64> = std::thread::scope(|scope| {
             let handles: Vec<_> = kranges
@@ -267,8 +263,6 @@ impl SeedTable {
                     scope.spawn(move || {
                         let mut sum = 0u64;
                         for c in counts.iter() {
-                            // the index is the k-mer position being accumulated
-                            #[allow(clippy::needless_range_loop)]
                             for k in lo..hi {
                                 sum += c[k] as u64;
                             }
@@ -277,10 +271,7 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("prefix worker panicked"))
-                .collect()
+            handles.into_iter().map(|h| h.join().expect("prefix worker panicked")).collect()
         });
 
         let mut chunk_base = Vec::with_capacity(kranges.len());
@@ -300,10 +291,8 @@ impl SeedTable {
             // pointers exist only because the disjointness is by k while the
             // owning containers are indexed by t first.
             let idx_ptr = index_table.as_mut_ptr() as usize;
-            let cur_ptrs: Vec<usize> = cursors
-                .iter_mut()
-                .map(|c| c.as_mut_ptr() as usize)
-                .collect();
+            let cur_ptrs: Vec<usize> =
+                cursors.iter_mut().map(|c| c.as_mut_ptr() as usize).collect();
             std::thread::scope(|scope| {
                 for (ci, &(lo, hi)) in kranges.iter().enumerate() {
                     let cur_ptrs = &cur_ptrs;
@@ -354,10 +343,7 @@ impl SeedTable {
             }
         });
 
-        SeedTable {
-            index_table,
-            pos_table,
-        }
+        SeedTable { index_table, pos_table }
     }
 
     /// Number of reference hits for a seed — what `find_num_hits` computes.
@@ -421,8 +407,7 @@ pub fn chunk_seeds_parallel(
 /// The per-worker pieces of [`chunk_seeds_parallel`], before concatenation.
 ///
 /// Split out so a caller can concatenate straight into pinned host memory
-/// (into pinned host memory) instead of into a `Vec` it would then have to
-/// copy again. The
+/// (PLAN.md N1) instead of into a `Vec` it would then have to copy again. The
 /// pieces are in original position order, so concatenating them reproduces
 /// `chunk_seeds` exactly.
 pub fn chunk_seeds_parts(
@@ -454,10 +439,7 @@ pub fn chunk_seeds_parts(
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("seed worker panicked"))
-            .collect()
+        handles.into_iter().map(|h| h.join().expect("seed worker panicked")).collect()
     })
 }
 
@@ -477,7 +459,7 @@ pub fn concat_parts(parts: &[Vec<u64>], dst: &mut [u64]) -> usize {
 /// Worst-case seeds one chunk of `span` query positions can emit: every
 /// position yields the exact k-mer plus, with transitions on, one variant per
 /// care position. Used to size the pinned staging buffers once up front so the
-/// seed worker never allocates.
+/// seed worker never allocates (PLAN.md N1).
 pub fn max_seeds(span: u32, shape: &Shape, transitions: bool) -> usize {
     let per_pos = if transitions { 1 + shape.kmer_size } else { 1 };
     span as usize * per_pos
@@ -510,10 +492,7 @@ mod tests {
 
     #[test]
     fn kmer_packs_care_positions_only() {
-        assert!(
-            Shape::parse("101").is_err(),
-            "3 care positions is below the k-mer floor"
-        );
+        assert!(Shape::parse("101").is_err(), "3 care positions is below the k-mer floor");
         let s = Shape::parse("1111").unwrap();
         assert_eq!(s.kmer_at(b"ACGT", 0), 0b00_01_10_11);
         // A separator anywhere in the window invalidates it.
@@ -536,8 +515,8 @@ mod tests {
         assert!(out.iter().all(|o| o & 0xFFFF_FFFF == 7));
     }
 
-    /// The parallel builder must be byte-identical to the serial one for every
-    /// thread count, on both tables.
+    /// PLAN.md M8 + AM-B: the parallel builder must be byte-identical to the
+    /// serial one for every thread count, on both tables.
     ///
     /// `pos_table` order matters as much as its contents: within-bucket order is
     /// hit order, hit order sets `MAX_HITS` chunk boundaries, and those decide
@@ -647,10 +626,7 @@ mod tests {
 
     #[test]
     fn chunking_matches_seeder_loop() {
-        assert_eq!(
-            chunks(0, 376657, 250_000),
-            vec![(0, 250_000), (250_000, 376_658)]
-        );
+        assert_eq!(chunks(0, 376657, 250_000), vec![(0, 250_000), (250_000, 376_658)]);
         assert_eq!(chunks(0, 10, 250_000), vec![(0, 11)]);
     }
 }

@@ -26,8 +26,10 @@ use std::cmp::Ordering;
 /// write and, worth more, in `find_hsps`' HSP store.
 ///
 /// Measured on an NVIDIA L4: `find_hsps` -4.25% (A) / -2.49% (B), whole run
-/// -3.3% / -3.2% drift-corrected. Under ZLUDA the same change was flat, so this
-/// is free there and a real win on native NVIDIA.
+/// -3.3% / -3.2% drift-corrected, non-overlapping in 4/4 paired rounds and
+/// winning in both run orders. Under ZLUDA the same change was flat, so this is
+/// free there and a real win on native NVIDIA
+/// (benchmarks/baseline.md, round 13).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, cuda_core::DeviceCopy)]
 pub struct SegmentPair {
@@ -103,12 +105,9 @@ pub fn dedup_and_order(hsps: &mut Vec<SegmentPair>, mut groups: Option<&mut Grou
         } else if let Some(g) = groups.as_deref_mut() {
             // Removed: attributed to the run head that survives it. The
             // production predicate decides this, not a geometric look-alike.
-            *g.sizes
-                .last_mut()
-                .expect("a survivor precedes every removal") += 1;
+            *g.sizes.last_mut().expect("a survivor precedes every removal") += 1;
             let prev = &hsps[i - 1];
-            if prev.ref_start == h.ref_start
-                && prev.query_start == h.query_start
+            if prev.ref_start == h.ref_start && prev.query_start == h.query_start
                 && prev.len == h.len
             {
                 g.duplicate += 1;
@@ -125,7 +124,7 @@ pub fn dedup_and_order(hsps: &mut Vec<SegmentPair>, mut groups: Option<&mut Grou
     *hsps = kept;
 }
 
-/// Raw-HSP provenance through the production dedup.
+/// Raw-HSP provenance through the production dedup (PLAN.md M6).
 #[derive(Debug, Default, Clone)]
 pub struct Groups {
     /// Raw HSPs collapsing into each surviving HSP, one entry per survivor.
@@ -171,7 +170,7 @@ impl Groups {
 
 /// One printed `.segments` record, still numeric.
 ///
-/// This is the unit `-D` partitions: partition structs, never text.
+/// This is the unit `-D` partitions (PLAN.md §9: partition structs, never text).
 /// Coordinates are exactly what gets printed — 1-based, chromosome-relative,
 /// inclusive at both ends — because the oracle's partitioner reads them off the
 /// printed file and its diagonal keys are defined on those values.
@@ -198,43 +197,52 @@ impl Record {
 
     /// Diagonal sort key. Plus strand sorts by the *sum*, minus by the
     /// *difference* — verified against `diagonal_partition.py`, whose own
-    /// comments have the two branches labelled the wrong way round.
+    /// comments have the two branches labelled the wrong way round (AM-1).
     pub fn diagonal_key(&self, strand: char) -> (i64, i64) {
         let (r_mid, q_mid) = self.mids();
-        if strand == '-' {
-            (q_mid - r_mid, r_mid)
-        } else {
-            (q_mid + r_mid, r_mid)
-        }
+        if strand == '-' { (q_mid - r_mid, r_mid) } else { (q_mid + r_mid, r_mid) }
     }
 }
 
 /// The records [`render_segments`] would print, in printed order.
-pub fn records(hsps: &[SegmentPair], r_chrs: &[Chr], q_chrs: &[Chr], strand: char) -> Vec<Record> {
+pub fn records(
+    hsps: &[SegmentPair],
+    r_chrs: &[Chr],
+    q_chrs: &[Chr],
+    strand: char,
+) -> Vec<Record> {
     let ordered: Box<dyn Iterator<Item = &SegmentPair>> = if strand == '-' {
         Box::new(hsps.iter().rev())
     } else {
         Box::new(hsps.iter())
     };
-    ordered
-        .map(|e| {
-            let ri = chr_at(r_chrs, e.ref_start as usize);
-            let qi = chr_at(q_chrs, e.query_start as usize);
-            Record {
-                r_chr: ri as u32,
-                q_chr: qi as u32,
-                r_start: e.ref_start as usize + 1 - r_chrs[ri].start,
-                r_end: e.ref_start as usize + e.len as usize + 1 - r_chrs[ri].start,
-                q_start: e.query_start as usize + 1 - q_chrs[qi].start,
-                q_end: e.query_start as usize + e.len as usize + 1 - q_chrs[qi].start,
-                score: e.score,
-            }
-        })
-        .collect()
+    ordered.map(|e| record(e, r_chrs, q_chrs)).collect()
+}
+
+/// Maps one block-relative HSP through the same chromosome tables used by the
+/// production writer. Diagnostics call this instead of duplicating coordinate
+/// arithmetic that output hashes cannot validate.
+pub fn record(e: &SegmentPair, r_chrs: &[Chr], q_chrs: &[Chr]) -> Record {
+    let ri = chr_at(r_chrs, e.ref_start as usize);
+    let qi = chr_at(q_chrs, e.query_start as usize);
+    Record {
+        r_chr: ri as u32,
+        q_chr: qi as u32,
+        r_start: e.ref_start as usize + 1 - r_chrs[ri].start,
+        r_end: e.ref_start as usize + e.len as usize + 1 - r_chrs[ri].start,
+        q_start: e.query_start as usize + 1 - q_chrs[qi].start,
+        q_end: e.query_start as usize + e.len as usize + 1 - q_chrs[qi].start,
+        score: e.score,
+    }
 }
 
 /// Renders records back to `.segments` text.
-pub fn render_records(recs: &[Record], r_chrs: &[Chr], q_chrs: &[Chr], strand: char) -> String {
+pub fn render_records(
+    recs: &[Record],
+    r_chrs: &[Chr],
+    q_chrs: &[Chr],
+    strand: char,
+) -> String {
     let mut out = String::with_capacity(recs.len() * 64);
     for r in recs {
         out.push_str(&format!(
@@ -296,12 +304,7 @@ mod tests {
     use super::*;
 
     fn sp(r: u32, q: u32, len: u32, score: i32) -> SegmentPair {
-        SegmentPair {
-            ref_start: r,
-            query_start: q,
-            len,
-            score,
-        }
+        SegmentPair { ref_start: r, query_start: q, len, score }
     }
 
     #[test]
@@ -313,41 +316,20 @@ mod tests {
 
     #[test]
     fn sort_key_is_diag_start_len_then_score_descending() {
-        let mut v = vec![
-            sp(5, 0, 3, 100),
-            sp(5, 0, 3, 900),
-            sp(5, 0, 1, 10),
-            sp(4, 0, 9, 1),
-        ];
+        let mut v = vec![sp(5, 0, 3, 100), sp(5, 0, 3, 900), sp(5, 0, 1, 10), sp(4, 0, 9, 1)];
         v.sort_by(by_diagonal);
-        assert_eq!(
-            v,
-            vec![
-                sp(4, 0, 9, 1),
-                sp(5, 0, 1, 10),
-                sp(5, 0, 3, 900),
-                sp(5, 0, 3, 100)
-            ]
-        );
+        assert_eq!(v, vec![sp(4, 0, 9, 1), sp(5, 0, 1, 10), sp(5, 0, 3, 900), sp(5, 0, 3, 100)]);
     }
 
     #[test]
     fn dedup_drops_contained_segments_on_the_same_diagonal() {
         // Same diagonal: [0,10) swallows [0,5) and [6,8); a different diagonal
         // is never merged even when the intervals nest.
-        let mut v = vec![
-            sp(0, 0, 10, 50),
-            sp(0, 0, 5, 40),
-            sp(6, 6, 2, 30),
-            sp(0, 1, 4, 20),
-        ];
+        let mut v = vec![sp(0, 0, 10, 50), sp(0, 0, 5, 40), sp(6, 6, 2, 30), sp(0, 1, 4, 20)];
         dedup_and_order(&mut v, None);
         assert_eq!(v.len(), 2, "one survivor per diagonal, got {v:?}");
         assert!(v.contains(&sp(0, 1, 4, 20)));
-        assert!(
-            v.contains(&sp(0, 0, 5, 40)),
-            "shortest sorts first and is the one kept"
-        );
+        assert!(v.contains(&sp(0, 0, 5, 40)), "shortest sorts first and is the one kept");
     }
 
     #[test]
