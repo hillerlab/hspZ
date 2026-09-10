@@ -61,8 +61,10 @@ and emitter-side receiver checks. Output bytes are unchanged.
 - **Receiver checks.** The emitter now rejects duplicate or out-of-plan work units
   and verifies completeness after joining the workers, reporting a worker's own
   error first.
-- **Automatic layout (`-B 0`).** `-B 0` resolves the layout for the current
-  machine instead of the fixed 500 Mbp default. At `--gpus W ≥ 2` the reference
+- **Automatic layout (`-B 0`, opt-in measurement tool).** `-B 0` resolves a
+  count-balanced layout for the current machine instead of the fixed 500 Mbp
+  default; it changes the HSP set (a different frozen plan), so measure per machine
+  before adopting it (a 2× T4 screen was 17–22% slower than the default). At `--gpus W ≥ 2` the reference
   takes `R = min(records, ceil(R_default/W)·W)` LPT-balanced bins, and the query
   collapses to one bin when the whole query fits both the per-worker device budget
   and the host preflight (an explicit `--query-block-size` is honoured); `W=1`
