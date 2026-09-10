@@ -141,6 +141,15 @@ impl Phases {
             .map_or(0, |r| r.calls)
     }
 
+    /// Summed host ms for a named phase, or 0 when it never ran. The
+    /// per-worker attribution line reads host residuals through this.
+    pub fn ms(&self, name: &str) -> f64 {
+        self.rows
+            .iter()
+            .find(|r| r.name == name)
+            .map_or(0.0, |r| r.host_ms)
+    }
+
     pub fn total_ms(&self) -> f64 {
         self.rows
             .iter()

@@ -19,7 +19,7 @@
 
 use crate::Fallible;
 use crate::cli::RunArgs;
-use crate::gpu::{Engine, EngineConfig, HitStats, Lifecycle};
+use crate::gpu::{DeviceProfile, Engine, EngineConfig, HitStats, Lifecycle};
 use crate::hsp::{self, SegmentPair};
 use crate::partition::{Partitioner, Plan};
 use crate::plan::{self, PackedBin, RecordMeta};
@@ -94,10 +94,23 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
     let t = Instant::now();
     // PLAN.md §1: reference and query input are timed separately and kept out
     // of `core`, so a format change can never be confused with a core change.
-    let query = Genome::load(&args.query, &args.query_prefix, args.seq_block_size)?;
+    // `-B 0` (automatic layout) is a planner decision this single-block path
+    // never makes: resolve to the default target so the guard below keeps
+    // today's behavior. `Genome::load` packs the whole input as one block and
+    // uses the target only to reject multi-block input, so no per-bin target
+    // applies here (the GPU `run` path below does not call `Genome::load`).
+    if args.seq_block_size == 0 && args.kegalign_bins {
+        return Err(plan::AUTO_KEGALIGN_ERROR.into());
+    }
+    let seq_block_size = if args.seq_block_size == 0 {
+        plan::DEFAULT_BLOCK_TARGET as u32
+    } else {
+        args.seq_block_size
+    };
+    let query = Genome::load(&args.query, &args.query_prefix, seq_block_size)?;
     phases.add("input.query", t.elapsed());
     let t = Instant::now();
-    let reference = Genome::load(&args.reference, &args.target_prefix, args.seq_block_size)?;
+    let reference = Genome::load(&args.reference, &args.target_prefix, seq_block_size)?;
     phases.add("input.reference", t.elapsed());
     if reference.block_len <= shape.size || query.block_len <= shape.size {
         return Err("reference and query blocks must be longer than the seed".into());
@@ -817,6 +830,29 @@ struct UnitOutput {
     pass: Pass,
 }
 
+/// One executed work unit for the `--time` unit ledger (round 90). GPU busy
+/// is the `engine.phases.gpu_ms()` delta across the unit's own
+/// `seed_and_filter_all` — no new device syncs, events resolve at the
+/// existing pipeline boundaries. Shared reference setup is not charged here.
+pub(crate) struct UnitLedgerRow {
+    ordinal: u32,
+    worker: usize,
+    device: usize,
+    reference_bin: u32,
+    query_bin: u32,
+    reference_bp: u64,
+    query_bp: u64,
+    gpu_ms: f64,
+    host_start_ms: f64,
+    host_end_ms: f64,
+    pack_ms: f64,
+    swap_ms: f64,
+    seeds: u64,
+    hits: u64,
+    raw_hsps: u64,
+    hsps: u64,
+}
+
 /// What one worker reports at join. Everything the serial executor used to
 /// accumulate inline, now per worker and summed by the caller.
 #[derive(Default)]
@@ -824,6 +860,10 @@ struct WorkerReport {
     stats: Stats,
     phases: Phases,
     lifecycle: Lifecycle,
+    ledger: Vec<UnitLedgerRow>,
+    /// Wall ms since run start when this worker returned (after its last send and
+    /// engine teardown) — the per-worker critical path, unlike the last unit's end.
+    finished_ms: f64,
     launches: u64,
     stage_syncs: u64,
     pipeline_syncs: u64,
@@ -835,6 +875,12 @@ struct WorkerReport {
     /// any batch-level pipelining.
     gap_ms: f32,
     gap_n: u64,
+    /// Per-pair gap totals merged across this worker's engines (round 72),
+    /// plus the discarded >1,000 ms intervals (unit-transition work) as a
+    /// separate count and sum so they stay visible instead of silent.
+    gap_pairs: Vec<((&'static str, &'static str), f32, u64)>,
+    gap_long_n: u64,
+    gap_long_ms: f32,
     prefetched_ms: Duration,
     hit_stats: HitStats,
     audit: Option<crate::census::SurvivorAudit>,
@@ -927,6 +973,112 @@ fn check_manifest_params(
     }
 }
 
+/// Layout worker count for `-B 0`: requested GPUs clamped to visible devices,
+/// so one device always resolves to the default layout. `forced` (the env hook
+/// below) overrides the clamp for testing the W>=2 path on a one-GPU box.
+pub(crate) fn layout_workers(gpus: usize, devices: usize, forced: Option<usize>) -> usize {
+    if let Some(w) = forced.filter(|&w| w >= 1) {
+        return w;
+    }
+    gpus.max(1).min(devices.max(1))
+}
+
+/// Debug/test hook: forces the `-B 0` layout worker count without touching
+/// execution (worker threads, device ids, budgets are all derived from
+/// `--gpus` as before). Deliberately ungated (no `cfg`): the release binary
+/// must exercise the W>=2 path on a one-GPU box, and the layout line always
+/// prints when it fires, so a stray setting is visible. Invalid values are
+/// ignored.
+fn forced_layout_workers() -> Option<usize> {
+    std::env::var("HSPZ_LAYOUT_FORCE_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&w| w >= 1)
+}
+
+/// Round 90b `HSPZ_UNIT_PARTITION` policy: unset is auto, `0` forces whole-bin,
+/// `1` forces the unit partition, anything else is a startup error.
+///
+/// Auto partitions iff `workers >= 2` and every device the run will use
+/// reports the same [`DeviceProfile`] (SM count, clock, L2). The guard exists
+/// because a heterogeneous pair pays -10.8% or +12.7% depending on which
+/// device got which units, so the count-balanced partition must not silently
+/// turn on there. Pure over its inputs so the decision is unit-testable with
+/// no env access and no device; `profiles` holds one entry per used device
+/// (worker `w` runs on `w % devices`), in ordinal order.
+pub(crate) fn partition_policy(
+    env: Option<&str>,
+    workers: usize,
+    profiles: &[DeviceProfile],
+) -> Result<(bool, String), String> {
+    let forced = match env {
+        Some("1") => Some((true, "forced by HSPZ_UNIT_PARTITION=1")),
+        Some("0") => Some((false, "forced by HSPZ_UNIT_PARTITION=0")),
+        Some(v) => {
+            return Err(format!(
+                "HSPZ_UNIT_PARTITION must be unset, 0 or 1, got {v:?}"
+            ));
+        }
+        None => None,
+    };
+    if let Some((on, why)) = forced {
+        return Ok((on, why.to_string()));
+    }
+    if workers <= 1 {
+        return Ok((false, "auto: W=1".to_string()));
+    }
+    let first = match profiles.first() {
+        Some(p) => p,
+        None => return Ok((false, "auto: no device profiles".to_string())),
+    };
+    // Workers sharing one device gain nothing from balancing and pay the replicas.
+    if workers > profiles.len() {
+        return Ok((
+            false,
+            format!(
+                "auto: {workers} workers time-slice {} device{}",
+                profiles.len(),
+                if profiles.len() == 1 { "" } else { "s" }
+            ),
+        ));
+    }
+    // Same class = same SM count and L2 (the architecture/model); clocks within 10%,
+    // because otherwise-identical cards from different vendors report different
+    // nominal boost clocks (RTX 4090: 2520-2610 MHz) and the partition is worth
+    // -12% on such a pair. A same-model card that is slower under load is not
+    // detectable here (HSPZ_UNIT_PARTITION=0 restores whole-bin ownership).
+    let same_class = |p: &DeviceProfile| {
+        p.sms == first.sms
+            && p.l2_bytes == first.l2_bytes
+            && (p.clock_khz - first.clock_khz).abs() * 10 <= first.clock_khz.abs()
+    };
+    if let Some((i, p)) = profiles.iter().enumerate().find(|(_, p)| !same_class(p)) {
+        return Ok((
+            false,
+            format!(
+                "auto: device {i} differs from device 0 ({} vs {} SMs, {} vs {} MHz, {} vs {} MiB L2)",
+                p.sms,
+                first.sms,
+                p.clock_khz / 1000,
+                first.clock_khz / 1000,
+                p.l2_bytes >> 20,
+                first.l2_bytes >> 20,
+            ),
+        ));
+    }
+    Ok((
+        true,
+        format!(
+            "auto: {} matching device{} ({} SMs, {} MHz, {} MiB L2; static attributes only, clocks within 10%)",
+            profiles.len(),
+            if profiles.len() == 1 { "" } else { "s" },
+            first.sms,
+            first.clock_khz / 1000,
+            first.l2_bytes >> 20,
+        ),
+    ))
+}
+
 /// Whether to generate the query seed stream on the device (round 69).
 ///
 /// The trade reverses with GPU count. On one GPU the device seeder adds ~165 s of
@@ -942,17 +1094,19 @@ pub fn device_seeds_for(workers: usize) -> bool {
     }
 }
 
-/// Runs one worker's reference bins on `device`, streaming finished units to the
-/// emitter (§Phase 5: build/upload each reference once, reuse it across its
-/// queries; no GPU is shared for performance).
+/// Runs one worker's visits on `device`, streaming finished units to the
+/// emitter (§Phase 5: build/upload each visited reference once, reuse it
+/// across its slice; no GPU is shared for performance).
 ///
-/// This is the serial executor, parameterised by which bins it owns: with one
-/// worker it is exactly the old path, which is what makes `serial == multi-GPU`
-/// (§20) a property of the assignment rather than of two code paths.
+/// This is the serial executor, parameterised by which visits it owns: with one
+/// worker (or the whole-bin policy) every visit is a whole bin, which is what
+/// makes `serial == multi-GPU` (§20) a property of the assignment rather than
+/// of two code paths. One engine per visit, reused across the slice.
 #[allow(clippy::too_many_arguments)]
 fn run_bins(
     device: usize,
-    bins: &[u32],
+    worker: usize,
+    visits: &[plan::Visit],
     plan: &plan::Plan,
     ref_records: &[(String, Vec<u8>)],
     qry_records: &[(String, Vec<u8>)],
@@ -967,9 +1121,10 @@ fn run_bins(
     device_seeds: bool,
     contract: crate::gpu::ExecutionContract,
     tx: &std::sync::mpsc::SyncSender<UnitOutput>,
+    run_started: Instant,
 ) -> Fallible<WorkerReport> {
     let mut rep = WorkerReport::default();
-    if bins.is_empty() {
+    if visits.is_empty() {
         return Ok(rep);
     }
     let t = Instant::now();
@@ -997,8 +1152,8 @@ fn run_bins(
     };
     let mut pending: Option<(PackedBin, SeedTable)> = None;
 
-    for (bin_index, bin_id) in bins.iter().enumerate() {
-        let rbin = &plan.reference_bins[*bin_id as usize];
+    for (visit_index, visit) in visits.iter().enumerate() {
+        let rbin = &plan.reference_bins[visit.bin];
         let t = Instant::now();
         let (mut packed_ref, table) = match pending.take() {
             Some(built) => built,
@@ -1040,10 +1195,10 @@ fn run_bins(
         drop(packed_ref);
         drop(table);
 
-        // The next bin *this worker owns* rides along with this bin's GPU work.
-        let next_bin = bins
-            .get(bin_index + 1)
-            .map(|id| &plan.reference_bins[*id as usize])
+        // The next visit *this worker owns* rides along with this visit's GPU work.
+        let next_bin = visits
+            .get(visit_index + 1)
+            .map(|v| &plan.reference_bins[v.bin])
             .filter(|_| prefetch);
         std::thread::scope(|scope| -> Fallible<()> {
             let prefetch = next_bin.map(|nb| {
@@ -1053,8 +1208,11 @@ fn run_bins(
                 })
             });
 
-            for unit in plan.units.iter().filter(|u| u.reference_bin == rbin.id) {
+            for unit in plan.units.iter().filter(|u| {
+                u.reference_bin == rbin.id && visit.queries.contains(&(u.query_bin as usize))
+            }) {
                 let qbin = &plan.query_bins[unit.query_bin as usize];
+                let host_start_ms = run_started.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
                 let packed_q = PackedBin::build(
                     qbin.record_ids.iter().map(|&id| {
@@ -1064,7 +1222,8 @@ fn run_bins(
                     &args.query_prefix,
                     true,
                 );
-                rep.phases.add("query pack", t.elapsed());
+                let pack_dur = t.elapsed();
+                rep.phases.add("query pack", pack_dur);
                 // Per-bin intervals + q_block_len (AM-B2). `intervals` is empty for a
                 // block <= seed, and `q_block_len` is then never read; saturating
                 // avoids the underflow the single-block path guards with an error.
@@ -1074,13 +1233,15 @@ fn run_bins(
 
                 let t = Instant::now();
                 engine.swap_query(&packed_q.enc, &packed_q.enc_rc)?;
-                rep.phases.add("swap_query", t.elapsed());
+                let swap_dur = t.elapsed();
+                rep.phases.add("swap_query", swap_dur);
                 let qpass = QueryPass {
                     fwd: &packed_q.buf[..packed_q.block_len],
                     rc: &packed_q.rc,
                     intervals: &intervals,
                     q_block_len,
                 };
+                let gpu_before = engine.phases.gpu_ms();
                 let pass =
                     seed_and_filter_all(&mut engine, &qpass, shape, transitions, args, threads)
                         .map_err(|e| {
@@ -1089,12 +1250,34 @@ fn run_bins(
                                 unit.ordinal, rbin.id, qbin.id
                             )
                         })?;
+                let busy_ms = engine.phases.gpu_ms() - gpu_before;
+                let host_end_ms = run_started.elapsed().as_secs_f64() * 1000.0;
 
                 rep.stats.seeds += pass.stats.seeds;
                 rep.stats.seed_hits += pass.stats.seed_hits;
                 rep.stats.raw_hsps += pass.stats.raw_hsps;
                 rep.stats.hsps += pass.stats.hsps;
                 rep.lifecycle.work_units_executed += 1;
+                if args.time {
+                    rep.ledger.push(UnitLedgerRow {
+                        ordinal: unit.ordinal,
+                        worker,
+                        device,
+                        reference_bin: rbin.id,
+                        query_bin: qbin.id,
+                        reference_bp: rbin.total_bp,
+                        query_bp: qbin.total_bp,
+                        gpu_ms: busy_ms,
+                        host_start_ms,
+                        host_end_ms,
+                        pack_ms: pack_dur.as_secs_f64() * 1000.0,
+                        swap_ms: swap_dur.as_secs_f64() * 1000.0,
+                        seeds: pass.stats.seeds,
+                        hits: pass.stats.seed_hits,
+                        raw_hsps: pass.stats.raw_hsps,
+                        hsps: pass.stats.hsps,
+                    });
+                }
 
                 // A dead emitter means the run is already failing; propagate rather
                 // than block forever on a channel nobody drains.
@@ -1128,7 +1311,22 @@ fn run_bins(
             let (g, n, _, _) = engine.stage_gaps();
             rep.gap_ms += g;
             rep.gap_n += n;
+            for ((a, b), ms, c) in engine.gap_pairs() {
+                match rep.gap_pairs.iter_mut().find(|e| e.0 == (a, b)) {
+                    Some(e) => {
+                        e.1 += ms;
+                        e.2 += c;
+                    }
+                    None => rep.gap_pairs.push(((a, b), ms, c)),
+                }
+            }
+            let (ln, lms) = engine.discarded_gaps();
+            rep.gap_long_n += ln;
+            rep.gap_long_ms += lms;
         }
+        // Engine-end autotune ledger: still in Auto means the chunks ran
+        // out before a decision, so say so under --time.
+        engine.finish_bucket_autotune();
         rep.launches += engine.launches;
         rep.stage_syncs += engine.stage_syncs();
         rep.pipeline_syncs += engine.pipeline_syncs();
@@ -1168,6 +1366,7 @@ fn run_bins(
             );
         }
     }
+    rep.finished_ms = run_started.elapsed().as_secs_f64() * 1000.0;
     Ok(rep)
 }
 
@@ -1175,6 +1374,12 @@ fn run_bins(
 // run
 
 pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallible<Stats> {
+    // Round 90b gate, read once here and validated before the `--cpu-only`
+    // branch returns (a bad value is a startup error there too). The auto arm
+    // is resolved with the other scheduling decisions below, where W and the
+    // per-device profiles are known; until then the env value is just carried.
+    let unit_env = std::env::var("HSPZ_UNIT_PARTITION").ok();
+    partition_policy(unit_env.as_deref(), 1, &[])?;
     let mut phases = Phases::new();
     phases.add_ms("process startup", pre_main_ms);
 
@@ -1232,27 +1437,101 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // ponytail: min(gpus, n_records) overcharges when bins < records; upgrade on measured false rejections
     let workers_upper = args.gpus.max(1).min(ref_meta.len().max(1));
     let budget = plan::worker_device_budget(free, workers_upper, devices);
-    let q_target = args.query_block_size.unwrap_or(args.seq_block_size) as u64;
-    let (plan, _worst, mut contract) = if let Some(m) = &loaded_manifest {
+    // `-B 0` is the automatic layout, resolved here before planning. It needs
+    // LPT bins, so `--kegalign-bins` (sequential fill) is rejected in every
+    // mode, including replay, where `-B` itself is otherwise ignored.
+    if args.seq_block_size == 0 && args.kegalign_bins {
+        return Err(plan::AUTO_KEGALIGN_ERROR.into());
+    }
+    let (plan, _worst, mut contract, res_seq, res_qry) = if let Some(m) = &loaded_manifest {
         let worst = m.check_fit(budget, shape.kmer_size)?;
         let contract = crate::gpu::ExecutionContract::from_resolved(m.max_hits, m.hsp_blocks);
-        (m.plan.clone(), worst, contract)
+        (
+            m.plan.clone(),
+            worst,
+            contract,
+            m.seq_block_size,
+            m.query_block_size,
+        )
     } else {
         let contract = crate::gpu::ExecutionContract::resolve(&ctx, args.max_hits, args.hsp_blocks);
-        let (plan, worst) = plan::plan_within_budget(
-            &ref_meta,
-            &qry_meta,
-            args.seq_block_size as u64,
-            q_target,
-            budget,
-            shape.kmer_size,
-            args.step,
-            contract.max_hits,
-            args.kegalign_bins,
-            args.wga_chunk_size,
-            transitions,
-        )?;
-        (plan, worst, contract)
+        if args.seq_block_size == 0 {
+            let w = layout_workers(args.gpus, devices, forced_layout_workers());
+            if w <= 1 {
+                // Trivial resolution: exactly today's default call, so a
+                // one-worker `-B 0` run is byte-identical to `-B 500000000`.
+                let q = args
+                    .query_block_size
+                    .map(u64::from)
+                    .unwrap_or(plan::DEFAULT_BLOCK_TARGET);
+                let (plan, worst) = plan::plan_within_budget(
+                    &ref_meta,
+                    &qry_meta,
+                    plan::DEFAULT_BLOCK_TARGET,
+                    q,
+                    budget,
+                    shape.kmer_size,
+                    args.step,
+                    contract.max_hits,
+                    args.kegalign_bins,
+                    args.wga_chunk_size,
+                    transitions,
+                )?;
+                (plan, worst, contract, plan::DEFAULT_BLOCK_TARGET, q)
+            } else {
+                let auto = plan::auto_layout(
+                    &ref_meta,
+                    &qry_meta,
+                    w,
+                    args.gpus.max(1).min(ref_meta.len().max(1)),
+                    budget,
+                    timing::available_host_bytes().map(|b| b * 9 / 10),
+                    args.query_block_size.map(u64::from),
+                    &plan::AutoCtx {
+                        kmer_size: shape.kmer_size,
+                        step: args.step,
+                        max_hits: contract.max_hits,
+                        wga_chunk_size: args.wga_chunk_size,
+                        transitions,
+                        threads: resolve_threads(args.threads),
+                        max_seeds: seed::max_seeds(args.wga_chunk_size, &shape, transitions),
+                    },
+                )?;
+                match auto.fell_back {
+                    Some((r, q)) => eprintln!(
+                        "layout: auto W={w} -> default --seq-block-size {} --query-block-size {} \
+                         (candidate R={r} Q={q} did not fit the device budget)",
+                        plan::DEFAULT_BLOCK_TARGET,
+                        plan::DEFAULT_BLOCK_TARGET
+                    ),
+                    None => eprintln!(
+                        "{}",
+                        plan::auto_layout_line(w, auto.seq_target, auto.query_target, &auto.plan)
+                    ),
+                }
+                let (seq, qry) = (auto.seq_target, auto.query_target);
+                (auto.plan, 0, contract, seq, qry)
+            }
+        } else {
+            let q_target = args
+                .query_block_size
+                .map(u64::from)
+                .unwrap_or(args.seq_block_size as u64);
+            let (plan, worst) = plan::plan_within_budget(
+                &ref_meta,
+                &qry_meta,
+                args.seq_block_size as u64,
+                q_target,
+                budget,
+                shape.kmer_size,
+                args.step,
+                contract.max_hits,
+                args.kegalign_bins,
+                args.wga_chunk_size,
+                transitions,
+            )?;
+            (plan, worst, contract, args.seq_block_size as u64, q_target)
+        }
     };
     // Physical capacity from the frozen/chosen plan at H under the same
     // per-worker budget; never replans. Clamped to the kernel-safe ceiling.
@@ -1310,8 +1589,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                     wga_chunk_size: args.wga_chunk_size,
                     lastz_interval_size: args.lastz_interval_size,
                     kegalign_bins: args.kegalign_bins,
-                    seq_block_size: args.seq_block_size as u64,
-                    query_block_size: q_target,
+                    seq_block_size: res_seq,
+                    query_block_size: res_qry,
                     ref_hash: plan::records_hash(&ref_records),
                     qry_hash: plan::records_hash(&qry_records),
                     executable_hash: plan::executable_hash()?,
@@ -1329,13 +1608,82 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         f.flush()?;
     }
 
-    // §18: reference bins to workers, deterministic LPT. Every query bin runs
-    // against every reference bin, so `cost(R) = reference_bp x total_query_bp` is
+    // §18: reference bins to workers, deterministic LPT (whole-bin), or the
+    // round-90 unit partition. `cost(R) = reference_bp x total_query_bp` is
     // monotone in the bin's own bp — LPT on `total_bp` is the same schedule with
-    // less arithmetic (plan::assign_bins).
+    // less arithmetic (plan::assign_bins). W = 1 always takes today's path.
     let devices = crate::gpu::device_count().max(1);
     let workers = args.gpus.max(1).min(plan.reference_bins.len().max(1));
-    let assignment = plan::assign_bins(&plan.reference_bins, workers);
+    // Round 90b: query each device the run will use (worker `w` maps to
+    // `w % devices`, so the used ordinals are `0..min(workers, devices)`) once,
+    // before any worker spawns. Only auto needs the profiles; a forced value
+    // short-circuits in `partition_policy` without them.
+    let profiles: Vec<DeviceProfile> = if unit_env.is_none() && workers > 1 {
+        (0..workers.min(devices))
+            .map(|d| crate::gpu::device_profile(d as i32))
+            .collect::<Result<_, _>>()?
+    } else {
+        Vec::new()
+    };
+    let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
+    let use_units = unit_enabled && workers > 1;
+    let part: Vec<Vec<plan::Visit>> = if use_units {
+        plan::unit_partition(&plan, workers)
+    } else {
+        let q = plan.query_bins.len();
+        plan::assign_bins(&plan.reference_bins, workers)
+            .into_iter()
+            .map(|bins| {
+                bins.into_iter()
+                    .map(|id| plan::Visit {
+                        bin: id as usize,
+                        queries: 0..q,
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    // Distinct reference bins per worker: the host peak counts one bin build at
+    // a time, never multiplied by the replica count.
+    let visit_bins: Vec<Vec<u32>> = part
+        .iter()
+        .map(|visits| {
+            let mut bins: Vec<u32> = visits.iter().map(|t| t.bin as u32).collect();
+            bins.sort_unstable();
+            bins.dedup();
+            bins
+        })
+        .collect();
+    let total_visits: usize = part.iter().map(Vec::len).sum();
+    eprintln!(
+        "schedule: policy={} W={workers} visits={total_visits} extra_replicas={} ({reason})",
+        if use_units {
+            "unit-partition"
+        } else {
+            "whole-bin"
+        },
+        total_visits.saturating_sub(plan.reference_bins.len())
+    );
+    for (x, visits) in part.iter().enumerate() {
+        let units: usize = visits.iter().map(|t| t.queries.len()).sum();
+        let desc = visits
+            .iter()
+            .map(|t| format!("R{}[{}..{})", t.bin, t.queries.start, t.queries.end))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!(
+            "schedule: worker {x} device {}: {desc} units={units} visits={}",
+            x % devices,
+            visits.len()
+        );
+    }
+    eprintln!(
+        "schedule: device mapping: {}",
+        (0..workers)
+            .map(|x| format!("worker{x}->device{}", x % devices))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     if workers > devices {
         eprintln!(
             "note: {workers} workers over {devices} device(s) — they time-slice one GPU. \
@@ -1367,7 +1715,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let mut host_status = "unknown (no cgroup/meminfo reading)";
     if let Some(available) = timing::available_host_bytes().map(|b| b * 9 / 10) {
         host_budget = Some(available);
-        let fits = plan::host_preflight(&est, &assignment, available)?;
+        let fits = plan::host_preflight(&est, &visit_bins, available)?;
         host_status = if fits {
             "fits with prefetch"
         } else {
@@ -1383,7 +1731,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     }
     // §9: the estimate that the decision was made on, so a run can be checked
     // against its own measured RSS (§11) without re-deriving the model.
-    let host_peak_est = plan::host_peak(&est, &assignment, prefetch);
+    let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
 
     let mut emitter = Emitter::new(args)?;
     let mut raw_all: Vec<(char, Vec<SegmentPair>)> = Vec::new();
@@ -1413,7 +1761,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let (tx, rx) = std::sync::mpsc::sync_channel::<UnitOutput>(2 * workers);
     let reports = std::thread::scope(|scope| -> Fallible<Vec<WorkerReport>> {
         let mut handles = Vec::new();
-        for (w, bins) in assignment.iter().enumerate() {
+        for (w, visits) in part.iter().enumerate() {
             let tx = tx.clone();
             let (plan, ref_records, qry_records, shape, sub_mat) =
                 (&plan, &ref_records, &qry_records, &shape, &sub_mat);
@@ -1422,7 +1770,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             handles.push(scope.spawn(move || {
                 run_bins(
                     w % devices,
-                    bins,
+                    w,
+                    visits,
                     plan,
                     ref_records,
                     qry_records,
@@ -1435,6 +1784,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                     device_seeds,
                     contract,
                     &tx,
+                    started,
                 )
                 .map_err(|e| e.to_string())
             }));
@@ -1445,7 +1795,24 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             std::collections::BTreeMap::new();
         let mut next = 0u32;
         for unit in rx {
-            buffered.insert(unit.ordinal, unit);
+            let ord = unit.ordinal;
+            // The ordinal alone is not identity: the unit must be the plan's unit.
+            let pu = plan.units.get(ord as usize).ok_or_else(|| {
+                format!(
+                    "work unit ordinal {ord} is outside the plan ({} units)",
+                    plan.units.len()
+                )
+            })?;
+            if (pu.reference_bin, pu.query_bin) != (unit.reference_bin, unit.query_bin) {
+                return Err(format!(
+                    "work unit ordinal {ord} arrived as R{} Q{} but the plan has R{} Q{}",
+                    unit.reference_bin, unit.query_bin, pu.reference_bin, pu.query_bin
+                )
+                .into());
+            }
+            if ord < next || buffered.insert(ord, unit).is_some() {
+                return Err(format!("duplicate work unit ordinal {ord} from a worker").into());
+            }
             while let Some(u) = buffered.remove(&next) {
                 emitter.emit_unit(
                     u.reference_bin,
@@ -1461,6 +1828,12 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                 next += 1;
             }
         }
+        let mut out = Vec::new();
+        for h in handles {
+            out.push(h.join().expect("gpu worker panicked")?);
+        }
+        // Join first so a worker's own error (OOM, CUDA failure) is reported
+        // instead of the completeness check it also trips (codex review, round 90).
         if !buffered.is_empty() {
             return Err(format!(
                 "emitter has {} unit(s) it can never reach: expected ordinal {next}, \
@@ -1470,9 +1843,12 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             )
             .into());
         }
-        let mut out = Vec::new();
-        for h in handles {
-            out.push(h.join().expect("gpu worker panicked")?);
+        if next != plan.units.len() as u32 {
+            return Err(format!(
+                "emitter reached ordinal {next} of {} work units — a unit ran twice or never",
+                plan.units.len()
+            )
+            .into());
         }
         Ok(out)
     })?;
@@ -1504,6 +1880,111 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                 0.0
             }
         );
+    }
+    // Residual attribution: per-worker notes that keep every existing line
+    // above unchanged (cycle-4/5 report scripts still parse). Printed under
+    // --time for any worker count, so a single-worker run still shows them.
+    if args.time {
+        let pairs: Vec<String> = reports
+            .iter()
+            .map(|r| {
+                let mut v = r.gap_pairs.clone();
+                v.sort_by(|a, b| b.1.total_cmp(&a.1));
+                let top: Vec<String> = v
+                    .iter()
+                    .take(5)
+                    .map(|((a, b), ms, n)| format!("({a}->{b}, {ms:.1}, {n})"))
+                    .collect();
+                format!("[{}]", top.join(", "))
+            })
+            .collect();
+        eprintln!("note: per-worker gap pairs: {pairs:?}");
+        let long_n: Vec<u64> = reports.iter().map(|r| r.gap_long_n).collect();
+        let long_ms: Vec<f32> = reports.iter().map(|r| r.gap_long_ms).collect();
+        eprintln!("note: per-worker long transitions: n={long_n:?} sum={long_ms:?} ms");
+        let qp: Vec<f64> = reports.iter().map(|r| r.phases.ms("query pack")).collect();
+        let sq: Vec<f64> = reports.iter().map(|r| r.phases.ms("swap_query")).collect();
+        let cp: Vec<f64> = reports
+            .iter()
+            .map(|r| r.phases.ms("chunk prep (lower_bound)"))
+            .collect();
+        let st: Vec<f64> = reports
+            .iter()
+            .map(|r| r.seed_table_ms.as_secs_f64() * 1000.0)
+            .collect();
+        // Standalone (non-overlapped) reference prep lives in the worker report,
+        // not in the worker Phases (that name is added globally after this note).
+        let rp: Vec<f64> = reports
+            .iter()
+            .map(|r| r.prefetched_ms.as_secs_f64() * 1000.0)
+            .collect();
+        eprintln!(
+            "note: per-worker host phases ms: [query pack={qp:?}, swap_query={sq:?}, \
+             chunk prep (lower_bound)={cp:?}, seed table build={st:?}, \
+             reference bin prep (standalone)={rp:?}]"
+        );
+        // Round 90 unit ledger: one tab-separated line per executed unit in
+        // ordinal order, then per-worker totals. The summed unit busy must agree
+        // with the per-worker gpu-busy note within 1% (warning only).
+        let mut rows: Vec<&UnitLedgerRow> = reports.iter().flat_map(|r| r.ledger.iter()).collect();
+        rows.sort_by_key(|r| r.ordinal);
+        eprintln!(
+            "unit ledger:\tordinal\tworker\tdevice\tref_bin\tquery_bin\tref_bp\tquery_bp\t\
+             gpu_ms\thost_start_ms\thost_end_ms\tpack_ms\tswap_ms\tseeds\thits\traw_hsps\thsps"
+        );
+        for r in &rows {
+            eprintln!(
+                "unit ledger:\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.3}\t{:.2}\t{:.2}\t{:.2}\t{:.2}\t{}\t{}\t{}\t{}",
+                r.ordinal,
+                r.worker,
+                r.device,
+                r.reference_bin,
+                r.query_bin,
+                r.reference_bp,
+                r.query_bp,
+                r.gpu_ms,
+                r.host_start_ms,
+                r.host_end_ms,
+                r.pack_ms,
+                r.swap_ms,
+                r.seeds,
+                r.hits,
+                r.raw_hsps,
+                r.hsps
+            );
+        }
+        for (x, rep) in reports.iter().enumerate() {
+            let busy: f64 = rep.ledger.iter().map(|r| r.gpu_ms).sum();
+            let host: f64 = rep
+                .ledger
+                .iter()
+                .map(|r| r.host_end_ms - r.host_start_ms)
+                .sum();
+            let end: f64 = rep.ledger.iter().map(|r| r.host_end_ms).fold(0.0, f64::max);
+            let gpu = rep.phases.gpu_ms();
+            eprintln!(
+                "unit ledger: worker {x} finished at {:.2} ms (last unit end {end:.2}), busy {busy:.2} ms, unit-host {host:.2} ms",
+                rep.finished_ms
+            );
+            eprintln!(
+                "unit ledger: worker {x} self-check unit_busy_sum={busy:.2} ms gpu_busy={gpu:.2} ms"
+            );
+            let tol = 0.01 * gpu.max(1e-9);
+            if (busy - gpu).abs() > tol {
+                eprintln!(
+                    "unit ledger: worker {x} WARNING unit busy and gpu-busy differ by over 1%"
+                );
+            }
+            debug_assert!((busy - gpu).abs() <= tol, "unit ledger self-check");
+        }
+    }
+
+    for (x, r) in reports.iter().enumerate() {
+        let vw = part[x].len() as u32;
+        let uw: u32 = part[x].iter().map(|t| t.queries.len() as u32).sum();
+        r.lifecycle
+            .check(vw, uw)
+            .map_err(|e| format!("worker {x}: {e}"))?;
     }
 
     let mut stats = Stats::default();
@@ -1550,7 +2031,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     if prefetched_ms > Duration::ZERO {
         phases.add_overlapped("reference bin prep (standalone)", prefetched_ms);
     }
-    lifecycle.check(plan.reference_bins.len() as u32, plan.units.len() as u32)?;
+    lifecycle.check(total_visits as u32, plan.units.len() as u32)?;
 
     if let Some(path) = &args.dump_raw {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
@@ -2072,6 +2553,32 @@ mod tests {
         assert_eq!(bare, spelled_out);
     }
 
+    /// `-B 0` needs LPT bins, so `--kegalign-bins` (sequential fill) is
+    /// rejected before any input is read; the GPU `run` path repeats the
+    /// check before planning.
+    #[test]
+    fn prepare_rejects_kegalign_with_auto_layout() {
+        let mut phases = Phases::new();
+        let mut auto = base_args();
+        auto.reference = PathBuf::from("/nonexistent/ref.fa");
+        auto.query = PathBuf::from("/nonexistent/qry.fa");
+        auto.seq_block_size = 0;
+        auto.kegalign_bins = true;
+        let err = prepare(&auto, &mut phases).err().unwrap();
+        assert!(err.to_string().contains("automatic layout"), "{err}");
+    }
+
+    #[test]
+    fn layout_workers_clamps_to_devices_with_env_override() {
+        assert_eq!(layout_workers(0, 0, None), 1);
+        assert_eq!(layout_workers(1, 1, None), 1);
+        assert_eq!(layout_workers(2, 1, None), 1);
+        assert_eq!(layout_workers(2, 2, None), 2);
+        assert_eq!(layout_workers(8, 2, None), 2);
+        assert_eq!(layout_workers(1, 4, Some(2)), 2);
+        assert_eq!(layout_workers(2, 2, Some(0)), 2, "zero override is ignored");
+    }
+
     /// `prepare` is the GPU-free path `benchmark` and `--cpu-only` share; neither
     /// implements frozen-plan replay or manifest dumps, so both flags must fail
     /// fast here rather than being silently dropped. Both paths point at inputs
@@ -2440,5 +2947,92 @@ mod tests {
         let line = n1_report_line(&c);
         assert!(line.starts_with("#n1 census: eligible seeds 14 of 452 (3.0973%)"));
         assert!(line.contains("eligible hits 28 of 904 (3.0973%)"));
+    }
+}
+
+/// Round 90b: the `HSPZ_UNIT_PARTITION` auto arm and its forced overrides are
+/// pure, so every branch (W=1, identical, one attribute differing, forced
+/// either way, invalid) is covered without CUDA or env access.
+#[cfg(test)]
+mod partition_policy_tests {
+    use super::partition_policy;
+    use crate::gpu::DeviceProfile;
+
+    fn p(sms: i32, mhz: i32, mib: u64) -> DeviceProfile {
+        DeviceProfile {
+            sms,
+            clock_khz: mhz * 1000,
+            l2_bytes: mib << 20,
+        }
+    }
+
+    #[test]
+    fn w1_stays_whole_bin() {
+        assert_eq!(
+            partition_policy(None, 1, &[p(128, 2520, 72)]),
+            Ok((false, "auto: W=1".to_string()))
+        );
+    }
+
+    #[test]
+    fn identical_devices_partition() {
+        assert_eq!(
+            partition_policy(None, 2, &[p(128, 2520, 72), p(128, 2520, 72)]),
+            Ok((
+                true,
+                "auto: 2 matching devices (128 SMs, 2520 MHz, 72 MiB L2; static attributes only, clocks within 10%)".to_string()
+            ))
+        );
+        // Vendor OC variants of one model report different nominal clocks; within 10% is the same class.
+        assert!(partition_policy(None, 2, &[p(128, 2520, 72), p(128, 2610, 72)]).unwrap().0);
+    }
+
+    #[test]
+    fn time_sliced_workers_stay_whole_bin() {
+        let (on, why) = partition_policy(None, 2, &[p(128, 2520, 72)]).unwrap();
+        assert!(!on);
+        assert_eq!(why, "auto: 2 workers time-slice 1 device");
+    }
+
+    #[test]
+    fn any_differing_attribute_forces_whole_bin() {
+        let base = p(40, 1590, 4);
+        for other in [p(48, 1590, 4), p(40, 1200, 4), p(40, 1590, 8)] {
+            let (on, why) = partition_policy(None, 2, &[base, other]).unwrap();
+            assert!(!on);
+            assert!(
+                why.starts_with("auto: device 1 differs from device 0 ("),
+                "{why}"
+            );
+        }
+        // The tuple is (differing device) vs (device 0), differing first.
+        let (_, why) = partition_policy(None, 2, &[base, p(48, 1500, 8)]).unwrap();
+        assert_eq!(
+            why,
+            "auto: device 1 differs from device 0 \
+             (48 vs 40 SMs, 1500 vs 1590 MHz, 8 vs 4 MiB L2)"
+        );
+    }
+
+    #[test]
+    fn forced_values_override_the_profiles() {
+        let same = [p(128, 2520, 72), p(128, 2520, 72)];
+        let diff = [p(40, 1590, 4), p(48, 1500, 8)];
+        assert_eq!(
+            partition_policy(Some("1"), 2, &diff),
+            Ok((true, "forced by HSPZ_UNIT_PARTITION=1".to_string()))
+        );
+        assert_eq!(
+            partition_policy(Some("0"), 2, &same),
+            Ok((false, "forced by HSPZ_UNIT_PARTITION=0".to_string()))
+        );
+    }
+
+    #[test]
+    fn invalid_value_is_an_error() {
+        assert_eq!(
+            partition_policy(Some("2"), 2, &[]).unwrap_err(),
+            "HSPZ_UNIT_PARTITION must be unset, 0 or 1, got \"2\""
+        );
     }
 }

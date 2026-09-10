@@ -95,6 +95,192 @@ pub fn assign_bins(bins: &[Bin], workers: usize) -> Vec<Vec<u32>> {
     out
 }
 
+/// One contiguous query slice of a single reference bin (round 90).
+///
+/// A worker executes its visits in ascending bin id, and the units inside a
+/// visit in ascending query id. Whole-bin ownership is the special case
+/// `queries == 0..Q`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Visit {
+    pub bin: usize,
+    pub queries: std::ops::Range<usize>,
+}
+
+/// Static unit-level partition of a frozen plan over `workers` workers.
+///
+/// Pure and deterministic. With `N = R*Q` units, quotas are `N div W` and one
+/// more (exactly `N mod W` large). A quota `c` gives `c div Q` whole-bin slots
+/// plus a residual of `c mod Q` units. Whole slots take the largest bins first
+/// (LPT on reference bp exactly as [`assign_bins`], ties by bin id, only workers
+/// with a free slot). The leftover bins form one residual stream of units in bin
+/// order then query order, cut into consecutive pieces; the large/small quota
+/// order along the stream is chosen by an `O(W^2)` DP over how many of each have
+/// been placed, minimising total bin visits (a piece at stream offset `S` with
+/// length `d` costs `1 + (((S mod Q) + d - 1) / Q)` visits, `0` when `d == 0`).
+/// Ties break towards fewer visits on large-quota workers, then earliest large
+/// quotas. `W == 1` is one whole-bin visit per bin, identical to today.
+pub fn unit_partition(plan: &Plan, workers: usize) -> Vec<Vec<Visit>> {
+    let w = workers.max(1);
+    let r = plan.reference_bins.len();
+    let q = plan.query_bins.len();
+    let n = plan.units.len();
+    if r == 0 || q == 0 || n == 0 {
+        return vec![Vec::new(); w];
+    }
+    if w == 1 {
+        let mut v: Vec<Visit> = plan
+            .reference_bins
+            .iter()
+            .map(|b| Visit {
+                bin: b.id as usize,
+                queries: 0..q,
+            })
+            .collect();
+        v.sort_by_key(|x| x.bin);
+        return vec![v];
+    }
+    let a = n / w;
+    let rem = n % w;
+    let (nl, large_c, small_c) = if rem == 0 { (0, a, a) } else { (rem, a + 1, a) };
+    let ns = w - nl;
+    let (d_large, d_small) = (large_c % q, small_c % q);
+    // DP over (#small placed, #large placed); stream offset is fixed by the
+    // counts, so the cost of the next piece is known. Best is (total visits,
+    // visits on large-quota pieces); exact ties keep the small arm, which
+    // places large quotas earliest (fixed order).
+    let visits_at = |s: usize, d: usize| -> u32 {
+        if d == 0 {
+            0
+        } else {
+            (1 + ((s % q) + d - 1) / q) as u32
+        }
+    };
+    let mut best: Vec<Vec<Option<(u32, u32)>>> = vec![vec![None; nl + 1]; ns + 1];
+    let mut large_last: Vec<Vec<bool>> = vec![vec![false; nl + 1]; ns + 1];
+    best[0][0] = Some((0, 0));
+    for i in 0..=ns {
+        for j in 0..=nl {
+            let Some((tot, lg)) = best[i][j] else {
+                continue;
+            };
+            let s = i * d_small + j * d_large;
+            if i < ns {
+                let cand = (tot + visits_at(s, d_small), lg);
+                let replace = match best[i + 1][j] {
+                    None => true,
+                    Some(cur) => cand < cur,
+                };
+                if replace {
+                    best[i + 1][j] = Some(cand);
+                    large_last[i + 1][j] = false;
+                }
+            }
+            if j < nl {
+                let v = visits_at(s, d_large);
+                let cand = (tot + v, lg + v);
+                let replace = match best[i][j + 1] {
+                    None => true,
+                    Some(cur) => cand < cur,
+                };
+                if replace {
+                    best[i][j + 1] = Some(cand);
+                    large_last[i][j + 1] = true;
+                }
+            }
+        }
+    }
+    let mut is_large = vec![false; w];
+    {
+        let (mut i, mut j) = (ns, nl);
+        while i + j > 0 {
+            if large_last[i][j] {
+                is_large[i + j - 1] = true;
+                j -= 1;
+            } else {
+                i -= 1;
+            }
+        }
+    }
+    let quota = |x: usize| {
+        if is_large[x] { large_c } else { small_c }
+    };
+    // Whole-bin slots, largest bins first into the lightest worker with a free
+    // slot (ties by worker index), exactly like `assign_bins`.
+    let mut order: Vec<&Bin> = plan.reference_bins.iter().collect();
+    order.sort_by(|x, y| y.total_bp.cmp(&x.total_bp).then(x.id.cmp(&y.id)));
+    let mut load = vec![0u64; w];
+    let mut used = vec![0usize; w];
+    let mut taken = vec![false; r];
+    let mut visits: Vec<Vec<Visit>> = vec![Vec::new(); w];
+    for b in order {
+        let mut pick: Option<usize> = None;
+        for x in 0..w {
+            if used[x] >= quota(x) / q {
+                continue;
+            }
+            pick = Some(match pick {
+                None => x,
+                Some(p) => {
+                    if (load[x], x) < (load[p], p) {
+                        x
+                    } else {
+                        p
+                    }
+                }
+            });
+        }
+        let Some(p) = pick else { break };
+        load[p] += b.total_bp;
+        used[p] += 1;
+        taken[b.id as usize] = true;
+        visits[p].push(Visit {
+            bin: b.id as usize,
+            queries: 0..q,
+        });
+    }
+    // Residual stream: leftover bins (descending bp, ties by id), query order.
+    let mut rest: Vec<&Bin> = plan
+        .reference_bins
+        .iter()
+        .filter(|b| !taken[b.id as usize])
+        .collect();
+    rest.sort_by(|x, y| y.total_bp.cmp(&x.total_bp).then(x.id.cmp(&y.id)));
+    let mut stream: Vec<(usize, usize)> = Vec::with_capacity(rest.len() * q);
+    for b in &rest {
+        for qq in 0..q {
+            stream.push((b.id as usize, qq));
+        }
+    }
+    let mut off = 0usize;
+    for x in 0..w {
+        let d = quota(x) % q;
+        let mut k = off;
+        let end = off + d;
+        while k < end {
+            let b = stream[k].0;
+            let mut e = k + 1;
+            while e < end && stream[e].0 == b {
+                e += 1;
+            }
+            visits[x].push(Visit {
+                bin: b,
+                queries: stream[k].1..stream[e - 1].1 + 1,
+            });
+            k = e;
+        }
+        off = end;
+    }
+    debug_assert_eq!(off, stream.len());
+    for v in &mut visits {
+        v.sort_by_key(|t| t.bin);
+        debug_assert!(
+            v.windows(2).all(|w| w[0].bin != w[1].bin),
+            "two visits of one bin on a worker"
+        );
+    }
+    visits
+}
+
 /// KegAlign's block rule, reproduced exactly, for matched-granularity runs
 /// (benchmark plan §5 Mode A).
 ///
@@ -286,6 +472,232 @@ pub fn candidate_plans(reference: &[RecordMeta], base: &Plan, workers: usize) ->
         }
     }
     out
+}
+
+/// Default block target both sides fall back to: the KegAlign-matched digest
+/// (`-B`'s CLI default). `-B 0` resolves to this at `workers <= 1`, and the
+/// automatic layout derives its reference count from it.
+pub const DEFAULT_BLOCK_TARGET: u64 = 500_000_000;
+
+/// Rejected combination: the automatic layout bins by LPT record balance,
+/// which cannot reproduce KegAlign's sequential fill.
+pub const AUTO_KEGALIGN_ERROR: &str =
+    "automatic layout uses LPT bins; drop --kegalign-bins or give -B explicitly";
+
+/// Automatic reference-bin count for `-B 0` at `workers >= 2` (rank-2 rule):
+/// the smallest multiple of `workers` that does not coarsen the default
+/// layout (`R_def`), capped at one bin per record so no worker idles by
+/// construction. Divisibility is the whole point: `R % W == 0` keeps every
+/// worker holding the same number of bins.
+pub fn auto_ref_bin_count(n_records: usize, r_def: usize, workers: usize) -> usize {
+    if n_records == 0 {
+        return 0;
+    }
+    let w = workers.max(1);
+    n_records.min(r_def.max(1).div_ceil(w).saturating_mul(w))
+}
+
+/// Resolved automatic layout: the plan plus the targets that reproduce it
+/// through the normal planner, for the manifest and the layout line.
+pub struct AutoLayout {
+    pub plan: Plan,
+    /// `Some((R, Q))` when the automatic candidate did not fit the device budget
+    /// and the plan fell back to the ordinary default policy (Grok r88 review:
+    /// `-B 0` must never be harder to admit than the default).
+    pub fell_back: Option<(usize, usize)>,
+    /// `ceil(total_ref_bp / R)`: any explicit `-B` in
+    /// `(total/R, total/(R-1)]` round-trips through [`layout_n_bins`] to the
+    /// same `R`, and [`bin_records_n`] is a pure function of the count, so an
+    /// explicit rerun with this target rebuilds these bins exactly.
+    pub seq_target: u64,
+    /// Whole-query total when Q=1 collapses the query (same round-trip), else
+    /// the target actually used (explicit override or default).
+    pub query_target: u64,
+}
+
+/// Everything [`auto_layout`]'s fit checks need beyond metadata and budgets.
+/// `threads`/`max_seeds` feed [`host_estimate`]; the caller derives them the
+/// same way `run` does so the layout-time check agrees with the real preflight.
+pub struct AutoCtx {
+    pub kmer_size: usize,
+    pub step: u32,
+    pub max_hits: u32,
+    pub wga_chunk_size: u32,
+    pub transitions: bool,
+    pub threads: usize,
+    pub max_seeds: usize,
+}
+
+/// Automatic layout for `-B 0` (rank-2 policy).
+///
+/// `workers <= 1` resolves trivially to today's default plan — no Q=1 attempt,
+/// no new bins — so a one-worker run is byte-identical to `-B 500000000`.
+/// At `workers >= 2` the reference takes [`auto_ref_bin_count`] bins via
+/// [`bin_records_n`], and the query collapses to one bin iff *both* the device
+/// fit ([`worst_unit_bytes`] against `budget_bytes`, the same budget
+/// [`plan_within_budget`] uses) and the host fit ([`host_preflight`] against
+/// `host_available`, already discounted; `None` means unknown and admits)
+/// allow it — otherwise the default query blocks are kept. An explicit
+/// `query_override` is honoured as given and skips the fit check. The query
+/// target is never derived from the reference target.
+///
+/// Fit-checks and falls back, never shrinks: a final plan that still exceeds
+/// the device budget errors with an explicit-flags hint, exactly like
+/// matched-granularity mode, instead of coarsening the layout behind the
+/// caller's back. Kernels, chunking and emitter ordinals are untouched —
+/// [`from_bins`] keeps dense ref-outer ordinals.
+#[allow(clippy::too_many_arguments)]
+pub fn auto_layout(
+    reference: &[RecordMeta],
+    query: &[RecordMeta],
+    workers: usize,
+    exec_workers: usize,
+    budget_bytes: u64,
+    host_available: Option<u64>,
+    query_override: Option<u64>,
+    ctx: &AutoCtx,
+) -> Result<AutoLayout, String> {
+    let ref_total: u64 = reference.iter().map(|r| r.len).sum();
+    let qry_total: u64 = query.iter().map(|r| r.len).sum();
+    if workers.max(1) <= 1 {
+        let q = query_override.unwrap_or(DEFAULT_BLOCK_TARGET);
+        let plan = plan_with(reference, query, DEFAULT_BLOCK_TARGET, q.max(1), false);
+        return Ok(AutoLayout {
+            plan,
+            fell_back: None,
+            seq_target: DEFAULT_BLOCK_TARGET,
+            query_target: q,
+        });
+    }
+    let r_def = layout_n_bins(ref_total, DEFAULT_BLOCK_TARGET, reference.len());
+    let r = auto_ref_bin_count(reference.len(), r_def, workers);
+    let reference_bins = bin_records_n(reference, r);
+    let seq_target = match r {
+        0 => DEFAULT_BLOCK_TARGET,
+        _ => ref_total.div_ceil(r as u64).max(1),
+    };
+    let (query_bins, query_target) = match query_override {
+        Some(q) => (bin_records(query, q.max(1)), q),
+        None => {
+            let single = bin_records_n(query, 1);
+            let cand = from_bins(reference_bins.clone(), single.clone());
+            let device_ok = worst_unit_bytes(
+                &cand,
+                ctx.kmer_size,
+                ctx.step,
+                ctx.max_hits,
+                ctx.wga_chunk_size,
+                ctx.transitions,
+            )
+            .map(|worst| worst <= budget_bytes)
+            .unwrap_or(false);
+            let host_ok = match host_available {
+                None => true,
+                Some(avail) => {
+                    let est = host_estimate(
+                        &cand,
+                        ref_total,
+                        qry_total,
+                        ctx.kmer_size,
+                        ctx.step,
+                        ctx.threads,
+                        ctx.max_seeds,
+                    );
+                    host_preflight(
+                        &est,
+                        &assign_bins(&reference_bins, exec_workers.max(1)),
+                        avail,
+                    )
+                    .is_ok()
+                }
+            };
+            if device_ok && host_ok {
+                (single, qry_total.max(1))
+            } else {
+                (
+                    bin_records(query, DEFAULT_BLOCK_TARGET),
+                    DEFAULT_BLOCK_TARGET,
+                )
+            }
+        }
+    };
+    let plan = from_bins(reference_bins, query_bins);
+    let worst = worst_unit_bytes(
+        &plan,
+        ctx.kmer_size,
+        ctx.step,
+        ctx.max_hits,
+        ctx.wga_chunk_size,
+        ctx.transitions,
+    )?;
+    if worst > budget_bytes {
+        if query_override.is_none() {
+            // The candidate does not fit: run exactly what `-B 500000000` would
+            // (including plan_within_budget's own halving), never an error.
+            let (candidate_r, candidate_q) = (plan.reference_bins.len(), plan.query_bins.len());
+            let (plan, _worst) = plan_within_budget(
+                reference,
+                query,
+                DEFAULT_BLOCK_TARGET,
+                DEFAULT_BLOCK_TARGET,
+                budget_bytes,
+                ctx.kmer_size,
+                ctx.step,
+                ctx.max_hits,
+                false,
+                ctx.wga_chunk_size,
+                ctx.transitions,
+            )?;
+            return Ok(AutoLayout {
+                plan,
+                fell_back: Some((candidate_r, candidate_q)),
+                seq_target: DEFAULT_BLOCK_TARGET,
+                query_target: DEFAULT_BLOCK_TARGET,
+            });
+        }
+        return Err(format!(
+            "automatic layout (R={} Q={}) with the explicit --query-block-size needs {:.1} GB per work unit, only {:.1} GB budgeted: \
+             drop --query-block-size or give -B explicitly",
+            plan.reference_bins.len(),
+            plan.query_bins.len(),
+            worst as f64 / 1e9,
+            budget_bytes as f64 / 1e9
+        ));
+    }
+    Ok(AutoLayout {
+        plan,
+        fell_back: None,
+        seq_target,
+        query_target,
+    })
+}
+
+/// The one stderr line an automatic layout prints: the explicit flags that
+/// reproduce it plus the per-worker bin counts (`owners`) under the layout
+/// worker count, so the run is reproducible without `-B 0`.
+pub fn auto_layout_line(workers: usize, seq_target: u64, query_target: u64, plan: &Plan) -> String {
+    let owners = assign_bins(&plan.reference_bins, workers.max(1))
+        .iter()
+        .map(|bins| bins.len().to_string())
+        .collect::<Vec<_>>()
+        .join("+");
+    let ref_total: u64 = plan.reference_bins.iter().map(|b| b.total_bp).sum();
+    let n_records: usize = plan.reference_bins.iter().map(|b| b.record_ids.len()).sum();
+    let r = plan.reference_bins.len();
+    // The printed -B reproduces these bins only if the count-first planner
+    // derives the same R from it (true for genome-scale inputs; tiny toy sets
+    // can break it). Say so rather than print flags that would not replay.
+    let hint = if layout_n_bins(ref_total, seq_target.max(1), n_records) == r {
+        String::new()
+    } else {
+        " [flags do not reproduce this R on this input; use --dump-manifest/--from-manifest]".into()
+    };
+    format!(
+        "layout: auto W={workers} -> --seq-block-size {seq_target} --query-block-size \
+         {query_target} (R={r} Q={}, {} units, owners {owners}){hint}",
+        plan.query_bins.len(),
+        plan.units.len()
+    )
 }
 
 fn from_bins(reference_bins: Vec<Bin>, query_bins: Vec<Bin>) -> Plan {
@@ -518,14 +930,7 @@ pub fn max_hit_capacity(
     if max_hits == 0 {
         return Err("max_hits must be positive".into());
     }
-    let base = worst_unit_bytes(
-        plan,
-        kmer_size,
-        step,
-        max_hits,
-        wga_chunk_size,
-        transitions,
-    )?;
+    let base = worst_unit_bytes(plan, kmer_size, step, max_hits, wga_chunk_size, transitions)?;
     if base > budget_bytes {
         return Err(format!(
             "max_hits {max_hits} needs {base} bytes per work unit, only {budget_bytes} bytes budgeted"
@@ -1495,7 +1900,7 @@ mod tests {
     /// *over* target — so blocks overshoot and the last one may be short.
     #[test]
     fn sequential_bins_match_kegalign_block_fill() {
-        use super::{bin_records_sequential, RecordMeta};
+        use super::{RecordMeta, bin_records_sequential};
         let rec = |id: u32, len: u64| RecordMeta {
             id,
             name: format!("chr{id}"),
@@ -1594,7 +1999,7 @@ mod tests {
 
     #[test]
     fn assign_bins_is_a_balanced_deterministic_partition() {
-        use super::{assign_bins, Bin};
+        use super::{Bin, assign_bins};
         let bins: Vec<Bin> = [100u64, 90, 80, 70, 10]
             .iter()
             .enumerate()
@@ -1651,7 +2056,7 @@ mod tests {
     /// count.
     #[test]
     fn host_preflight_keeps_prefetch_then_falls_back_then_errors() {
-        use super::{host_peak, host_preflight, HostEstimate};
+        use super::{HostEstimate, host_peak, host_preflight};
         // shared 100, per-worker prefetch 300, no-prefetch 150.
         let est = HostEstimate {
             shared: 100,
@@ -1659,7 +2064,7 @@ mod tests {
             per_worker_no_prefetch: 150,
         };
         let multi = |w: usize| vec![vec![0u32, 1]; w]; // every worker owns 2 bins
-                                                       // 1 worker: 100 + 300 = 400 fits → prefetch kept.
+        // 1 worker: 100 + 300 = 400 fits → prefetch kept.
         assert_eq!(host_preflight(&est, &multi(1), 400), Ok(true));
         // 4 workers: 100 + 4*300 = 1300 fails, 100 + 4*150 = 700 fits → disabled.
         assert_eq!(host_preflight(&est, &multi(4), 1000), Ok(false));
@@ -1931,6 +2336,152 @@ mod tests {
         assert_eq!(layout_n_bins(450, 150, 6), 3);
     }
 
+    fn auto_test_ctx() -> AutoCtx {
+        AutoCtx {
+            kmer_size: 12,
+            step: 1,
+            max_hits: 1000,
+            wga_chunk_size: 250_000,
+            transitions: true,
+            threads: 4,
+            max_seeds: 10_000,
+        }
+    }
+
+    /// `-B 0` rank-2 rule: `R = min(n_records, ceil(R_def / W) * W)` — the
+    /// smallest multiple of W that does not coarsen the default layout.
+    #[test]
+    fn auto_ref_bin_count_follows_the_rank2_rule() {
+        // 7 x 499 Mbp + 5 x 1 bp: total 3,493,000,005 bp, so R_def = 7 over 12
+        // records against the 500 Mbp default.
+        let mut lens = vec![499_000_000u64; 7];
+        lens.extend_from_slice(&[1; 5]);
+        let r = recs(&lens);
+        assert_eq!(r.len(), 12);
+        assert_eq!(layout_n_bins(3_493_000_005, 500_000_000, 12), 7);
+        assert_eq!(auto_ref_bin_count(12, 7, 2), 8);
+        assert_eq!(auto_ref_bin_count(12, 7, 4), 8);
+        assert_eq!(auto_ref_bin_count(12, 7, 3), 9);
+        assert_eq!(auto_ref_bin_count(12, 7, 8), 8);
+        assert_eq!(auto_ref_bin_count(5, 7, 4), 5, "one bin per record caps R");
+        assert_eq!(auto_ref_bin_count(0, 7, 4), 0);
+        // The full path agrees, and its printed targets rebuild the same plan.
+        let q = recs(&[10, 10]);
+        let auto = auto_layout(&r, &q, 2, 2, u64::MAX, None, None, &auto_test_ctx()).unwrap();
+        assert_eq!(auto.plan.reference_bins.len(), 8);
+        assert_eq!(
+            plan_with(&r, &q, auto.seq_target, auto.query_target, false),
+            auto.plan
+        );
+    }
+
+    /// Resolving 0 at W=1 is the default plan exactly — no Q=1 attempt, no new
+    /// bins — which is what makes one-worker `-B 0` byte-identical to today.
+    #[test]
+    fn auto_layout_at_w1_is_the_default_plan() {
+        let r = recs(&[250, 240, 200, 190, 180, 170, 160]);
+        let q = recs(&[195, 180, 160, 155, 150, 145, 60]);
+        let ctx = auto_test_ctx();
+        let auto = auto_layout(&r, &q, 1, 1, u64::MAX, None, None, &ctx).unwrap();
+        assert_eq!(
+            auto.plan,
+            plan_with(&r, &q, 500_000_000, 500_000_000, false)
+        );
+        assert_eq!(
+            (auto.seq_target, auto.query_target),
+            (500_000_000, 500_000_000)
+        );
+        // An explicit query target is honoured as given, still with no Q=1.
+        let auto = auto_layout(&r, &q, 1, 1, u64::MAX, None, Some(10_000), &ctx).unwrap();
+        assert_eq!(auto.plan, plan_with(&r, &q, 500_000_000, 10_000, false));
+        assert_eq!(auto.query_target, 10_000);
+    }
+
+    /// Q=1 needs *both* budgets; either failure falls back to the default
+    /// query blocks, and an explicit query target is honoured as given.
+    #[test]
+    fn auto_layout_q1_needs_both_budgets() {
+        // 2 x 100 bp reference over 2 workers: R_def = 1, so R = 2.
+        let r = recs(&[100, 100]);
+        // 2 x 600 Mbp query: Q=1 holds 1.2 Gbp where the default holds 600
+        // Mbp, so a budget between the two estimates separates the paths.
+        let q = recs(&[600_000_000, 600_000_000]);
+        let ctx = auto_test_ctx();
+        let wb = |p: &Plan| {
+            worst_unit_bytes(
+                p,
+                ctx.kmer_size,
+                ctx.step,
+                ctx.max_hits,
+                ctx.wga_chunk_size,
+                ctx.transitions,
+            )
+            .unwrap()
+        };
+        let q1 = from_bins(bin_records_n(&r, 2), bin_records_n(&q, 1));
+        let defq = from_bins(bin_records_n(&r, 2), bin_records(&q, 500_000_000));
+        assert_eq!(defq.query_bins.len(), 2);
+        let (w1, w0) = (wb(&q1), wb(&defq));
+        assert!(
+            w1 > w0,
+            "fixture must separate Q=1 ({w1}) from default-Q ({w0})"
+        );
+
+        // Both budgets admit: Q=1, and the printed targets rebuild the plan
+        // through the normal planner.
+        let one = auto_layout(&r, &q, 2, 2, w1, None, None, &ctx).unwrap();
+        assert_eq!(one.plan, q1);
+        assert_eq!(one.query_target, 1_200_000_000);
+        assert_eq!(
+            plan_with(&r, &q, one.seq_target, one.query_target, false),
+            one.plan
+        );
+        assert_eq!(
+            auto_layout_line(2, one.seq_target, one.query_target, &one.plan),
+            "layout: auto W=2 -> --seq-block-size 100 --query-block-size 1200000000 \
+             (R=2 Q=1, 2 units, owners 1+1)"
+        );
+
+        // Device budget admits the fallback but not Q=1: default query blocks.
+        let poor = auto_layout(&r, &q, 2, 2, w0, None, None, &ctx).unwrap();
+        assert_eq!(poor.plan, defq);
+        assert_eq!(poor.query_target, 500_000_000);
+        assert_eq!(
+            plan_with(&r, &q, poor.seq_target, poor.query_target, false),
+            poor.plan
+        );
+
+        // Host budget rejects Q=1 under ample device memory: same fallback.
+        let cramped = auto_layout(&r, &q, 2, 2, w1, Some(1), None, &ctx).unwrap();
+        assert_eq!(cramped.plan, defq);
+
+        // Explicit query target is honoured as given, fit permitting.
+        let expl = auto_layout(&r, &q, 2, 2, w0, None, Some(500_000_000), &ctx).unwrap();
+        assert_eq!(expl.plan, defq);
+        assert_eq!(expl.query_target, 500_000_000);
+    }
+
+    /// The manifest stores the resolved targets (never 0) and round-trips.
+    #[test]
+    fn auto_manifest_round_trips_resolved_targets() {
+        let r = recs(&[100, 100]);
+        let q = recs(&[50, 50]);
+        let auto = auto_layout(&r, &q, 2, 2, u64::MAX, None, None, &auto_test_ctx()).unwrap();
+        assert_eq!(auto.plan.reference_bins.len(), 2);
+        assert_eq!(auto.plan.query_bins.len(), 1);
+        let mut m = manifest_fixture(auto.plan.clone());
+        m.seq_block_size = auto.seq_target;
+        m.query_block_size = auto.query_target;
+        assert_ne!(m.seq_block_size, 0);
+        assert_ne!(m.query_block_size, 0);
+        let back = PlanManifest::read(&manifest_text(&m)).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(
+            (back.seq_block_size, back.query_block_size),
+            (auto.seq_target, auto.query_target)
+        );
+    }
+
     #[test]
     fn candidate_bin_counts_dedup_and_clamp() {
         assert_eq!(candidate_bin_counts(24, 4, 7), vec![4, 7, 8]);
@@ -2020,15 +2571,18 @@ mod tests {
             worst,
             worst_unit_bytes(&p, 12, 1, 16_711_680, m.wga_chunk_size, m.transitions).unwrap()
         );
-        assert!(m
-            .check_fit(1, 12)
-            .unwrap_err()
-            .contains("refusing to replan"));
+        assert!(
+            m.check_fit(1, 12)
+                .unwrap_err()
+                .contains("refusing to replan")
+        );
 
         let zero = text.replace("max_hits 16711680", "max_hits 0");
-        assert!(PlanManifest::read(&zero)
-            .unwrap_err()
-            .contains("resolved cap"));
+        assert!(
+            PlanManifest::read(&zero)
+                .unwrap_err()
+                .contains("resolved cap")
+        );
     }
 
     #[test]
@@ -2080,10 +2634,12 @@ mod tests {
         manifest_fixture(plan(&empty, &q, 1))
             .validate_records(&empty, &q)
             .unwrap();
-        assert!(manifest_fixture(plan(&empty, &q, 1))
-            .validate_records(&r, &q)
-            .unwrap_err()
-            .contains("reference"));
+        assert!(
+            manifest_fixture(plan(&empty, &q, 1))
+                .validate_records(&r, &q)
+                .unwrap_err()
+                .contains("reference")
+        );
 
         let mut alt = m0.clone();
         alt.plan.units.swap(0, 1);
@@ -2124,10 +2680,11 @@ mod tests {
         let mut miss = manifest_fixture(plan(&r1, &q1, 1000));
         miss.plan.reference_bins[0].record_ids = vec![0];
         miss.plan.reference_bins[0].total_bp = 10;
-        assert!(miss
-            .validate_records(&r1, &q1)
-            .unwrap_err()
-            .contains("missing"));
+        assert!(
+            miss.validate_records(&r1, &q1)
+                .unwrap_err()
+                .contains("missing")
+        );
 
         let big = vec![RecordMeta {
             id: 0,
@@ -2229,10 +2786,11 @@ mod tests {
             worst,
             worst_unit_bytes(&p, 12, 1, m.max_hits, m.wga_chunk_size, m.transitions).unwrap()
         );
-        assert!(m
-            .check_fit(1, 12)
-            .unwrap_err()
-            .contains("refusing to replan"));
+        assert!(
+            m.check_fit(1, 12)
+                .unwrap_err()
+                .contains("refusing to replan")
+        );
 
         let mut bad = m.clone();
         bad.plan.units[0].reference_bin = 99;
@@ -2473,10 +3031,11 @@ mod tests {
         let b = m.check_fit(u64::MAX, 12).unwrap();
         assert_ne!(a, b, "frozen fit must use manifest wga_chunk_size");
         assert_eq!(m.max_hits, cap_before);
-        assert!(m
-            .check_fit(1, 12)
-            .unwrap_err()
-            .contains("refusing to replan"));
+        assert!(
+            m.check_fit(1, 12)
+                .unwrap_err()
+                .contains("refusing to replan")
+        );
         assert_eq!(m.max_hits, cap_before);
     }
 
@@ -2671,9 +3230,8 @@ mod tests {
 
     #[test]
     fn max_hit_capacity_exact_boundary_and_brute_force_agreement() {
-        let cost = |p: &super::Plan, h: u32| {
-            super::worst_unit_bytes(p, 12, 1, h, TEST_C, true).unwrap()
-        };
+        let cost =
+            |p: &super::Plan, h: u32| super::worst_unit_bytes(p, 12, 1, h, TEST_C, true).unwrap();
         // Multi-query plan charges the swap overlap (3 Qmax vs 2 Qmax).
         let p = super::plan_with(&recs(&[100]), &recs(&[50, 60]), 10_000, 1, false);
         assert_eq!(p.query_bins.len(), 2);
@@ -2733,5 +3291,248 @@ mod tests {
             super::max_hit_capacity(&empty, u64::MAX, 12, 1, h, TEST_C, true).unwrap(),
             h
         );
+    }
+}
+
+/// Round 90: unit-level static partition (task.md Part 2).
+#[cfg(test)]
+mod unit_partition_tests {
+    use super::{Bin, Plan, Visit, WorkUnit, unit_partition};
+
+    fn toy_plan(ref_bps: &[u64], q: usize) -> Plan {
+        let reference_bins = ref_bps
+            .iter()
+            .enumerate()
+            .map(|(i, &bp)| Bin {
+                id: i as u32,
+                record_ids: Vec::new(),
+                total_bp: bp,
+            })
+            .collect::<Vec<_>>();
+        let query_bins = (0..q)
+            .map(|i| Bin {
+                id: i as u32,
+                record_ids: Vec::new(),
+                total_bp: 1,
+            })
+            .collect::<Vec<_>>();
+        let mut units = Vec::new();
+        let mut ordinal = 0u32;
+        for r in &reference_bins {
+            for qq in &query_bins {
+                units.push(WorkUnit {
+                    ordinal,
+                    reference_bin: r.id,
+                    query_bin: qq.id,
+                });
+                ordinal += 1;
+            }
+        }
+        Plan {
+            reference_bins,
+            query_bins,
+            units,
+        }
+    }
+
+    /// Canonical whole-genome shape: descending bp order 3,4,2,1,0,6,5.
+    fn canonical() -> Plan {
+        let mut bps = [0u64; 7];
+        bps[3] = 700;
+        bps[4] = 600;
+        bps[2] = 500;
+        bps[1] = 400;
+        bps[0] = 300;
+        bps[6] = 200;
+        bps[5] = 100;
+        toy_plan(&bps, 6)
+    }
+
+    fn v(bin: usize, lo: usize, hi: usize) -> Visit {
+        Visit {
+            bin,
+            queries: lo..hi,
+        }
+    }
+
+    fn total_visits(part: &[Vec<Visit>]) -> usize {
+        part.iter().map(Vec::len).sum()
+    }
+
+    /// Exact cover, quotas, contiguity and in-bin order for any partition.
+    fn check_invariants(plan: &Plan, workers: usize, part: &[Vec<Visit>]) {
+        let r = plan.reference_bins.len();
+        let q = plan.query_bins.len();
+        let n = plan.units.len();
+        let w = workers.max(1);
+        assert_eq!(part.len(), w);
+        let (a, rem) = (n / w, n % w);
+        let mut seen = vec![vec![false; q]; r.max(1)];
+        let mut large = 0;
+        for (x, visits) in part.iter().enumerate() {
+            let mut units = 0;
+            let mut bins: Vec<usize> = Vec::new();
+            for t in visits {
+                assert!(!t.queries.is_empty(), "worker {x}: empty visit");
+                assert!(t.bin < r, "worker {x}: bin out of range");
+                assert!(t.queries.end <= q, "worker {x}: range past Q");
+                bins.push(t.bin);
+                for qq in t.queries.clone() {
+                    assert!(!seen[t.bin][qq], "worker {x}: unit covered twice");
+                    seen[t.bin][qq] = true;
+                    units += 1;
+                }
+            }
+            let mut sorted = bins.clone();
+            sorted.sort_unstable();
+            assert_eq!(bins, sorted, "worker {x}: visits not in bin order");
+            assert!(units == a || units == a + 1, "worker {x}: quota {units}");
+            if rem > 0 && units == a + 1 {
+                large += 1;
+            }
+        }
+        for b in 0..r {
+            assert!(seen[b].iter().all(|&s| s), "bin {b}: unit missing");
+        }
+        if rem > 0 {
+            assert_eq!(large, rem, "exactly N mod W large quotas");
+        }
+    }
+
+    #[test]
+    fn canonical_w2() {
+        let p = canonical();
+        let got = unit_partition(&p, 2);
+        assert_eq!(
+            got,
+            vec![
+                vec![v(0, 0, 6), v(1, 0, 6), v(3, 0, 6), v(5, 0, 3)],
+                vec![v(2, 0, 6), v(4, 0, 6), v(5, 3, 6), v(6, 0, 6)],
+            ]
+        );
+        assert_eq!(total_visits(&got), 8);
+        assert_eq!(total_visits(&got) - 7, 1, "1 extra replica");
+        check_invariants(&p, 2, &got);
+    }
+
+    #[test]
+    fn canonical_w4() {
+        let p = canonical();
+        let got = unit_partition(&p, 4);
+        assert_eq!(
+            got,
+            vec![
+                vec![v(0, 0, 5), v(3, 0, 6)],
+                vec![v(0, 5, 6), v(4, 0, 6), v(6, 0, 3)],
+                vec![v(2, 0, 6), v(5, 0, 1), v(6, 3, 6)],
+                vec![v(1, 0, 6), v(5, 1, 6)],
+            ]
+        );
+        assert_eq!(total_visits(&got), 10);
+        assert_eq!(total_visits(&got) - 7, 3, "3 extra replicas");
+        check_invariants(&p, 4, &got);
+    }
+
+    #[test]
+    fn w1_is_one_visit_per_bin() {
+        let p = canonical();
+        let got = unit_partition(&p, 1);
+        let want: Vec<Visit> = (0..7).map(|b| v(b, 0, 6)).collect();
+        assert_eq!(got, vec![want]);
+        check_invariants(&p, 1, &got);
+    }
+
+    #[test]
+    fn q1_needs_no_split() {
+        let p = toy_plan(&[50, 40, 30, 20], 1);
+        for w in 1..=5 {
+            let got = unit_partition(&p, w);
+            assert_eq!(total_visits(&got), 4, "W={w}");
+            for visits in &got {
+                for t in visits {
+                    assert_eq!(t.queries, 0..1);
+                }
+            }
+            check_invariants(&p, w, &got);
+        }
+    }
+
+    #[test]
+    fn fewer_units_than_workers_leaves_empty_quotas() {
+        let p = toy_plan(&[30, 20], 1);
+        let got = unit_partition(&p, 5);
+        let counts: Vec<usize> = got
+            .iter()
+            .map(|visits| visits.iter().map(|t| t.queries.len()).sum())
+            .collect();
+        assert_eq!(counts, vec![1, 1, 0, 0, 0]);
+        assert_eq!(total_visits(&got), 2);
+        check_invariants(&p, 5, &got);
+    }
+
+    #[test]
+    fn deterministic_and_quota_shaped_elsewhere() {
+        for (bps, q, w) in [
+            (vec![9, 8, 7, 6, 5], 3, 2),
+            (vec![100, 1, 1, 1], 4, 3),
+            (vec![30, 20, 10], 2, 4),
+            (vec![5], 5, 3),
+        ] {
+            let p = toy_plan(&bps, q);
+            let (a, b) = (unit_partition(&p, w), unit_partition(&p, w));
+            assert_eq!(a, b, "deterministic for {bps:?} Q={q} W={w}");
+            check_invariants(&p, w, &a);
+        }
+    }
+
+    #[test]
+    fn minimal_visits_against_brute_force_oracle() {
+        // Every R,Q,W <= 3: enumerate all quota-respecting assignments of the
+        // N units to W workers and take the minimum (bin,worker) touch count.
+        // Visit count is contiguity-blind, so the oracle needs no contiguity
+        // filter; the construction must still attain the minimum.
+        for r in 1..=3 {
+            for q in 1..=3 {
+                for w in 1..=3 {
+                    let bps: Vec<u64> = (0..r).map(|i| (r - i) as u64 * 10 + 1).collect();
+                    let p = toy_plan(&bps, q);
+                    let n = r * q;
+                    let (a, rem) = (n / w, n % w);
+                    let mut best = usize::MAX;
+                    let mut assign = vec![0usize; n];
+                    loop {
+                        let mut counts = vec![0usize; w];
+                        for &x in &assign {
+                            counts[x] += 1;
+                        }
+                        if counts.iter().all(|&c| c == a || (rem > 0 && c == a + 1)) {
+                            let mut pair = vec![vec![false; w]; r];
+                            for (u, &x) in assign.iter().enumerate() {
+                                pair[u / q][x] = true;
+                            }
+                            let mut touches = 0;
+                            for b in 0..r {
+                                touches += pair[b].iter().filter(|&&t| t).count();
+                            }
+                            best = best.min(touches);
+                        }
+                        let mut k = 0;
+                        while k < n {
+                            assign[k] += 1;
+                            if assign[k] < w {
+                                break;
+                            }
+                            assign[k] = 0;
+                            k += 1;
+                        }
+                        if k == n {
+                            break;
+                        }
+                    }
+                    let got = total_visits(&unit_partition(&p, w));
+                    assert_eq!(got, best, "R={r} Q={q} W={w}");
+                }
+            }
+        }
     }
 }

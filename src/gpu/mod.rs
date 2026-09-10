@@ -961,6 +961,11 @@ pub struct Engine {
     /// which is structural. The single largest gap cannot tell those apart. Linear scan
     /// over a handful of distinct stage pairs.
     gap_pairs: Vec<((&'static str, &'static str), f32, u64)>,
+    /// Intervals the gap accounting discards because they exceed 1,000 ms
+    /// (unit-transition work: query pack, ref prep). Counted separately so
+    /// the residual is visible instead of silently dropped.
+    gap_long_n: u64,
+    gap_long_ms: f32,
     /// Generate the query seed stream on the device instead of walking it on the
     /// host (round 68). Both paths are compiled; the executor sets this from the
     /// worker count because the trade reverses with GPU count — on one GPU the
@@ -1049,6 +1054,45 @@ unsafe fn reserve<T>(
     Ok(())
 }
 
+/// `cuDeviceGetAttribute` for `ordinal`, no context required (round 90b: the
+/// unit-partition guard runs before any worker owns a device).
+fn device_attribute(ordinal: i32, attr: cuda_core::sys::CUdevice_attribute) -> Result<i32, String> {
+    let mut value: i32 = 0;
+    // SAFETY: driver query; `value` is a local and the status is checked.
+    unsafe {
+        if cuda_core::sys::cuDeviceGetAttribute(&mut value, attr, ordinal)
+            != cuda_core::sys::cudaError_enum_CUDA_SUCCESS
+        {
+            return Err(format!("cuDeviceGetAttribute failed for device {ordinal}"));
+        }
+    }
+    Ok(value)
+}
+
+/// The three attributes the round-90b same-device guard compares: resident
+/// multiprocessors, the driver-reported clock in kHz, and L2 cache bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DeviceProfile {
+    pub(crate) sms: i32,
+    pub(crate) clock_khz: i32,
+    pub(crate) l2_bytes: u64,
+}
+
+/// [`DeviceProfile`] of `ordinal`, queried once per used device before any
+/// worker spawns (the auto unit-partition guard).
+pub(crate) fn device_profile(ordinal: i32) -> Result<DeviceProfile, String> {
+    use cuda_core::sys::{
+        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_CLOCK_RATE as CLOCK_RATE,
+        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE as L2_CACHE_SIZE,
+        CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT as MULTIPROCESSOR_COUNT,
+    };
+    Ok(DeviceProfile {
+        sms: device_attribute(ordinal, MULTIPROCESSOR_COUNT)?,
+        clock_khz: device_attribute(ordinal, CLOCK_RATE)?,
+        l2_bytes: device_attribute(ordinal, L2_CACHE_SIZE)?.max(0) as u64,
+    })
+}
+
 /// Device L2 cache bytes, or 0 if the driver will not say.
 ///
 /// `CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE` on the context's device. cuda-oxide keeps
@@ -1057,23 +1101,18 @@ unsafe fn reserve<T>(
 #[cfg(feature = "ref-loc-buckets")]
 fn l2_cache_bytes() -> u64 {
     let mut dev: i32 = 0;
-    let mut bytes: i32 = 0;
-    // SAFETY: driver queries against the current context; both outputs are
-    // locals, and a failed call leaves the zero initialiser in place.
+    // SAFETY: driver query against the current context; `dev` is a local.
     unsafe {
         if cuda_core::sys::cuCtxGetDevice(&mut dev) != cuda_core::sys::cudaError_enum_CUDA_SUCCESS {
             return 0;
         }
-        if cuda_core::sys::cuDeviceGetAttribute(
-            &mut bytes,
-            cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
-            dev,
-        ) != cuda_core::sys::cudaError_enum_CUDA_SUCCESS
-        {
-            return 0;
-        }
     }
-    bytes.max(0) as u64
+    device_attribute(
+        dev,
+        cuda_core::sys::CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE,
+    )
+    .map(|bytes| bytes.max(0) as u64)
+    .unwrap_or(0)
 }
 
 /// Human-readable window size for a bucket shift. Shifts below 20 (a small
@@ -1303,10 +1342,24 @@ struct BlockDecision {
     on_ns: Vec<f64>,
 }
 
+/// A block closed without a usable settled comparison: `span_ms >=
+/// 2 * T_BLOCK` with fewer than 4 settled chunks (e.g. a tail of small
+/// chunks). Exactness-neutral: the block ran its production path, only
+/// the accounting is discarded.
+#[cfg(feature = "ref-loc-buckets")]
+#[derive(Clone, Debug, PartialEq)]
+struct InconclusiveBlock {
+    k: usize,
+    on: bool,
+    span_ms: f64,
+    settled_chunks: u32,
+}
+
 /// `Auto` phase: untimed warm-up, then alternating OFF, ON, OFF, ON, OFF, ON
 /// blocks (3 per path). `k` is the block index and always equals the number
 /// of blocks closed so far.
 #[cfg(feature = "ref-loc-buckets")]
+#[derive(Debug, PartialEq)]
 enum AutoPhase {
     Warm {
         n: u32,
@@ -1326,6 +1379,7 @@ enum AutoPhase {
 /// auto-off forcing OFF before any block), the block-alternation phase, or
 /// the committed decision.
 #[cfg(feature = "ref-loc-buckets")]
+#[derive(Debug, PartialEq)]
 enum BucketMode {
     Forced(bool),
     Auto {
@@ -1474,6 +1528,13 @@ impl BucketMode {
     /// `ns_per_hit = settled_span_ms * 1e6 / settled_hits`. Returns the
     /// closed block (index + sample) plus, after the 6th block, the decision
     /// (`Decided(true)` iff the median adjacent-pair ratio is < 0.97).
+    ///
+    /// Inconclusive close (exactness-neutral): a block that reaches
+    /// `span_ms >= 2 * t_block` with fewer than 4 settled chunks (a tail of
+    /// small chunks) can never decide. An inconclusive OFF block is dropped
+    /// and a fresh OFF block starts at the same index; an inconclusive ON
+    /// block ends the trial as `Decided(false)`. Reported as the third
+    /// element; conclusive closes return it as `None`.
     fn commit_block_span(
         &mut self,
         span_ms: f64,
@@ -1481,9 +1542,13 @@ impl BucketMode {
         max_hits: u32,
         t_block: f64,
         t_settle: f64,
-    ) -> (Option<(usize, BlockSample)>, Option<BlockDecision>) {
+    ) -> (
+        Option<(usize, BlockSample)>,
+        Option<BlockDecision>,
+        Option<InconclusiveBlock>,
+    ) {
         let BucketMode::Auto { phase, blocks } = self else {
-            return (None, None);
+            return (None, None, None);
         };
         let AutoPhase::Block {
             on,
@@ -1495,7 +1560,7 @@ impl BucketMode {
             settled_chunks,
         } = phase
         else {
-            return (None, None);
+            return (None, None, None);
         };
         debug_assert_eq!(*k, blocks.len());
         let settled_before = *acc >= t_settle;
@@ -1507,7 +1572,29 @@ impl BucketMode {
             *settled_chunks += 1;
         }
         if *acc < t_block || *settled_chunks < 4 {
-            return (None, None);
+            if *acc >= 2.0 * t_block && *settled_chunks < 4 {
+                let inc = InconclusiveBlock {
+                    k: *k,
+                    on: *on,
+                    span_ms: *acc,
+                    settled_chunks: *settled_chunks,
+                };
+                if *on {
+                    *self = BucketMode::Decided(false);
+                } else {
+                    *phase = AutoPhase::Block {
+                        on: false,
+                        k: *k,
+                        span_ms: 0.0,
+                        settled_span_ms: 0.0,
+                        settled_hits: 0,
+                        chunks: 0,
+                        settled_chunks: 0,
+                    };
+                }
+                return (None, None, Some(inc));
+            }
+            return (None, None, None);
         }
         debug_assert!(*settled_hits > 0);
         let closed_k = *k;
@@ -1530,7 +1617,7 @@ impl BucketMode {
                 chunks: 0,
                 settled_chunks: 0,
             };
-            return (Some((closed_k, closed)), None);
+            return (Some((closed_k, closed)), None, None);
         }
         let ratios = block_pair_ratios(blocks);
         let use_on = decide_bucket_autotune(&ratios);
@@ -1547,7 +1634,17 @@ impl BucketMode {
                 .collect(),
         };
         *self = BucketMode::Decided(use_on);
-        (Some((closed_k, closed)), Some(decision))
+        (Some((closed_k, closed)), Some(decision), None)
+    }
+
+    /// Closed blocks so far, if the engine is still in `Auto` (`None` once
+    /// forced or decided). The engine-end ledger uses this to say why there
+    /// is no decision.
+    fn undecided_blocks(&self) -> Option<usize> {
+        match self {
+            BucketMode::Auto { blocks, .. } => Some(blocks.len()),
+            BucketMode::Forced(_) | BucketMode::Decided(_) => None,
+        }
     }
 }
 
@@ -1781,6 +1878,8 @@ impl Engine {
             gap_max: 0.0,
             gap_max_pair: ("", ""),
             gap_pairs: Vec::new(),
+            gap_long_n: 0,
+            gap_long_ms: 0.0,
             device_seeds: false,
             reference_uploads: 1,
             query_swaps: 0,
@@ -1834,7 +1933,7 @@ impl Engine {
 
     /// How many times this engine uploaded a reference index (§9.7 / AM-A1).
     ///
-    /// The executor asserts this equals the *reference-bin* count, not the
+    /// The executor asserts this equals the *visit* count, not the
     /// work-unit count. Counting host `SeedTable::build` calls alone would miss a
     /// refactor that rebuilt the `Engine` per pair, which is the regression the
     /// amendment is guarding against — so this counts device uploads.
@@ -3135,7 +3234,7 @@ impl Engine {
                                 .expect("block span events ensured above"),
                         )? as f64;
                     let max_hits = self.max_hits;
-                    let (closed, decided) = self.bucket_mode.commit_block_span(
+                    let (closed, decided, inconclusive) = self.bucket_mode.commit_block_span(
                         span_ms,
                         iter_num_hits,
                         max_hits,
@@ -3156,6 +3255,19 @@ impl Engine {
                                 sample.ns_per_hit * sample.hits as f64 / 1e6,
                                 sample.ns_per_hit,
                             );
+                        }
+                        if let Some(inc) = &inconclusive {
+                            if inc.on {
+                                eprintln!(
+                                    "  ref buckets: auto -> off (inconclusive: block k={} mode=on span {:.1} ms settled {} chunks)",
+                                    inc.k, inc.span_ms, inc.settled_chunks,
+                                );
+                            } else {
+                                eprintln!(
+                                    "  ref buckets: dropped block eng={} k={} mode=off (inconclusive; span_ms={:.1} settled={})",
+                                    self.bucket_eng_id, inc.k, inc.span_ms, inc.settled_chunks,
+                                );
+                            }
                         }
                         if let Some(d) = &decided {
                             let r3 = |v: &[f64]| -> Vec<f64> {
@@ -3608,6 +3720,8 @@ impl Engine {
             // on one stream, so the delta is GPU-timeline idle — the bubble the host put
             // there. A negative or absurd reading would mean the events are unordered,
             // so anything outside [0, 1000] ms is dropped rather than trusted.
+            // Intervals above 1,000 ms are unit-transition work (query pack, ref
+            // prep) counted separately so they stay visible instead of silent.
             if let (Some(prev), Some((start, _))) = (self.last_end.as_ref(), p.events.as_ref()) {
                 if let Ok(gap) = prev.elapsed_ms(start) {
                     if (0.0f32..=1000.0f32).contains(&gap) {
@@ -3625,6 +3739,9 @@ impl Engine {
                             }
                             None => self.gap_pairs.push((key, gap, 1)),
                         }
+                    } else if gap > 1000.0 {
+                        self.gap_long_n += 1;
+                        self.gap_long_ms += gap;
                     }
                 }
             }
@@ -3651,6 +3768,8 @@ impl Engine {
         self.gap_max = 0.0;
         self.gap_max_pair = ("", "");
         self.gap_pairs.clear();
+        self.gap_long_n = 0;
+        self.gap_long_ms = 0.0;
         self.last_end = None;
         self.last_name = "";
     }
@@ -3662,9 +3781,36 @@ impl Engine {
         v
     }
 
+    /// Intervals discarded by the gap accounting because they exceed 1,000 ms
+    /// (unit-transition work), as `(count, summed ms)`.
+    pub fn discarded_gaps(&self) -> (u64, f32) {
+        (self.gap_long_n, self.gap_long_ms)
+    }
+
     /// Round 71: `(summed gap ms, pairs measured, largest gap, its stage pair)`.
     pub fn stage_gaps(&self) -> (f32, u64, f32, (&'static str, &'static str)) {
         (self.gap_ms, self.gap_n, self.gap_max, self.gap_max_pair)
+    }
+
+    /// Engine-end autotune ledger: if still in `Auto` (the chunks ran out
+    /// before 6 blocks), the count of closed blocks so the log says why
+    /// there is no decision. `None` once forced or decided.
+    #[cfg(feature = "ref-loc-buckets")]
+    pub fn bucket_undecided_blocks(&self) -> Option<usize> {
+        self.bucket_mode.undecided_blocks()
+    }
+
+    /// Prints the engine-end ledger line when still undecided. Call once per
+    /// engine after its last chunk, under `--time` only via `self.timing`.
+    pub fn finish_bucket_autotune(&self) {
+        #[cfg(feature = "ref-loc-buckets")]
+        {
+            if let Some(k) = self.bucket_undecided_blocks() {
+                if self.timing {
+                    eprintln!("ref buckets: auto undecided (engine ended after {k} blocks)");
+                }
+            }
+        }
     }
 
     /// A genuine host dependency (Phase 1 §2): the host is about to read a device
@@ -3706,8 +3852,10 @@ impl Engine {
 ///
 /// Not statistics: the executor asserts these, because the failure they guard
 /// against — rebuilding or re-uploading the reference index per work unit instead
-/// of per reference bin — is invisible in output and only shows up as ~1 GB of
-/// extra H->D traffic per avoided reuse.
+/// of per reference visit — is invisible in output and only shows up as ~1 GB of
+/// extra H->D traffic per avoided reuse. Under the round-90 unit partition one
+/// visit is one reference build/upload, so `visits` is the bin count on the
+/// whole-bin path and the visit count on the unit path.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Lifecycle {
     pub seed_table_builds: u32,
@@ -3722,11 +3870,11 @@ impl Lifecycle {
     ///
     /// Returns the first violation as a message rather than panicking, so a
     /// caller can report it alongside the rest of a profile.
-    pub fn check(&self, reference_bins: u32, work_units: u32) -> Result<(), String> {
+    pub fn check(&self, visits: u32, work_units: u32) -> Result<(), String> {
         let want = [
-            ("seed_table_builds", self.seed_table_builds, reference_bins),
-            ("engine_creations", self.engine_creations, reference_bins),
-            ("reference_uploads", self.reference_uploads, reference_bins),
+            ("seed_table_builds", self.seed_table_builds, visits),
+            ("engine_creations", self.engine_creations, visits),
+            ("reference_uploads", self.reference_uploads, visits),
             ("query_swaps", self.query_swaps, work_units),
             ("work_units_executed", self.work_units_executed, work_units),
         ];
@@ -3734,7 +3882,7 @@ impl Lifecycle {
             if got != expect {
                 return Err(format!(
                     "lifecycle: {name} = {got}, expected {expect} \
-                     (reference_bins {reference_bins}, work_units {work_units})"
+                     (visits {visits}, work_units {work_units})"
                 ));
             }
         }
@@ -4459,32 +4607,34 @@ mod tests {
         // a tail joins the span but is never settled.
         assert_eq!(
             mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         assert_eq!(
             mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         assert_eq!(
             mode.commit_block_span(10.0, 1, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         assert_eq!(
             mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         assert_eq!(
             mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         assert_eq!(
             mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE),
-            (None, None)
+            (None, None, None)
         );
         // Span 60 ms but only 3 settled: both conditions are required, so
         // the next chunk closes block 0.
-        let (closed, decided) = mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE);
+        let (closed, decided, inconclusive) =
+            mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE);
         assert_eq!(decided, None);
+        assert_eq!(inconclusive, None);
         let Some((k, sample)) = closed else {
             panic!("70 ms span with 4 settled chunks must close block 0");
         };
@@ -4505,10 +4655,15 @@ mod tests {
         for expect_k in 1..BUCKET_BLOCKS {
             let expect_on = expect_k % 2 == 1;
             let span = if expect_on { 9.0 } else { 10.0 };
-            let (closed, decided) = loop {
-                let (closed, decided) = mode.commit_block_span(span, MAX, MAX, T_BLOCK, T_SETTLE);
+            let (closed, decided, inconclusive) = loop {
+                let (closed, decided, inconclusive) =
+                    mode.commit_block_span(span, MAX, MAX, T_BLOCK, T_SETTLE);
+                assert!(
+                    inconclusive.is_none(),
+                    "settled path must not go inconclusive"
+                );
                 if closed.is_some() || decided.is_some() {
-                    break (closed, decided);
+                    break (closed, decided, inconclusive);
                 }
             };
             let Some((k, sample)) = closed else {
@@ -4537,6 +4692,142 @@ mod tests {
         assert!(BucketMode::Forced(true).production_path());
         assert!(!BucketMode::Decided(false).auto_chunk(MAX, MAX));
         assert!(!BucketMode::Decided(false).production_path());
+    }
+
+    /// Inconclusive OFF blocks (span >= 2*T_BLOCK, <4 settled) are dropped
+    /// and a fresh OFF block starts at the same index; the trial stays in
+    /// Auto with no decided path.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn bucket_inconclusive_off_drops_and_retries_same_block() {
+        use super::{AutoPhase, BucketMode, InconclusiveBlock};
+        const T_BLOCK: f64 = 60.0;
+        const T_SETTLE: f64 = 15.0;
+        const MAX: u32 = 16_711_680;
+        let mut mode = BucketMode::Auto {
+            phase: AutoPhase::Block {
+                on: false,
+                k: 0,
+                span_ms: 0.0,
+                settled_span_ms: 0.0,
+                settled_hits: 0,
+                chunks: 0,
+                settled_chunks: 0,
+            },
+            blocks: Vec::new(),
+        };
+        // 11 tail chunks (ineligible): span 110 < 120, no decision, no drop.
+        for _ in 0..11 {
+            assert_eq!(
+                mode.commit_block_span(10.0, 1, MAX, T_BLOCK, T_SETTLE),
+                (None, None, None)
+            );
+        }
+        // 12th tail chunk: span 120 >= 2*T_BLOCK with 0 settled -> drop.
+        let (closed, decided, inconclusive) =
+            mode.commit_block_span(10.0, 1, MAX, T_BLOCK, T_SETTLE);
+        assert_eq!(closed, None);
+        assert_eq!(decided, None);
+        assert_eq!(
+            inconclusive,
+            Some(InconclusiveBlock {
+                k: 0,
+                on: false,
+                span_ms: 120.0,
+                settled_chunks: 0,
+            })
+        );
+        // Dropped: no block recorded, fresh OFF block at the same index.
+        assert!(matches!(mode, BucketMode::Auto { .. }));
+        assert_eq!(mode.undecided_blocks(), Some(0));
+        assert!(!mode.production_path());
+        assert!(mode.auto_chunk(MAX, MAX));
+        // The retry can still close conclusively.
+        for _ in 0..5 {
+            let (_, _, inc) = mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE);
+            assert_eq!(inc, None);
+        }
+        let (closed, decided, inc) = mode.commit_block_span(10.0, MAX, MAX, T_BLOCK, T_SETTLE);
+        assert_eq!(inc, None);
+        assert_eq!(decided, None);
+        let Some((k, sample)) = closed else {
+            panic!("retried OFF block must close");
+        };
+        assert_eq!(k, 0);
+        assert!(!sample.on);
+        assert_eq!(mode.undecided_blocks(), Some(1));
+    }
+
+    /// An inconclusive ON block ends the trial as `Decided(false)`: the
+    /// production default path, with the ledger fields for the
+    /// `auto -> off (inconclusive: ...)` line.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn bucket_inconclusive_on_falls_back_to_off() {
+        use super::{AutoPhase, BlockSample, BucketMode, InconclusiveBlock};
+        const T_BLOCK: f64 = 60.0;
+        const T_SETTLE: f64 = 15.0;
+        const MAX: u32 = 16_711_680;
+        let mut mode = BucketMode::Auto {
+            phase: AutoPhase::Block {
+                on: true,
+                k: 1,
+                span_ms: 0.0,
+                settled_span_ms: 0.0,
+                settled_hits: 0,
+                chunks: 0,
+                settled_chunks: 0,
+            },
+            blocks: vec![BlockSample {
+                on: false,
+                ns_per_hit: 1.0,
+                chunks: 7,
+                settled_chunks: 4,
+                hits: 4 * u64::from(MAX),
+                span_ms: 70.0,
+            }],
+        };
+        for _ in 0..11 {
+            assert_eq!(
+                mode.commit_block_span(10.0, 1, MAX, T_BLOCK, T_SETTLE),
+                (None, None, None)
+            );
+        }
+        let (closed, decided, inconclusive) =
+            mode.commit_block_span(10.0, 1, MAX, T_BLOCK, T_SETTLE);
+        assert_eq!(closed, None);
+        assert_eq!(decided, None);
+        assert_eq!(
+            inconclusive,
+            Some(InconclusiveBlock {
+                k: 1,
+                on: true,
+                span_ms: 120.0,
+                settled_chunks: 0,
+            })
+        );
+        assert_eq!(mode, BucketMode::Decided(false));
+        assert!(!mode.production_path());
+        assert!(!mode.auto_chunk(MAX, MAX));
+        assert_eq!(mode.undecided_blocks(), None);
+    }
+
+    /// An engine that finishes in `Auto` reports its closed-block count so
+    /// the ledger can say why there is no decision; forced/decided engines
+    /// report nothing.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn bucket_engine_end_reports_undecided_blocks() {
+        use super::{AutoPhase, BucketMode};
+        let warm = BucketMode::Auto {
+            phase: AutoPhase::Warm { n: 0 },
+            blocks: Vec::new(),
+        };
+        assert_eq!(warm.undecided_blocks(), Some(0));
+        assert_eq!(BucketMode::Forced(true).undecided_blocks(), None);
+        assert_eq!(BucketMode::Forced(false).undecided_blocks(), None);
+        assert_eq!(BucketMode::Decided(true).undecided_blocks(), None);
+        assert_eq!(BucketMode::Decided(false).undecided_blocks(), None);
     }
 
     /// Two distributions with the *same* mean hits/seed, the same seed count
