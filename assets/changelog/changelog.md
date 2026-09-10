@@ -36,6 +36,48 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.5] — 2026-09-10
+
+Unit-level static partitioning behind a device-class guard, with a per-unit ledger
+and emitter-side receiver checks. Output bytes are unchanged.
+
+- **Unit-level static partition (default on for matching GPUs).** With two or more
+  GPUs the frozen plan's work units are now split across workers by count quotas
+  (whole bins first, then contiguous query slices of as few bins as possible, one
+  extra reference build per split bin) instead of whole-bin ownership, when every
+  device the run uses is the same class (equal SM count and L2, nominal clocks
+  within 10%) and each worker has its own device. Output bytes are unchanged.
+  Measured on canonical hg38 × mm39 at `MAX_HITS=16,711,680`: seed-and-filter
+  wall **−11.9%** on 2× RTX 4090 (1,400 → 1,233 s) and **−5.1%** on 4× RTX 4090
+  (718 → 681 s), identical output. `HSPZ_UNIT_PARTITION=0` restores whole-bin
+  ownership, `1` forces the partition; W=1, time-sliced workers and mixed device
+  classes keep whole-bin ownership. The static-attribute guard cannot detect
+  same-model cards with different sustained clocks (on such a pair the balance
+  depends on device order).
+- **Per-unit ledger.** `--time` prints one `unit ledger:` row per work unit
+  (worker, device, bins, bp, GPU ms, host start/end, pack/swap ms, seeds, hits,
+  raw/final HSPs) plus per-worker finish/busy lines, and every run prints
+  `schedule:` lines with the policy, its reason, and each worker's visits.
+- **Receiver checks.** The emitter now rejects duplicate or out-of-plan work units
+  and verifies completeness after joining the workers, reporting a worker's own
+  error first.
+- **Automatic layout (`-B 0`).** `-B 0` resolves the layout for the current
+  machine instead of the fixed 500 Mbp default. At `--gpus W ≥ 2` the reference
+  takes `R = min(records, ceil(R_default/W)·W)` LPT-balanced bins, and the query
+  collapses to one bin when the whole query fits both the per-worker device budget
+  and the host preflight (an explicit `--query-block-size` is honoured); `W=1`
+  resolves to exactly the 500 Mbp plan, and a candidate that fails the final fit
+  falls back to the default policy rather than erroring. Resolved sizes are stored
+  in the manifest/`--dump-plan`, and one `layout: auto W=…` line prints the flags
+  that reproduce them. `-B 0` with `--kegalign-bins` is an error.
+  `HSPZ_LAYOUT_FORCE_WORKERS` exercises the W≥2 path on one device.
+- **Diagnostics.** The ref-buckets autotune drops and restarts an OFF block that
+  reaches twice the block span with fewer than four settled chunks (an
+  inconclusive ON block decides OFF, with a ledger line). `--time` attributes
+  gap pairs per worker, counts the >1 s transitions the gap accounting discards,
+  and totals the host phases (query pack, swap, chunk prep, seed table,
+  standalone reference prep).
+
 ## [0.0.4] — 2026-09-09
 
 Two exact speed-ups, both byte-identical to 0.0.3 on every device tested (NVIDIA L4,
