@@ -1067,7 +1067,6 @@ pub fn host_estimate(
     threads: usize,
     max_seeds: usize,
 ) -> HostEstimate {
-    let index = (1u64 << (2 * kmer_size)) * 4; // index_table, 4 B/entry
     let largest_ref = plan
         .reference_bins
         .iter()
@@ -1080,6 +1079,34 @@ pub fn host_estimate(
         .map(|b| b.total_bp)
         .max()
         .unwrap_or(0);
+    host_estimate_sizes(
+        largest_ref,
+        largest_qry,
+        ref_bp_total,
+        qry_bp_total,
+        kmer_size,
+        step,
+        threads,
+        max_seeds,
+    )
+}
+
+/// As [`host_estimate`], with the largest reference and query bins supplied by
+/// the caller instead of read from one plan. Batch mode holds every job in RAM
+/// and picks both maxima over all jobs, so it calls this directly; the formula
+/// itself exists once.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn host_estimate_sizes(
+    largest_ref: u64,
+    largest_qry: u64,
+    ref_bp_total: u64,
+    qry_bp_total: u64,
+    kmer_size: usize,
+    step: u32,
+    threads: usize,
+    max_seeds: usize,
+) -> HostEstimate {
+    let index = (1u64 << (2 * kmer_size)) * 4; // index_table, 4 B/entry
     let pos = largest_ref / step.max(1) as u64 * 4; // pos_table, 4 B/indexed bp
     let counts = threads as u64 * index; // build_parallel pass-1 transient
     let packed_ref = largest_ref * 2; // buf + enc (no rc for a reference bin)

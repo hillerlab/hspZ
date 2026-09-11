@@ -81,6 +81,9 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
                 .into(),
         );
     }
+    if args.query_list.is_some() {
+        return Err("--query-list is only supported by `run`, not benchmark or --cpu-only".into());
+    }
 
     let plus = args.strand == "plus" || args.strand == "both";
     let minus = args.strand == "minus" || args.strand == "both";
@@ -107,7 +110,11 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
     } else {
         args.seq_block_size
     };
-    let query = Genome::load(&args.query, &args.query_prefix, seq_block_size)?;
+    let query_path = args
+        .query
+        .as_ref()
+        .ok_or("--query is required without --query-list")?;
+    let query = Genome::load(query_path, &args.query_prefix, seq_block_size)?;
     phases.add("input.query", t.elapsed());
     let t = Instant::now();
     let reference = Genome::load(&args.reference, &args.target_prefix, seq_block_size)?;
@@ -636,11 +643,28 @@ pub(crate) struct Emitter {
 
 impl Emitter {
     pub(crate) fn new(args: &RunArgs) -> Fallible<Self> {
-        let sink: Box<dyn OutputSink> = match tarball_path(args) {
-            Some(path) => Box::new(TarGzSink::new(&path)?),
-            None => Box::new(DirectorySink::new(&args.output)?),
+        Self::new_at(
+            &args.output,
+            tarball_path(args).as_deref(),
+            args.diagonal_partition,
+            crate::census::SurvivorAudit::dump_path().as_deref(),
+        )
+    }
+
+    /// One emitter rooted at `output`: a directory sink, or a tarball sink at
+    /// `tarball` when set. `audit_path` is the `HSPZ_ANCHOR_CENSUS` dump file;
+    /// batch jobs pass a per-job path so emitters never share one file.
+    pub(crate) fn new_at(
+        output: &std::path::Path,
+        tarball: Option<&std::path::Path>,
+        diagonal: bool,
+        audit_path: Option<&std::path::Path>,
+    ) -> Fallible<Self> {
+        let sink: Box<dyn OutputSink> = match tarball {
+            Some(path) => Box::new(TarGzSink::new(path)?),
+            None => Box::new(DirectorySink::new(output)?),
         };
-        let mut audit = crate::census::SurvivorAudit::dump_path()
+        let mut audit = audit_path
             .map(|path| std::fs::File::create(path).map(BufWriter::new))
             .transpose()?;
         if let Some(out) = audit.as_mut() {
@@ -652,7 +676,7 @@ impl Emitter {
         Ok(Emitter {
             sink,
             part: Partitioner::default(),
-            diagonal: args.diagonal_partition,
+            diagonal,
             partition_ms: 0.0,
             format_ms: 0.0,
             archive_ms: 0.0,
@@ -783,9 +807,196 @@ impl Emitter {
     }
 }
 
+/// Writes a `--dump-plan` membership table: one `side<TAB>bin<TAB>record<TAB>bp`
+/// line per record, reference side first. Shared by the single-query path and
+/// the batch executor, which calls it once per job at a per-job sibling path.
+fn write_plan_dump(
+    path: &std::path::Path,
+    plan: &plan::Plan,
+    ref_records: &[(String, Vec<u8>)],
+    qry_records: &[(String, Vec<u8>)],
+) -> Fallible<()> {
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    for (side, bins, recs) in [
+        ("reference", &plan.reference_bins, ref_records),
+        ("query", &plan.query_bins, qry_records),
+    ] {
+        for b in bins {
+            for &id in &b.record_ids {
+                let (name, seq) = &recs[id as usize];
+                writeln!(f, "{side}\t{}\t{name}\t{}", b.id, seq.len())?;
+            }
+        }
+    }
+    f.flush()?;
+    Ok(())
+}
+
+/// Builds the manifest `--dump-manifest` writes for a fresh (non-replay) run.
+/// `executable_hash` is passed in because the batch computes it once for every
+/// job, while the single-query path calls [`plan::executable_hash`] only here
+/// so an ordinary run pays no hashing overhead.
+#[allow(clippy::too_many_arguments)]
+fn plan_manifest(
+    args: &RunArgs,
+    contract: &crate::gpu::ExecutionContract,
+    sub_mat: &[i32],
+    res_seq: u64,
+    res_qry: u64,
+    ref_records: &[(String, Vec<u8>)],
+    qry_records: &[(String, Vec<u8>)],
+    plan: &plan::Plan,
+    executable_hash: u64,
+) -> plan::PlanManifest {
+    plan::PlanManifest {
+        version: plan::PlanManifest::FORMAT,
+        hspz_version: env!("CARGO_PKG_VERSION").into(),
+        features: plan::compiled_features(),
+        max_hits: contract.max_hits,
+        hsp_blocks: contract.hsp_blocks,
+        seed: args.seed.clone(),
+        step: args.step,
+        transitions: !args.notransition,
+        xdrop: args.xdrop,
+        hspthresh: args.hspthresh,
+        noentropy: args.noentropy,
+        wga_chunk_size: args.wga_chunk_size,
+        lastz_interval_size: args.lastz_interval_size,
+        kegalign_bins: args.kegalign_bins,
+        seq_block_size: res_seq,
+        query_block_size: res_qry,
+        ref_hash: plan::records_hash(ref_records),
+        qry_hash: plan::records_hash(qry_records),
+        executable_hash,
+        sub_mat: sub_mat.to_vec(),
+        strand: args.strand.clone(),
+        target_prefix: args.target_prefix.clone(),
+        query_prefix: args.query_prefix.clone(),
+        plan: plan.clone(),
+    }
+}
+
+/// Writes one `--dump-manifest` file and flushes it: `BufWriter::drop`
+/// discards a failed final flush, turning a truncated manifest into a
+/// silently "successful" dump.
+fn write_manifest_dump(path: &std::path::Path, m: &plan::PlanManifest) -> Fallible<()> {
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    m.write(&mut f)?;
+    f.flush()?;
+    Ok(())
+}
+
+/// Everything the `--time` footer reports after the executor returns. One
+/// printer for the single-query and batch paths, so the two can never drift;
+/// the callers pass the totals that apply to them.
+struct TimeFooter<'a> {
+    phases: &'a Phases,
+    wall_ms: f64,
+    launches: u64,
+    stage_syncs: u64,
+    pipeline_syncs: u64,
+    contract: &'a crate::gpu::ExecutionContract,
+    ref_bins: usize,
+    units: usize,
+    lifecycle: &'a Lifecycle,
+    uploads: u64,
+    copy_stalls: u64,
+    files: usize,
+    bytes_in: u64,
+    bytes_out: u64,
+    diagonal: bool,
+    host_peak_est: u64,
+    est_shared: u64,
+    workers: usize,
+    est_prefetch: u64,
+    est_no_prefetch: u64,
+    host_budget: Option<u64>,
+    host_status: &'a str,
+    prefetch_requested: bool,
+    prefetch: bool,
+}
+
+impl TimeFooter<'_> {
+    fn print(&self) {
+        eprintln!(
+            "\nWALL-TIME ACCOUNTING\n{}",
+            self.phases.report(self.wall_ms)
+        );
+        eprintln!("  kernel launches: {}", self.launches);
+        // Phase 1 §12: the mechanism gate. `stage` waits are the ones stream
+        // ordering makes unnecessary and are 0 with --async-stages.
+        eprintln!(
+            "  host syncs: {} stage, {} pipeline ({} per launch)",
+            self.stage_syncs,
+            self.pipeline_syncs,
+            if self.launches > 0 {
+                format!(
+                    "{:.3}",
+                    (self.stage_syncs + self.pipeline_syncs) as f64 / self.launches as f64
+                )
+            } else {
+                "-".into()
+            }
+        );
+        eprintln!(
+            "  max_hits: {} (target; resolved once; pinned unless --max-hits 0)\n  hit_capacity: {} (physical; success/failure only, never output bytes)\n  lifecycle: {} ref bins, \
+ {} work units, {} builds, {} engines, {} ref uploads, {} query swaps",
+            self.contract.max_hits,
+            self.contract.hit_capacity,
+            self.ref_bins,
+            self.units,
+            self.lifecycle.seed_table_builds,
+            self.lifecycle.engine_creations,
+            self.lifecycle.reference_uploads,
+            self.lifecycle.query_swaps,
+        );
+        // Phase 3 mechanism: a stalled upload is one that had not finished when
+        // its compute needed it, i.e. overlap that did not happen.
+        eprintln!(
+            "  seed uploads: {} ({} stalled{})",
+            self.uploads,
+            self.copy_stalls,
+            if self.uploads > 0 {
+                format!(
+                    ", {:.2}%",
+                    self.copy_stalls as f64 / self.uploads as f64 * 100.0
+                )
+            } else {
+                String::new()
+            }
+        );
+        eprintln!(
+            "  output: {} files, {} bytes formatted, {} bytes written{}",
+            self.files,
+            self.bytes_in,
+            self.bytes_out,
+            if self.diagonal { " (-D)" } else { "" }
+        );
+        eprintln!("  peak RSS: {:>10} KiB", timing::peak_rss_kib());
+        // Phase 1 §9: the host-budget decision, in the same units as the line
+        // above so §11's validation is a subtraction.
+        let mib = |b: u64| b as f64 / 1048576.0;
+        eprintln!(
+            "  host budget: estimated peak {:.0} MiB (shared {:.0} + {} worker(s), \
+             {:.0} prefetching / {:.0} not), budget {}, status {}, \
+             prefetch requested {} effective {}",
+            mib(self.host_peak_est),
+            mib(self.est_shared),
+            self.workers,
+            mib(self.est_prefetch),
+            mib(self.est_no_prefetch),
+            self.host_budget
+                .map_or("unknown".to_string(), |b| format!("{:.0} MiB", mib(b))),
+            self.host_status,
+            self.prefetch_requested,
+            self.prefetch,
+        );
+    }
+}
+
 /// Builds the planner's metadata from raw records: `id` and `ordinal` are the
 /// input index, so `bin.record_ids` indexes straight back into `records`.
-fn record_meta(records: &[(String, Vec<u8>)]) -> Vec<RecordMeta> {
+pub(crate) fn record_meta(records: &[(String, Vec<u8>)]) -> Vec<RecordMeta> {
     records
         .iter()
         .enumerate()
@@ -1094,6 +1305,30 @@ pub fn device_seeds_for(workers: usize) -> bool {
     }
 }
 
+/// Packs one reference bin's records and builds its seed table — the host half
+/// of a reference build. The single-query worker and the batch executor both
+/// call it inline for the first bin and from the prefetch thread for the next,
+/// so the two paths cannot drift.
+fn build_ref_bin(
+    rbin: &plan::Bin,
+    ref_records: &[(String, Vec<u8>)],
+    target_prefix: &str,
+    shape: &Shape,
+    step: u32,
+    threads: usize,
+) -> (PackedBin, SeedTable) {
+    let packed = PackedBin::build(
+        rbin.record_ids.iter().map(|&id| {
+            let (n, s) = &ref_records[id as usize];
+            (n.as_str(), s.as_slice())
+        }),
+        target_prefix,
+        false,
+    );
+    let table = SeedTable::build_parallel(&packed.buf[..packed.block_len], shape, step, threads);
+    (packed, table)
+}
+
 /// Runs one worker's visits on `device`, streaming finished units to the
 /// emitter (§Phase 5: build/upload each visited reference once, reuse it
 /// across its slice; no GPU is shared for performance).
@@ -1137,19 +1372,6 @@ fn run_bins(
     // while bin k's work units run, so only the first build stays exposed.
     // Execution order, bin identity and the lifecycle counts are untouched: this
     // moves *when* the data is built, not what runs or in which order.
-    let build_ref_bin = |rbin: &plan::Bin| -> (PackedBin, SeedTable) {
-        let packed = PackedBin::build(
-            rbin.record_ids.iter().map(|&id| {
-                let (n, s) = &ref_records[id as usize];
-                (n.as_str(), s.as_slice())
-            }),
-            &args.target_prefix,
-            false,
-        );
-        let table =
-            SeedTable::build_parallel(&packed.buf[..packed.block_len], shape, args.step, threads);
-        (packed, table)
-    };
     let mut pending: Option<(PackedBin, SeedTable)> = None;
 
     for (visit_index, visit) in visits.iter().enumerate() {
@@ -1157,7 +1379,14 @@ fn run_bins(
         let t = Instant::now();
         let (mut packed_ref, table) = match pending.take() {
             Some(built) => built,
-            None => build_ref_bin(rbin),
+            None => build_ref_bin(
+                rbin,
+                ref_records,
+                &args.target_prefix,
+                shape,
+                args.step,
+                threads,
+            ),
         };
         rep.seed_table_ms += t.elapsed();
         rep.lifecycle.seed_table_builds += 1;
@@ -1204,7 +1433,15 @@ fn run_bins(
             let prefetch = next_bin.map(|nb| {
                 scope.spawn(|| {
                     let t = Instant::now();
-                    (build_ref_bin(nb), t.elapsed())
+                    let built = build_ref_bin(
+                        nb,
+                        ref_records,
+                        &args.target_prefix,
+                        shape,
+                        args.step,
+                        threads,
+                    );
+                    (built, t.elapsed())
                 })
             });
 
@@ -1386,6 +1623,9 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     if args.cpu_only {
         return run_cpu_only(args, &mut phases, pre_main_ms, started);
     }
+    if args.query_list.is_some() {
+        return run_batch(args, &mut phases, pre_main_ms, started);
+    }
 
     // Shared config, parsed once.
     let shape = Shape::parse(&args.seed)?;
@@ -1393,8 +1633,12 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let transitions = !args.notransition;
 
     // Load both sides as raw records — no block-size guard (§10).
+    let query_path = args
+        .query
+        .as_ref()
+        .ok_or("--query is required without --query-list")?;
     let t = Instant::now();
-    let (_, qry_records, _) = sequence::read_records(&args.query)?;
+    let (_, qry_records, _) = sequence::read_records(query_path)?;
     phases.add("input.query", t.elapsed());
     let t = Instant::now();
     let (_, ref_records, _) = sequence::read_records(&args.reference)?;
@@ -1551,61 +1795,30 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     phases.add("plan", t.elapsed());
 
     if let Some(path) = &args.dump_plan {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-        for (side, bins, recs) in [
-            ("reference", &plan.reference_bins, &ref_records),
-            ("query", &plan.query_bins, &qry_records),
-        ] {
-            for b in bins {
-                for &id in &b.record_ids {
-                    let (name, seq) = &recs[id as usize];
-                    writeln!(f, "{side}\t{}\t{name}\t{}", b.id, seq.len())?;
-                }
-            }
-        }
-        f.flush()?;
+        write_plan_dump(path, &plan, &ref_records, &qry_records)?;
     }
     if let Some(path) = &args.dump_manifest {
-        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         match &loaded_manifest {
             // Replay + dump: re-emit exactly what was loaded and validated,
             // never a reconstruction from this run's B/Q CLI defaults.
-            Some(m) => m.write(&mut f)?,
+            Some(m) => write_manifest_dump(path, m)?,
             None => {
                 // Fresh dump only: this is the one place `plan::executable_hash`
                 // runs, so an ordinary run pays no hashing overhead.
-                let m = plan::PlanManifest {
-                    version: plan::PlanManifest::FORMAT,
-                    hspz_version: env!("CARGO_PKG_VERSION").into(),
-                    features: plan::compiled_features(),
-                    max_hits: contract.max_hits,
-                    hsp_blocks: contract.hsp_blocks,
-                    seed: args.seed.clone(),
-                    step: args.step,
-                    transitions: !args.notransition,
-                    xdrop: args.xdrop,
-                    hspthresh: args.hspthresh,
-                    noentropy: args.noentropy,
-                    wga_chunk_size: args.wga_chunk_size,
-                    lastz_interval_size: args.lastz_interval_size,
-                    kegalign_bins: args.kegalign_bins,
-                    seq_block_size: res_seq,
-                    query_block_size: res_qry,
-                    ref_hash: plan::records_hash(&ref_records),
-                    qry_hash: plan::records_hash(&qry_records),
-                    executable_hash: plan::executable_hash()?,
-                    sub_mat: sub_mat.clone(),
-                    strand: args.strand.clone(),
-                    target_prefix: args.target_prefix.clone(),
-                    query_prefix: args.query_prefix.clone(),
-                    plan: plan.clone(),
-                };
-                m.write(&mut f)?;
+                let m = plan_manifest(
+                    args,
+                    &contract,
+                    &sub_mat,
+                    res_seq,
+                    res_qry,
+                    &ref_records,
+                    &qry_records,
+                    &plan,
+                    plan::executable_hash()?,
+                );
+                write_manifest_dump(path, &m)?;
             }
         }
-        // `BufWriter::drop` discards a failed final flush, which would turn a
-        // truncated manifest into a silently "successful" dump.
-        f.flush()?;
     }
 
     // §18: reference bins to workers, deterministic LPT (whole-bin), or the
@@ -2050,76 +2263,37 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     report_counts(&stats);
     if args.time {
         let wall = pre_main_ms + started.elapsed().as_secs_f64() * 1000.0;
-        eprintln!("\nWALL-TIME ACCOUNTING\n{}", phases.report(wall));
-        eprintln!("  kernel launches: {}", launches);
-        // Phase 1 §12: the mechanism gate. `stage` waits are the ones stream
-        // ordering makes unnecessary and are 0 with --async-stages.
-        eprintln!(
-            "  host syncs: {} stage, {} pipeline ({} per launch)",
+        TimeFooter {
+            phases: &phases,
+            wall_ms: wall,
+            launches,
             stage_syncs,
             pipeline_syncs,
-            if launches > 0 {
-                format!(
-                    "{:.3}",
-                    (stage_syncs + pipeline_syncs) as f64 / launches as f64
-                )
-            } else {
-                "-".into()
-            }
-        );
-        eprintln!(
-            "  max_hits: {} (target; resolved once; pinned unless --max-hits 0)\n  hit_capacity: {} (physical; success/failure only, never output bytes)\n  lifecycle: {} ref bins, \
-{} work units, {} builds, {} engines, {} ref uploads, {} query swaps",
-            contract.max_hits,
-            contract.hit_capacity,
-            plan.reference_bins.len(),
-            plan.units.len(),
-            lifecycle.seed_table_builds,
-            lifecycle.engine_creations,
-            lifecycle.reference_uploads,
-            lifecycle.query_swaps,
-        );
-        // Phase 3 mechanism: a stalled upload is one that had not finished when
-        // its compute needed it, i.e. overlap that did not happen.
-        eprintln!(
-            "  seed uploads: {} ({} stalled{})",
+            contract: &contract,
+            ref_bins: plan.reference_bins.len(),
+            units: plan.units.len(),
+            lifecycle: &lifecycle,
             uploads,
             copy_stalls,
-            if uploads > 0 {
-                format!(", {:.2}%", copy_stalls as f64 / uploads as f64 * 100.0)
-            } else {
-                String::new()
-            }
-        );
-        eprintln!(
-            "  output: {} files, {} bytes formatted, {} bytes written{}",
-            out.files,
-            out.bytes_in,
-            if out.bytes_out > 0 {
+            files: out.files,
+            bytes_in: out.bytes_in,
+            bytes_out: if out.bytes_out > 0 {
                 out.bytes_out
             } else {
                 out.bytes_in
             },
-            if args.diagonal_partition { " (-D)" } else { "" }
-        );
-        eprintln!("  peak RSS: {:>10} KiB", timing::peak_rss_kib());
-        // Phase 1 §9: the host-budget decision, in the same units as the line
-        // above so §11's validation is a subtraction.
-        let mib = |b: u64| b as f64 / 1048576.0;
-        eprintln!(
-            "  host budget: estimated peak {:.0} MiB (shared {:.0} + {} worker(s), \
-             {:.0} prefetching / {:.0} not), budget {}, status {}, \
-             prefetch requested {} effective {}",
-            mib(host_peak_est),
-            mib(est.shared),
+            diagonal: args.diagonal_partition,
+            host_peak_est,
+            est_shared: est.shared,
             workers,
-            mib(est.per_worker_prefetch),
-            mib(est.per_worker_no_prefetch),
-            host_budget.map_or("unknown".to_string(), |b| format!("{:.0} MiB", mib(b))),
+            est_prefetch: est.per_worker_prefetch,
+            est_no_prefetch: est.per_worker_no_prefetch,
+            host_budget,
             host_status,
             prefetch_requested,
             prefetch,
-        );
+        }
+        .print();
     }
     if let Some(a) = audit.as_ref() {
         eprintln!("\n(ALL REFERENCE BINS) {}", a.report());
@@ -2127,6 +2301,777 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     if args.hit_stats {
         eprintln!("\nHITS PER SEED\n{}", hit_stats.report());
     }
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Bin-major batch: one reference × many queries (`--query-list`), W=1 only.
+//
+// Every job is planned independently exactly as `run -q` would (same
+// `plan_within_budget` call, same once-resolved `--max-hits`), and the batch
+// aborts before any GPU work unless all jobs share identical reference bins.
+// Execution is bin-major: each reference bin is built and uploaded once (with
+// the existing one-bin-ahead prefetch), then every job's query blocks for that
+// bin run through the unchanged `seed_and_filter_all` on their original units.
+// Each job owns one `Emitter` (+ `-D` history) fed in its standalone ordinal
+// order via a per-job cursor in `JobRouter`.
+//
+// A batch is all-or-nothing: any job's failure (`?`, OOM, CUDA, router, pack)
+// unwinds `run_batch`. Per-job directories are left with whatever files were
+// already written, a `-Z` archive is left truncated (`TarGzSink::finish` never
+// runs), later jobs on later bins never run, and `OUT/queries.tsv` is only
+// written after every emitter finishes. This is documented in the
+// `--query-list` CLI help as well.
+
+/// Batch-mode flag validation, pure so it is unit-testable without a GPU.
+pub(crate) fn validate_batch_args(args: &RunArgs) -> Result<(), String> {
+    if args.gpus > 1 {
+        return Err("batch mode is W=1 in this release".into());
+    }
+    if args.seq_block_size == 0 {
+        return Err("batch mode rejects -B 0 (automatic layout): give -B explicitly".into());
+    }
+    if args.kegalign_bins {
+        return Err("batch mode rejects --kegalign-bins".into());
+    }
+    if args.from_manifest.is_some() {
+        return Err("batch mode rejects --from-manifest".into());
+    }
+    Ok(())
+}
+
+/// Reads a `--query-list` file: one query FASTA path per line, blank lines and
+/// `#` comments ignored. Relative paths resolve against the list file's dir.
+pub(crate) fn read_query_list(path: &std::path::Path) -> Fallible<Vec<PathBuf>> {
+    let text = std::fs::read_to_string(path)?;
+    let base = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let p = PathBuf::from(line);
+        out.push(match base {
+            Some(dir) if p.is_relative() => dir.join(p),
+            _ => p,
+        });
+    }
+    if out.is_empty() {
+        return Err(format!("query list {} has no queries", path.display()).into());
+    }
+    Ok(out)
+}
+
+/// Reference-bin compatibility across batch jobs: identical count, ids,
+/// membership and sizes. Anything else would silently replan one job into a
+/// different dedup scope, so the batch aborts naming the job instead.
+pub(crate) fn check_reference_bins_compatible(
+    first: &[plan::Bin],
+    job: &[plan::Bin],
+    job_index: usize,
+    job_path: &std::path::Path,
+) -> Result<(), String> {
+    if first.len() != job.len()
+        || first
+            .iter()
+            .zip(job.iter())
+            .any(|(a, b)| a.id != b.id || a.total_bp != b.total_bp || a.record_ids != b.record_ids)
+    {
+        return Err(format!(
+            "batch: job {:06} ({}): reference bins differ from job 000001; \
+             batch only admits jobs with identical reference bins",
+            job_index + 1,
+            job_path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// Output router: one next-ordinal cursor per job. A single global cursor
+/// would buffer every later job while bin-major execution waits on the first,
+/// so each job advances in its own standalone ordinal order.
+pub(crate) struct JobRouter {
+    next: Vec<u32>,
+    totals: Vec<u32>,
+}
+
+impl JobRouter {
+    pub(crate) fn new(totals: Vec<u32>) -> Self {
+        Self {
+            next: vec![0; totals.len()],
+            totals,
+        }
+    }
+
+    /// Admits `(job, ordinal)` iff it is that job's next expected unit *and*
+    /// the bin tuple matches the job plan's unit at that ordinal.
+    pub(crate) fn accept(
+        &mut self,
+        job: usize,
+        ordinal: u32,
+        reference_bin: u32,
+        query_bin: u32,
+        plan: &plan::Plan,
+    ) -> Result<(), String> {
+        if job >= self.next.len() {
+            return Err(format!("batch router: unknown job {job}"));
+        }
+        let want = self.next[job];
+        if ordinal < want {
+            return Err(format!(
+                "batch router: duplicate work unit ordinal {ordinal} for job {:06}",
+                job + 1
+            ));
+        }
+        if ordinal > want {
+            return Err(format!(
+                "batch router: missing work unit for job {:06}: expected ordinal {want}, got {ordinal}",
+                job + 1
+            ));
+        }
+        if ordinal >= self.totals[job] {
+            return Err(format!(
+                "batch router: work unit ordinal {ordinal} is outside job {:06}'s plan ({} units)",
+                job + 1,
+                self.totals[job]
+            ));
+        }
+        let pu = &plan.units[ordinal as usize];
+        if (pu.reference_bin, pu.query_bin) != (reference_bin, query_bin) {
+            return Err(format!(
+                "batch router: job {:06} ordinal {ordinal} arrived as R{reference_bin} Q{query_bin} \
+                 but the plan has R{} Q{}",
+                job + 1,
+                pu.reference_bin,
+                pu.query_bin
+            ));
+        }
+        self.next[job] += 1;
+        Ok(())
+    }
+
+    /// True once every job's cursor reached its plan length.
+    pub(crate) fn complete(&self) -> bool {
+        self.next == self.totals
+    }
+}
+
+/// Per-job sibling of a batch dump path: append `.{job:06}` to the full file
+/// name, so `--dump-manifest out.manifest` writes `out.manifest.000001` and
+/// `--dump-plan`/`--dump-raw`/the `HSPZ_ANCHOR_CENSUS` dump all agree. Never
+/// `Path::with_extension`, which would replace `.manifest` with `.000001`.
+/// `job` is the zero-based loop index.
+pub(crate) fn job_sibling(path: &std::path::Path, job: usize) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(format!(".{:06}", job + 1));
+    PathBuf::from(name)
+}
+
+/// SHA-256 of a file via the existing `sha256sum` binary (no new crates).
+fn sha256_file(path: &std::path::Path) -> Fallible<String> {
+    let out = std::process::Command::new("sha256sum").arg(path).output()?;
+    if !out.status.success() {
+        return Err(format!("sha256sum failed for {}", path.display()).into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.split_whitespace()
+        .next()
+        .map(str::to_string)
+        .ok_or_else(|| format!("sha256sum gave no digest for {}", path.display()).into())
+}
+
+#[allow(clippy::too_many_lines)]
+fn run_batch(
+    args: &RunArgs,
+    phases: &mut Phases,
+    pre_main_ms: f64,
+    started: Instant,
+) -> Fallible<Stats> {
+    validate_batch_args(args).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    let list_path = args
+        .query_list
+        .as_ref()
+        .ok_or("--query-list is required for batch mode")?;
+    let job_paths = read_query_list(list_path)?;
+
+    let shape = Shape::parse(&args.seed)?;
+    let sub_mat = scoring::build_sub_mat(&args.ambiguous, args.xdrop, args.scoring.as_deref())?;
+    let transitions = !args.notransition;
+
+    let t = Instant::now();
+    let (_, ref_records, ref_bytes) = sequence::read_records(&args.reference)?;
+    phases.add("input.reference", t.elapsed());
+    let ref_meta = record_meta(&ref_records);
+    let ref_bp_total: u64 = ref_meta.iter().map(|r| r.len).sum();
+
+    // Resolve `--max-hits 0` ONCE for the whole batch (design: never from
+    // whichever worker happens to run a unit — here there is one device).
+    let t = Instant::now();
+    let ctx = CudaContext::new(0)?;
+    phases.add("CUDA context init", t.elapsed());
+    // `plan` mirrors the single-query path exactly: device probe, worker budget
+    // and contract resolution, then each job's own `plan_within_budget`, then
+    // the shared hit capacity. Never the CUDA context or the query loads — the
+    // query reads are charged to `input.query` (once per job), as standalone.
+    let t = Instant::now();
+    let devices = crate::gpu::device_count().max(1);
+    let free = crate::gpu::min_free_bytes(1)?;
+    let workers_upper = 1usize.min(ref_meta.len().max(1));
+    let budget = plan::worker_device_budget(free, workers_upper, devices);
+    let mut contract = crate::gpu::ExecutionContract::resolve(&ctx, args.max_hits, args.hsp_blocks);
+    let resolved_max_hits = contract.max_hits;
+    let q_target = args
+        .query_block_size
+        .map(u64::from)
+        .unwrap_or(args.seq_block_size as u64);
+    let res_seq = args.seq_block_size as u64;
+    let mut plan_ms = t.elapsed();
+
+    // Plan EVERY job independently with the same call the single path uses.
+    let mut qry_records_list: Vec<Vec<(String, Vec<u8>)>> = Vec::with_capacity(job_paths.len());
+    let mut plans: Vec<plan::Plan> = Vec::with_capacity(job_paths.len());
+    let mut worsts: Vec<u64> = Vec::with_capacity(job_paths.len());
+    for path in &job_paths {
+        let tq = Instant::now();
+        let (_, recs, _) = sequence::read_records(path)?;
+        phases.add("input.query", tq.elapsed());
+        let tp = Instant::now();
+        let meta = record_meta(&recs);
+        let (p, worst) = plan::plan_within_budget(
+            &ref_meta,
+            &meta,
+            res_seq,
+            q_target,
+            budget,
+            shape.kmer_size,
+            args.step,
+            resolved_max_hits,
+            false,
+            args.wga_chunk_size,
+            transitions,
+        )
+        .map_err(|e| {
+            format!(
+                "batch: job {} ({}): {e}",
+                qry_records_list.len() + 1,
+                path.display()
+            )
+        })?;
+        qry_records_list.push(recs);
+        plans.push(p);
+        worsts.push(worst);
+        plan_ms += tp.elapsed();
+    }
+    let tp = Instant::now();
+    // The reference bins must be identical across all jobs — abort before any
+    // GPU work, naming the job.
+    for (j, (p, path)) in plans.iter().zip(&job_paths).enumerate().skip(1) {
+        check_reference_bins_compatible(&plans[0].reference_bins, &p.reference_bins, j, path)?;
+    }
+
+    // Physical capacity shared by the batch's engines: per-plan candidates
+    // never lower the semantic cap, so take the minimum that still fits every
+    // job (success/failure only, never output bytes).
+    {
+        let mut shared: Option<u32> = None;
+        for p in &plans {
+            let candidate = plan::max_hit_capacity(
+                p,
+                budget,
+                shape.kmer_size,
+                args.step,
+                resolved_max_hits,
+                args.wga_chunk_size,
+                transitions,
+            )?;
+            shared = Some(shared.map_or(candidate, |s: u32| s.min(candidate)));
+        }
+        contract.hit_capacity = crate::gpu::clamp_hit_capacity(
+            contract.max_hits,
+            shared.unwrap_or(contract.max_hits),
+            contract.hsp_blocks,
+        )?;
+    }
+    plan_ms += tp.elapsed();
+    phases.add("plan", plan_ms);
+
+    if let Some(path) = &args.dump_plan {
+        for (j, p) in plans.iter().enumerate() {
+            write_plan_dump(&job_sibling(path, j), p, &ref_records, &qry_records_list[j])?;
+        }
+    }
+    if let Some(path) = &args.dump_manifest {
+        // One executable hash for every job's manifest. Batch rejects
+        // `--from-manifest`, so every manifest here is a fresh dump.
+        let executable_hash = plan::executable_hash()?;
+        for (j, p) in plans.iter().enumerate() {
+            let m = plan_manifest(
+                args,
+                &contract,
+                &sub_mat,
+                res_seq,
+                q_target,
+                &ref_records,
+                &qry_records_list[j],
+                p,
+                executable_hash,
+            );
+            write_manifest_dump(&job_sibling(path, j), &m)?;
+        }
+    }
+
+    // Host preflight over the WHOLE batch: all queries' records stay in RAM,
+    // packed per unit from the held records (never re-read per bin).
+    let qry_bp_sum: u64 = qry_records_list
+        .iter()
+        .map(|recs| recs.iter().map(|(_, s)| s.len() as u64).sum::<u64>())
+        .sum();
+    let largest_ref = plans[0]
+        .reference_bins
+        .iter()
+        .map(|b| b.total_bp)
+        .max()
+        .unwrap_or(0);
+    let largest_qry = plans
+        .iter()
+        .flat_map(|p| p.query_bins.iter().map(|b| b.total_bp))
+        .max()
+        .unwrap_or(0);
+    let threads = resolve_threads(args.threads);
+    let max_seeds = seed::max_seeds(args.wga_chunk_size, &shape, transitions);
+    // Shared formula with the single-query path; the two maxima span every
+    // job here, because the batch holds all of them in RAM at once.
+    let est = plan::host_estimate_sizes(
+        largest_ref,
+        largest_qry,
+        ref_bp_total,
+        qry_bp_sum,
+        shape.kmer_size,
+        args.step,
+        threads,
+        max_seeds,
+    );
+    let ref_bins_all: Vec<u32> = plans[0].reference_bins.iter().map(|b| b.id).collect();
+    let assignment: Vec<Vec<u32>> = vec![ref_bins_all];
+    let prefetch_requested = !args.no_ref_prefetch;
+    let mut prefetch = prefetch_requested;
+    let mut host_budget = None;
+    let mut host_status = "unknown (no cgroup/meminfo reading)";
+    if let Some(available) = timing::available_host_bytes().map(|b| b * 9 / 10) {
+        host_budget = Some(available);
+        let fits = plan::host_preflight(&est, &assignment, available)?;
+        host_status = if fits {
+            "fits with prefetch"
+        } else {
+            "fits without prefetch"
+        };
+        if prefetch && !fits {
+            eprintln!("note: host preflight disabled reference prefetch (batch W=1)");
+        }
+        prefetch &= fits;
+    }
+    let host_peak_est = plan::host_peak(&est, &assignment, prefetch);
+
+    // One emitter (+ `-D` history) per job, each starting empty.
+    std::fs::create_dir_all(&args.output)?;
+    let batch_tarball = args.tarball.is_some();
+    if let Some(p) = &args.tarball {
+        // Bare `-Z` (clap's `-` sentinel) and an empty value mean the default
+        // per-job archive layout; any other path cannot be honoured because a
+        // batch writes one archive per job.
+        if !p.as_os_str().is_empty() && p.as_os_str() != "-" {
+            eprintln!(
+                "note: batch mode writes one archive per job (OUT/000001.tar.gz …); \
+                 the -Z path value is ignored"
+            );
+        }
+    }
+    let audit_base = crate::census::SurvivorAudit::dump_path();
+    let mut emitters: Vec<Emitter> = Vec::with_capacity(job_paths.len());
+    for (j, _) in job_paths.iter().enumerate() {
+        let tag = format!("{:06}", j + 1);
+        let (dir, tar) = if batch_tarball {
+            (
+                args.output.join(&tag),
+                Some(args.output.join(format!("{tag}.tar.gz"))),
+            )
+        } else {
+            (args.output.join(&tag), None)
+        };
+        let audit_path = audit_base.as_ref().map(|p| job_sibling(p, j));
+        emitters.push(Emitter::new_at(
+            &dir,
+            tar.as_deref(),
+            args.diagonal_partition,
+            audit_path.as_deref(),
+        )?);
+    }
+    let mut router = JobRouter::new(plans.iter().map(|p| p.units.len() as u32).collect());
+    let mut job_stats: Vec<Stats> = vec![Stats::default(); job_paths.len()];
+    let mut job_raw: Vec<Vec<(char, Vec<SegmentPair>)>> =
+        (0..job_paths.len()).map(|_| Vec::new()).collect();
+    let mut job_first_ms: Vec<Option<f64>> = vec![None; job_paths.len()];
+    let mut job_done_ms: Vec<f64> = vec![0.0; job_paths.len()];
+    let mut job_hit_stats: Vec<crate::gpu::HitStats> = (0..job_paths.len())
+        .map(|_| crate::gpu::HitStats::default())
+        .collect();
+    let mut job_audits: Vec<Option<crate::census::SurvivorAudit>> =
+        (0..job_paths.len()).map(|_| None).collect();
+
+    let total_units: usize = plans.iter().map(|p| p.units.len()).sum();
+    let r_bins = plans[0].reference_bins.len();
+    eprintln!(
+        "schedule: policy=whole-bin W=1 visits={r_bins} extra_replicas=0 (batch W=1; auto: W=1)"
+    );
+    {
+        let desc = plans[0]
+            .reference_bins
+            .iter()
+            .map(|b| format!("R{}(Qbatch)", b.id))
+            .collect::<Vec<_>>()
+            .join(" ");
+        eprintln!("schedule: worker 0 device 0: {desc} units={total_units} visits={r_bins}");
+    }
+    eprintln!("schedule: device mapping: worker0->device0");
+
+    let device_seeds = device_seeds_for(1);
+    if device_seeds {
+        eprintln!("note: generating query seeds on the device (1 worker)");
+    }
+
+    let mut pending: Option<(plan::PackedBin, SeedTable)> = None;
+    let mut lifecycle = Lifecycle::default();
+    let mut launches = 0u64;
+    let (mut stage_syncs, mut pipeline_syncs) = (0u64, 0u64);
+    let (mut uploads, mut copy_stalls) = (0u64, 0u64);
+    let mut seed_table_ms = Duration::ZERO;
+    let mut prefetched_ms = Duration::ZERO;
+
+    for (visit_index, rbin) in plans[0].reference_bins.iter().enumerate() {
+        let t = Instant::now();
+        let (mut packed_ref, table) = match pending.take() {
+            Some(built) => built,
+            None => build_ref_bin(
+                rbin,
+                &ref_records,
+                &args.target_prefix,
+                &shape,
+                args.step,
+                threads,
+            ),
+        };
+        seed_table_ms += t.elapsed();
+        lifecycle.seed_table_builds += 1;
+
+        let cfg = EngineConfig {
+            index_table: &table.index_table,
+            pos_table: &table.pos_table,
+            ref_seq: &packed_ref.enc,
+            sub_mat: &sub_mat,
+            seed_size: shape.size as u32,
+            xdrop: args.xdrop,
+            hspthresh: args.hspthresh,
+            noentropy: args.noentropy,
+            max_hits: contract.max_hits,
+            hit_capacity: contract.hit_capacity,
+            timing: args.time,
+            hsp_blocks: contract.hsp_blocks,
+        };
+        let mut engine = Engine::new(&ctx, cfg, &mut *phases)?;
+        lifecycle.engine_creations += 1;
+        engine.dump_raw = args.dump_raw.is_some();
+        engine.device_seeds = device_seeds;
+        engine.collect_hit_stats = args.hit_stats;
+        engine.persistent_seed_buffers = !args.no_persistent_seed_buffers;
+        engine.async_stages = !args.no_async_stages;
+
+        let ref_chrs = std::mem::take(&mut packed_ref.chrs);
+        drop(packed_ref);
+        drop(table);
+
+        // The next reference bin builds on a worker thread while this bin's
+        // units run on the GPU — the existing one-bin-ahead prefetch, kept at
+        // W=1 (`std::thread::scope` so the closure can borrow the records).
+        let next_bin = plans[0]
+            .reference_bins
+            .get(visit_index + 1)
+            .filter(|_| prefetch);
+        std::thread::scope(|scope| -> Fallible<()> {
+            let prefetch = next_bin.map(|nb| {
+                scope.spawn(|| {
+                    let t = Instant::now();
+                    let built = build_ref_bin(
+                        nb,
+                        &ref_records,
+                        &args.target_prefix,
+                        &shape,
+                        args.step,
+                        threads,
+                    );
+                    (built, t.elapsed())
+                })
+            });
+
+            // Bin-major: for this reference bin, every job's units at this bin
+            // in that job's ordinal order (ref-outer ordinals make this
+            // per-job ordered, so each job's `-D` history matches standalone).
+            for (j, plan_j) in plans.iter().enumerate() {
+                let units: Vec<plan::WorkUnit> = plan_j
+                    .units
+                    .iter()
+                    .filter(|u| u.reference_bin == rbin.id)
+                    .copied()
+                    .collect();
+                for unit in units {
+                    let qbin = &plan_j.query_bins[unit.query_bin as usize];
+                    let t = Instant::now();
+                    let packed_q = plan::PackedBin::build(
+                        qbin.record_ids.iter().map(|&id| {
+                            let (n, s) = &qry_records_list[j][id as usize];
+                            (n.as_str(), s.as_slice())
+                        }),
+                        &args.query_prefix,
+                        true,
+                    );
+                    phases.add("query pack", t.elapsed());
+                    let intervals = sequence::intervals(
+                        packed_q.block_len,
+                        shape.size,
+                        args.lastz_interval_size,
+                    );
+                    let q_block_len = packed_q.block_len.saturating_sub(shape.size) as u32;
+
+                    let t = Instant::now();
+                    engine.swap_query(&packed_q.enc, &packed_q.enc_rc)?;
+                    phases.add("swap_query", t.elapsed());
+                    let qpass = QueryPass {
+                        fwd: &packed_q.buf[..packed_q.block_len],
+                        rc: &packed_q.rc,
+                        intervals: &intervals,
+                        q_block_len,
+                    };
+                    let pass = seed_and_filter_all(
+                        &mut engine,
+                        &qpass,
+                        &shape,
+                        transitions,
+                        args,
+                        threads,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "batch: job {:06} unit {} ref_bin {} query_bin {}: {e}",
+                            j + 1,
+                            unit.ordinal,
+                            rbin.id,
+                            qbin.id
+                        )
+                    })?;
+                    // Per-job diagnostic attribution (byte-neutral): drain what
+                    // this unit added into its job's accumulators.
+                    if args.hit_stats {
+                        job_hit_stats[j].merge(&std::mem::take(&mut engine.hit_stats));
+                    }
+                    if let Some(c) = engine.census.as_mut() {
+                        job_audits[j]
+                            .get_or_insert_with(crate::census::SurvivorAudit::default)
+                            .merge(&std::mem::take(c));
+                    }
+
+                    router
+                        .accept(j, unit.ordinal, unit.reference_bin, unit.query_bin, plan_j)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    emitters[j].emit_unit(
+                        unit.reference_bin,
+                        unit.query_bin,
+                        &ref_chrs,
+                        &packed_q.chrs,
+                        &packed_q.rc_chrs,
+                        &pass,
+                    )?;
+                    if args.dump_raw.is_some() {
+                        job_raw[j].extend_from_slice(&pass.raw);
+                    }
+                    let now_ms = started.elapsed().as_secs_f64() * 1000.0;
+                    if job_first_ms[j].is_none() {
+                        job_first_ms[j] = Some(now_ms);
+                    }
+                    job_done_ms[j] = now_ms;
+                    job_stats[j].seeds += pass.stats.seeds;
+                    job_stats[j].seed_hits += pass.stats.seed_hits;
+                    job_stats[j].raw_hsps += pass.stats.raw_hsps;
+                    job_stats[j].hsps += pass.stats.hsps;
+                    lifecycle.work_units_executed += 1;
+                    lifecycle.query_swaps += 1;
+                }
+            }
+
+            if let Some(prefetch) = prefetch {
+                let t = Instant::now();
+                let (built, standalone) = prefetch.join().expect("reference prefetch panicked");
+                seed_table_ms += t.elapsed();
+                prefetched_ms += standalone;
+                pending = Some(built);
+            }
+            Ok(())
+        })?;
+
+        let got_swaps = engine.query_swaps();
+        let want_swaps: u32 = plans
+            .iter()
+            .map(|p| {
+                p.units
+                    .iter()
+                    .filter(|u| u.reference_bin == rbin.id)
+                    .count() as u32
+            })
+            .sum();
+        if got_swaps != want_swaps {
+            return Err(format!(
+                "batch: reference bin {}: engine query_swaps = {got_swaps}, expected {want_swaps}",
+                rbin.id
+            )
+            .into());
+        }
+        lifecycle.reference_uploads += engine.reference_uploads();
+        engine.finish_bucket_autotune();
+        launches += engine.launches;
+        stage_syncs += engine.stage_syncs();
+        pipeline_syncs += engine.pipeline_syncs();
+        let (u, st) = engine.seed_copy_stats();
+        uploads += u;
+        copy_stalls += st;
+        if let Some(c) = engine.census.as_mut() {
+            eprintln!("\n(reference bin {}) {}", rbin.id, c.report());
+        }
+        phases.merge(&engine.phases);
+    }
+    if !router.complete() {
+        return Err("batch: emitter did not reach every job's final ordinal".into());
+    }
+    lifecycle.check(r_bins as u32, total_units as u32)?;
+
+    phases.add("seed table build", seed_table_ms);
+    if prefetched_ms > Duration::ZERO {
+        phases.add_overlapped("reference bin prep (standalone)", prefetched_ms);
+    }
+
+    if let Some(path) = &args.dump_raw {
+        for (j, raw) in job_raw.iter().enumerate() {
+            let mut f = std::io::BufWriter::new(std::fs::File::create(job_sibling(path, j))?);
+            for (strand, hsps) in raw {
+                for h in hsps {
+                    writeln!(
+                        f,
+                        "{strand}\t{}\t{}\t{}\t{}",
+                        h.ref_start, h.query_start, h.len, h.score
+                    )?;
+                }
+            }
+        }
+    }
+
+    let mut total_files = 0usize;
+    let mut total_bytes_in = 0u64;
+    let mut total_bytes_out = 0u64;
+    for emitter in emitters {
+        let out = emitter.finish(&mut *phases)?;
+        total_files += out.files;
+        total_bytes_in += out.bytes_in;
+        total_bytes_out += out.bytes_out.max(out.bytes_in);
+    }
+
+    // OUT/queries.tsv: per-job identity and completion.
+    {
+        let mut f =
+            std::io::BufWriter::new(std::fs::File::create(args.output.join("queries.tsv"))?);
+        writeln!(
+            f,
+            "job\tpath\tbytes\tsha256\tblocks\tunits\thsps\tcompletion_ms"
+        )?;
+        for (j, path) in job_paths.iter().enumerate() {
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let sha = sha256_file(path)?;
+            writeln!(
+                f,
+                "{:06}\t{}\t{bytes}\t{sha}\t{}\t{}\t{}\t{:.2}",
+                j + 1,
+                path.display(),
+                plans[j].query_bins.len(),
+                plans[j].units.len(),
+                job_stats[j].hsps,
+                job_done_ms[j],
+            )?;
+        }
+        f.flush()?;
+    }
+
+    let mut stats = Stats::default();
+    for s in &job_stats {
+        stats.seeds += s.seeds;
+        stats.seed_hits += s.seed_hits;
+        stats.raw_hsps += s.raw_hsps;
+        stats.hsps += s.hsps;
+    }
+    report_counts(&stats);
+    for (j, s) in job_stats.iter().enumerate() {
+        eprintln!(
+            "job {:06}: blocks={} units={} hsps={} first_output_ms={:.2} completed_ms={:.2}",
+            j + 1,
+            plans[j].query_bins.len(),
+            plans[j].units.len(),
+            s.hsps,
+            job_first_ms[j].unwrap_or(job_done_ms[j]),
+            job_done_ms[j],
+        );
+    }
+    eprintln!(
+        "batch: jobs={} units={total_units} wall_ms={:.2}",
+        job_paths.len(),
+        started.elapsed().as_secs_f64() * 1000.0
+    );
+    if args.time {
+        let wall = pre_main_ms + started.elapsed().as_secs_f64() * 1000.0;
+        TimeFooter {
+            phases,
+            wall_ms: wall,
+            launches,
+            stage_syncs,
+            pipeline_syncs,
+            contract: &contract,
+            ref_bins: r_bins,
+            units: total_units,
+            lifecycle: &lifecycle,
+            uploads,
+            copy_stalls,
+            files: total_files,
+            bytes_in: total_bytes_in,
+            bytes_out: total_bytes_out,
+            diagonal: args.diagonal_partition,
+            host_peak_est,
+            est_shared: est.shared,
+            workers: 1,
+            est_prefetch: est.per_worker_prefetch,
+            est_no_prefetch: est.per_worker_no_prefetch,
+            host_budget,
+            host_status,
+            prefetch_requested,
+            prefetch,
+        }
+        .print();
+        for (j, a) in job_audits.iter().flatten().enumerate() {
+            eprintln!("\n(job {:06}, ALL REFERENCE BINS) {}", j + 1, a.report());
+        }
+        if args.hit_stats {
+            let mut merged = crate::gpu::HitStats::default();
+            for h in &job_hit_stats {
+                merged.merge(h);
+            }
+            eprintln!("\nHITS PER SEED\n{}", merged.report());
+        }
+    }
+    let _ = (ref_bytes, worsts);
     Ok(stats)
 }
 
@@ -2561,7 +3506,7 @@ mod tests {
         let mut phases = Phases::new();
         let mut auto = base_args();
         auto.reference = PathBuf::from("/nonexistent/ref.fa");
-        auto.query = PathBuf::from("/nonexistent/qry.fa");
+        auto.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         auto.seq_block_size = 0;
         auto.kegalign_bins = true;
         let err = prepare(&auto, &mut phases).err().unwrap();
@@ -2579,6 +3524,259 @@ mod tests {
         assert_eq!(layout_workers(2, 2, Some(0)), 2, "zero override is ignored");
     }
 
+    /// Batch validation is pure: W>1, `-B 0`, `--kegalign-bins` and
+    /// `--from-manifest` are all rejected with clear messages.
+    #[test]
+    fn batch_rejects_unsupported_combinations() {
+        let mut bad_gpus = base_args();
+        bad_gpus.query = None;
+        bad_gpus.query_list = Some(PathBuf::from("q.txt"));
+        bad_gpus.gpus = 2;
+        assert_eq!(
+            validate_batch_args(&bad_gpus).unwrap_err(),
+            "batch mode is W=1 in this release"
+        );
+
+        let mut bad_b = base_args();
+        bad_b.query_list = Some(PathBuf::from("q.txt"));
+        bad_b.seq_block_size = 0;
+        assert!(validate_batch_args(&bad_b).unwrap_err().contains("-B 0"));
+
+        let mut bad_k = base_args();
+        bad_k.query_list = Some(PathBuf::from("q.txt"));
+        bad_k.kegalign_bins = true;
+        assert!(
+            validate_batch_args(&bad_k)
+                .unwrap_err()
+                .contains("kegalign")
+        );
+
+        let mut bad_m = base_args();
+        bad_m.query_list = Some(PathBuf::from("q.txt"));
+        bad_m.from_manifest = Some(PathBuf::from("m.txt"));
+        assert!(
+            validate_batch_args(&bad_m)
+                .unwrap_err()
+                .contains("from-manifest")
+        );
+
+        let ok = base_args();
+        assert!(validate_batch_args(&ok).is_ok());
+    }
+
+    /// `--query-list` parsing: blank lines and `#` comments are ignored;
+    /// relative paths resolve against the list file's directory.
+    #[test]
+    fn query_list_ignores_blanks_comments_and_resolves_relative() {
+        let dir = std::env::temp_dir().join(format!("hspz-qlist-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let list = dir.join("list.txt");
+        std::fs::write(&list, "# comment\n\na.fa\n  \n# another\nsub/b.fa\n").unwrap();
+        let got = read_query_list(&list).unwrap();
+        assert_eq!(got, vec![dir.join("a.fa"), dir.join("sub/b.fa")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let dir2 = std::env::temp_dir().join(format!("hspz-qlist-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        let empty = dir2.join("empty.txt");
+        std::fs::write(&empty, "# only comments\n\n").unwrap();
+        assert!(read_query_list(&empty).is_err());
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
+    /// Per-job dump siblings append `.{job:06}` to the full file name, so all
+    /// four batch dump paths agree. The old `Path::with_extension` form dropped
+    /// `.manifest`/`.raw` and wrote `out.000001` instead of `out.manifest.000001`.
+    #[test]
+    fn batch_dump_siblings_append_to_the_full_file_name() {
+        assert_eq!(
+            job_sibling(PathBuf::from("out.manifest").as_path(), 0),
+            PathBuf::from("out.manifest.000001")
+        );
+        assert_eq!(
+            job_sibling(PathBuf::from("/tmp/out.plan").as_path(), 41),
+            PathBuf::from("/tmp/out.plan.000042")
+        );
+        assert_eq!(
+            job_sibling(PathBuf::from("dump.raw").as_path(), 2),
+            PathBuf::from("dump.raw.000003")
+        );
+        // The HSPZ_ANCHOR_CENSUS dump uses the same helper, not `format!("{}.{}")`.
+        assert_eq!(
+            job_sibling(PathBuf::from("out/queries.tsv").as_path(), 9),
+            PathBuf::from("out/queries.tsv.000010")
+        );
+    }
+
+    /// Reference-bin compatibility: identical bins pass; any difference in
+    /// count, membership or size aborts naming the job.
+    #[test]
+    fn reference_bin_compatibility_names_the_job() {
+        use crate::plan::Bin;
+        let bins = vec![
+            Bin {
+                id: 0,
+                record_ids: vec![0, 1],
+                total_bp: 100,
+            },
+            Bin {
+                id: 1,
+                record_ids: vec![2],
+                total_bp: 50,
+            },
+        ];
+        assert!(
+            check_reference_bins_compatible(
+                &bins,
+                &bins.clone(),
+                1,
+                PathBuf::from("b.fa").as_path()
+            )
+            .is_ok()
+        );
+        let fewer = vec![Bin {
+            id: 0,
+            record_ids: vec![0, 1],
+            total_bp: 100,
+        }];
+        let err =
+            check_reference_bins_compatible(&bins, &fewer, 1, PathBuf::from("b.fa").as_path())
+                .unwrap_err();
+        assert!(err.contains("job 000002") && err.contains("b.fa"), "{err}");
+        let mut moved = bins.clone();
+        moved[0].record_ids = vec![0, 2];
+        let err =
+            check_reference_bins_compatible(&bins, &moved, 2, PathBuf::from("c.fa").as_path())
+                .unwrap_err();
+        assert!(err.contains("job 000003"), "{err}");
+        let mut resized = bins.clone();
+        resized[1].total_bp = 51;
+        assert!(
+            check_reference_bins_compatible(&bins, &resized, 1, PathBuf::from("b.fa").as_path())
+                .is_err()
+        );
+    }
+
+    /// The batch router keeps one next-ordinal cursor per job: a bin-major
+    /// interleave (R0J0, R0J1, R1J0, R1J1) advances each job in its standalone
+    /// order, while duplicates, skips, swapped bins and unknown jobs fail.
+    #[test]
+    fn job_router_routes_by_job_and_rejects_bad_identity() {
+        use crate::plan::{Bin, Plan, WorkUnit};
+        // Two jobs sharing R=2 bins: job 0 has Q=1 (2 units), job 1 has Q=2
+        // (4 units). Ordinals are ref-outer per job.
+        let bins = || {
+            vec![
+                Bin {
+                    id: 0,
+                    record_ids: vec![0],
+                    total_bp: 10,
+                },
+                Bin {
+                    id: 1,
+                    record_ids: vec![1],
+                    total_bp: 10,
+                },
+            ]
+        };
+        let plan0 = Plan {
+            reference_bins: bins(),
+            query_bins: vec![Bin {
+                id: 0,
+                record_ids: vec![0],
+                total_bp: 5,
+            }],
+            units: vec![
+                WorkUnit {
+                    ordinal: 0,
+                    reference_bin: 0,
+                    query_bin: 0,
+                },
+                WorkUnit {
+                    ordinal: 1,
+                    reference_bin: 1,
+                    query_bin: 0,
+                },
+            ],
+        };
+        let plan1 = Plan {
+            reference_bins: bins(),
+            query_bins: vec![
+                Bin {
+                    id: 0,
+                    record_ids: vec![0],
+                    total_bp: 5,
+                },
+                Bin {
+                    id: 1,
+                    record_ids: vec![1],
+                    total_bp: 5,
+                },
+            ],
+            units: vec![
+                WorkUnit {
+                    ordinal: 0,
+                    reference_bin: 0,
+                    query_bin: 0,
+                },
+                WorkUnit {
+                    ordinal: 1,
+                    reference_bin: 0,
+                    query_bin: 1,
+                },
+                WorkUnit {
+                    ordinal: 2,
+                    reference_bin: 1,
+                    query_bin: 0,
+                },
+                WorkUnit {
+                    ordinal: 3,
+                    reference_bin: 1,
+                    query_bin: 1,
+                },
+            ],
+        };
+        let mut r = JobRouter::new(vec![2, 4]);
+        // Bin-major traversal the executor uses.
+        r.accept(0, 0, 0, 0, &plan0).unwrap();
+        r.accept(1, 0, 0, 0, &plan1).unwrap();
+        r.accept(1, 1, 0, 1, &plan1).unwrap();
+        r.accept(0, 1, 1, 0, &plan0).unwrap();
+        r.accept(1, 2, 1, 0, &plan1).unwrap();
+        r.accept(1, 3, 1, 1, &plan1).unwrap();
+        assert!(r.complete());
+
+        // Duplicate: job 0 ordinal 1 was already consumed.
+        let mut r = JobRouter::new(vec![2, 4]);
+        r.accept(0, 0, 0, 0, &plan0).unwrap();
+        r.accept(0, 1, 1, 0, &plan0).unwrap();
+        let err = r.accept(0, 1, 1, 0, &plan0).unwrap_err();
+        assert!(err.contains("duplicate"), "{err}");
+
+        // Missing: skipping ordinal 0 for job 1.
+        let mut r = JobRouter::new(vec![2, 4]);
+        let err = r.accept(1, 1, 0, 1, &plan1).unwrap_err();
+        assert!(err.contains("missing"), "{err}");
+
+        // Swapped bin tuple at the expected ordinal.
+        let mut r = JobRouter::new(vec![2, 4]);
+        let err = r.accept(0, 0, 1, 0, &plan0).unwrap_err();
+        assert!(err.contains("R1 Q0") && err.contains("R0 Q0"), "{err}");
+
+        // Unknown ordinal past the plan end, and unknown job.
+        let mut r = JobRouter::new(vec![2, 4]);
+        r.accept(0, 0, 0, 0, &plan0).unwrap();
+        r.accept(0, 1, 1, 0, &plan0).unwrap();
+        let err = r.accept(0, 2, 0, 0, &plan0).unwrap_err();
+        assert!(err.contains("outside"), "{err}");
+        assert!(
+            r.accept(7, 0, 0, 0, &plan0)
+                .unwrap_err()
+                .contains("unknown job")
+        );
+        assert!(!r.complete());
+    }
+
     /// `prepare` is the GPU-free path `benchmark` and `--cpu-only` share; neither
     /// implements frozen-plan replay or manifest dumps, so both flags must fail
     /// fast here rather than being silently dropped. Both paths point at inputs
@@ -2589,14 +3787,14 @@ mod tests {
 
         let mut from_manifest = base_args();
         from_manifest.reference = PathBuf::from("/nonexistent/ref.fa");
-        from_manifest.query = PathBuf::from("/nonexistent/qry.fa");
+        from_manifest.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         from_manifest.from_manifest = Some(PathBuf::from("/nonexistent/plan.manifest"));
         let err = prepare(&from_manifest, &mut phases).err().unwrap();
         assert!(err.to_string().contains("--from-manifest"), "{err}");
 
         let mut dump_manifest = base_args();
         dump_manifest.reference = PathBuf::from("/nonexistent/ref.fa");
-        dump_manifest.query = PathBuf::from("/nonexistent/qry.fa");
+        dump_manifest.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         dump_manifest.dump_manifest = Some(PathBuf::from("/nonexistent/out.manifest"));
         let err = prepare(&dump_manifest, &mut phases).err().unwrap();
         assert!(err.to_string().contains("--dump-manifest"), "{err}");

@@ -74,6 +74,7 @@ mod census;
 mod cli;
 mod compare;
 mod gpu;
+mod hits_estimate;
 mod hsp;
 mod partition;
 mod plan;
@@ -99,6 +100,7 @@ fn main() {
         Command::Run(args) => run::run(&args, pre_main_ms, started).map(|_| ()),
         Command::Benchmark(args) => benchmark::benchmark(&args, pre_main_ms),
         Command::Compare(args) => compare::compare(&args),
+        Command::HitsEstimate(args) => hits_estimate::run(&args).map(|_| ()),
     };
     if let Err(e) = result {
         eprintln!("error: {e}");

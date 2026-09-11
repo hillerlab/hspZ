@@ -465,6 +465,316 @@ pub fn max_seeds(span: u32, shape: &Shape, transitions: bool) -> usize {
     span as usize * per_pos
 }
 
+// ---------------------------------------------------------------------------
+// R92 PR1: exact per-unit seed-hit estimator (host histograms, no GPU).
+//
+// `hits(r,q) = Σ_key refcount_r[key] × qrycount_q[key]` over the pipeline's
+// compact seeds, equal to the `unit ledger:` hits column EXACTLY (u64). The
+// reference counts use the same strided starts as `SeedTable::build`; the
+// query counts use the same `kmer_at` validity over the same chunked LASTZ
+// interval schedule (`seed::chunks`) on both strands, counting base k-mers
+// only. Transition variants are folded into the reference side
+// (`fold_transitions`): each valid query window emits
+// its base k-mer plus one single-transition variant per transition care
+// position (`push_seeds`, identical XOR mapping), so dotting base query
+// counts against folded reference weights is exact.
+
+/// Dense-table guard: one `u32` table is `4^k` entries; `k > 12` needs 1 GiB+
+/// per table and is out of scope (12of19 default).
+pub fn estimator_table_size(shape: &Shape) -> Result<usize, String> {
+    if shape.kmer_size > 12 {
+        return Err(format!(
+            "hits-estimate needs k<=12 (dense 4^k table); seed has k={}",
+            shape.kmer_size
+        ));
+    }
+    Ok(1usize << (2 * shape.kmer_size))
+}
+
+/// Strided start sequence shared with `SeedTable::build`: positions
+/// `start + i*step` for `i in 0..num` over a block of `len` bases.
+fn ref_starts(len: usize, shape: &Shape, step: u32) -> (usize, usize) {
+    let step = step.max(1) as usize;
+    let offset = (shape.size + 1) % step;
+    let num = (len + offset).saturating_sub(shape.size) / step;
+    (step - offset, num)
+}
+
+/// Serial reference histogram over a packed block.
+pub fn count_ref_block(buf: &[u8], shape: &Shape, step: u32) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let mut hist = vec![0u32; nkeys];
+    for i in 0..num {
+        let k = shape.kmer_at(buf, start + i * step);
+        if k != INVALID_KMER {
+            hist[k as usize] += 1;
+        }
+    }
+    Ok(hist)
+}
+
+/// Adds `part` into `acc` (the histogram merge; counts commute).
+fn merge_hist(acc: &mut [u32], part: &[u32]) {
+    for (a, b) in acc.iter_mut().zip(part.iter()) {
+        *a += *b;
+    }
+}
+
+/// Parallel reference histogram: the step-index range is split into `threads`
+/// contiguous pieces, each counted into a private table, then summed.
+/// Exact — the same positions, the same `kmer_at`, addition commutes.
+pub fn count_ref_block_parallel(
+    buf: &[u8],
+    shape: &Shape,
+    step: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let threads = threads.max(1).min(num.max(1));
+    if threads <= 1 || num < 1 << 16 {
+        return count_ref_block(buf, shape, step as u32);
+    }
+    let per = num.div_ceil(threads);
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let (lo, hi) = (t * per, ((t + 1) * per).min(num));
+                s.spawn(move || {
+                    let mut h = vec![0u32; nkeys];
+                    for i in lo..hi {
+                        let k = shape.kmer_at(buf, start + i * step);
+                        if k != INVALID_KMER {
+                            h[k as usize] += 1;
+                        }
+                    }
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("ref count worker panicked"))
+            .collect()
+    });
+    let mut out = vec![0u32; nkeys];
+    for p in &parts {
+        merge_hist(&mut out, p);
+    }
+    Ok(out)
+}
+
+/// Key-sharded reference histogram (the alternative strategy, test-only):
+/// the key space is split into `threads` shards and every worker scans all
+/// positions, counting only keys in its shard — one final table, no merge,
+/// but `kmer_at` is recomputed per worker. Used by the strategy-comparison
+/// test; production uses the private-tables path above.
+#[cfg(test)]
+pub fn count_ref_block_sharded(
+    buf: &[u8],
+    shape: &Shape,
+    step: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let threads = threads.max(1).min(nkeys);
+    if threads <= 1 || num < 1 << 16 {
+        return count_ref_block(buf, shape, step as u32);
+    }
+    let kper = nkeys.div_ceil(threads);
+    let mut out = vec![0u32; nkeys];
+    {
+        let ptr = out.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let (lo, hi) = (t * kper, ((t + 1) * kper).min(nkeys));
+                s.spawn(move || {
+                    for i in 0..num {
+                        let k = shape.kmer_at(buf, start + i * step);
+                        if k != INVALID_KMER && (k as usize) >= lo && (k as usize) < hi {
+                            // SAFETY: shard `[lo,hi)` is disjoint across workers.
+                            unsafe { *(ptr as *mut u32).add(k as usize) += 1 };
+                        }
+                    }
+                });
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Base-k-mer query histogram over one packed query bin: `fwd[..block_len]`
+/// plus its reverse complement `rc`, over the pipeline's LASTZ intervals on
+/// the strands `plus`/`minus` select. Counts base k-mers only (variants are
+/// folded on the reference side). `stride` S counts window starts `j % S == 0`
+/// only (S=1 is exact); `lastz_interval` is the pipeline's `-I` tiling and
+/// `wga_chunk` its `-C` chunk size. Interval ranges are split across `threads`
+/// workers with private tables, then merged.
+///
+/// The window starts are exactly the ones `seed_and_filter_all` batches: each
+/// interval is cut with [`chunks`] (whose exclusive upper bound includes the
+/// interval end only when the chunk walk does not land on it — an interval
+/// whose length is a multiple of `wga_chunk` leaves its end to the next
+/// interval), and the minus strand chunks its RC mirror
+/// `(qbl - end, qbl - start)`, whose own chunk alignment decides the mirror's
+/// duplicate windows. Counting raw interval ends as inclusive, as the first
+/// version of this estimator did, double-counts every shared endpoint.
+pub fn count_query_block(
+    fwd: &[u8],
+    rc: &[u8],
+    block_len: usize,
+    shape: &Shape,
+    plus: bool,
+    minus: bool,
+    lastz_interval: u32,
+    wga_chunk: u32,
+    stride: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    if block_len <= shape.size {
+        return Ok(vec![0u32; nkeys]);
+    }
+    let stride = stride.max(1);
+    let qbl = (block_len - shape.size) as u32;
+    let ivs = crate::sequence::intervals(block_len, shape.size, lastz_interval);
+    // (is_rc, lo, hi-exclusive) window-start ranges, exactly the pipeline's.
+    let mut ranges: Vec<(bool, u32, u32)> = Vec::new();
+    if plus {
+        for &(s, e) in &ivs {
+            ranges.extend(
+                chunks(s, e, wga_chunk)
+                    .into_iter()
+                    .map(|(lo, hi)| (false, lo, hi)),
+            );
+        }
+    }
+    if minus {
+        for &(s, e) in &ivs {
+            let (lo, hi) = (qbl - e, qbl - s);
+            ranges.extend(
+                chunks(lo, hi, wga_chunk)
+                    .into_iter()
+                    .map(|(l, h)| (true, l, h)),
+            );
+        }
+    }
+    let threads = threads.max(1).min(ranges.len().max(1));
+    if threads <= 1 {
+        let mut hist = vec![0u32; nkeys];
+        count_query_ranges(&mut hist, fwd, rc, &ranges, shape, stride);
+        return Ok(hist);
+    }
+    let chunk = ranges.len().div_ceil(threads);
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let hs: Vec<_> = ranges
+            .chunks(chunk)
+            .map(|ch| {
+                s.spawn(move || {
+                    let mut h = vec![0u32; nkeys];
+                    count_query_ranges(&mut h, fwd, rc, ch, shape, stride);
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("query count worker panicked"))
+            .collect()
+    });
+    let mut out = vec![0u32; nkeys];
+    for p in &parts {
+        merge_hist(&mut out, p);
+    }
+    Ok(out)
+}
+
+/// Counts base k-mers over `ranges` (exclusive upper bounds, as [`chunks`]
+/// returns them), skipping window starts `j % stride != 0`.
+fn count_query_ranges(
+    hist: &mut [u32],
+    fwd: &[u8],
+    rc: &[u8],
+    ranges: &[(bool, u32, u32)],
+    shape: &Shape,
+    stride: u32,
+) {
+    for &(is_rc, lo, hi) in ranges {
+        let seq = if is_rc { rc } else { fwd };
+        for j in lo..hi {
+            if j % stride != 0 {
+                continue;
+            }
+            let k = shape.kmer_at(seq, j as usize);
+            if k != INVALID_KMER {
+                hist[k as usize] += 1;
+            }
+        }
+    }
+}
+
+/// Folds transition variants into reference weights (exact): each valid query
+/// window with base k-mer K scores `ref[K] + Σ_t ref[K ^ (2 << 2t)]` over the
+/// transition care positions — the same XOR mapping `push_seeds` emits — so
+/// the dot product over base query counts reproduces the pipeline's compact
+/// seed stream. `transitions=false` (`--notransition`) is the identity. u64:
+/// a 3 Gbp bin holds < 2^32 positions per key, but the 13-term sum can exceed
+/// u32 (up to 13× the bin length in the adversarial case).
+pub fn fold_transitions(ref_hist: &[u32], shape: &Shape, transitions: bool) -> Vec<u64> {
+    let mut out: Vec<u64> = ref_hist.iter().map(|&c| c as u64).collect();
+    if !transitions {
+        return out;
+    }
+    let n = out.len();
+    for t in 0..shape.kmer_size {
+        if !shape.transition[t] {
+            continue;
+        }
+        let flip = 2u32 << (2 * t);
+        for k in 0..n {
+            out[k] += ref_hist[(k as u32 ^ flip) as usize] as u64;
+        }
+    }
+    out
+}
+
+/// Row-major `r*Q+q` exact hit counts: each reference histogram is folded
+/// once, then dotted against every query histogram (base counts). One scoped
+/// worker per reference bin (R is small); the histogram passes above carry
+/// the thread budget.
+pub fn unit_hits(
+    ref_hists: &[Vec<u32>],
+    qry_hists: &[Vec<u32>],
+    shape: &Shape,
+    transitions: bool,
+) -> Vec<u64> {
+    let q = qry_hists.len();
+    if ref_hists.is_empty() || q == 0 {
+        return Vec::new();
+    }
+    let rows: Vec<Vec<u64>> = std::thread::scope(|s| {
+        let hs: Vec<_> = ref_hists
+            .iter()
+            .map(|rh| {
+                s.spawn(move || {
+                    let w = fold_transitions(rh, shape, transitions);
+                    qry_hists
+                        .iter()
+                        .map(|qh| w.iter().zip(qh.iter()).map(|(&a, &b)| a * b as u64).sum())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("dot worker panicked"))
+            .collect()
+    });
+    rows.into_iter().flatten().collect()
+}
+
 /// The `[i, e)` chunk bounds `seeder.cpp` walks for one interval. `end` is
 /// inclusive there, hence the `+ 1`.
 pub fn chunks(start: u32, end: u32, wga_chunk: u32) -> Vec<(u32, u32)> {

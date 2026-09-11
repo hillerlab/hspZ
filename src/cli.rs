@@ -36,14 +36,27 @@ pub(crate) enum Command {
     /// Run the C++ CUDA reference and this implementation back to back and
     /// compare runtime and HSP output.
     Compare(CompareArgs),
+    /// Exact per-unit seed-hit estimates before any GPU work (CPU-only).
+    HitsEstimate(HitsEstimateArgs),
 }
 
 #[derive(Args, Clone)]
 pub(crate) struct RunArgs {
     #[arg(short, long)]
     pub(crate) reference: PathBuf,
-    #[arg(short, long)]
-    pub(crate) query: PathBuf,
+    #[arg(
+        short,
+        long,
+        required_unless_present = "query_list",
+        conflicts_with = "query_list"
+    )]
+    pub(crate) query: Option<PathBuf>,
+    /// One query FASTA path per line (blank lines and `#` comments ignored).
+    /// Bin-major batch: one reference × many queries, W=1 only. All-or-nothing:
+    /// a failing job aborts the batch, so partial per-job outputs (and a
+    /// truncated `-Z` archive) may remain on disk.
+    #[arg(long, conflicts_with = "query")]
+    pub(crate) query_list: Option<PathBuf>,
     /// Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into.
     #[arg(short, long, default_value = ".")]
     pub(crate) output: PathBuf,
@@ -189,6 +202,9 @@ pub(crate) struct RunArgs {
     pub(crate) diagonal_partition: bool,
     /// Write output into one `.tar.gz` instead of a directory. Without a path,
     /// `<output>.tar.gz` is used. Archived directly from the formatted bytes.
+    /// In batch mode (`--query-list`) one archive per job is written
+    /// (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is
+    /// printed).
     #[arg(short = 'Z', long, num_args = 0..=1, default_missing_value = "-", require_equals = false)]
     pub(crate) tarball: Option<PathBuf>,
 }
@@ -252,6 +268,53 @@ pub(crate) struct CompareArgs {
     pub(crate) tuning: Tuning,
 }
 
+/// CPU-only exact seed-hit estimator (R92 PR1): same planning inputs as
+/// `run` (bins/blocks identical to what `run` would freeze), no CUDA.
+#[derive(Args, Clone)]
+pub(crate) struct HitsEstimateArgs {
+    #[arg(short, long)]
+    pub(crate) reference: PathBuf,
+    #[arg(short, long)]
+    pub(crate) query: PathBuf,
+    /// Target bin size in bases, as in `run` (`-B 0` resolves to the default).
+    #[arg(short = 'B', long, default_value_t = 500_000_000)]
+    pub(crate) seq_block_size: u32,
+    /// Bin target for the query side; defaults to `--seq-block-size`.
+    #[arg(long)]
+    pub(crate) query_block_size: Option<u32>,
+    /// Bin records the way KegAlign does (sequential fill, not LPT).
+    #[arg(long)]
+    pub(crate) kegalign_bins: bool,
+    /// 12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts (k<=12).
+    #[arg(long, default_value = "12of19")]
+    pub(crate) seed: String,
+    #[arg(short = 'e', long, default_value_t = 1)]
+    pub(crate) step: u32,
+    /// Don't allow one transition in a seed hit.
+    #[arg(long)]
+    pub(crate) notransition: bool,
+    /// plus / minus / both
+    #[arg(short = 'S', long, default_value = "both")]
+    pub(crate) strand: String,
+    /// Worker threads for histogram passes; 0 uses available parallelism.
+    #[arg(short, long, default_value_t = 0)]
+    pub(crate) threads: usize,
+    /// LASTZ interval size, as in `run` (`-I`): interval boundaries decide
+    /// which shared window starts the pipeline seeds once and which twice.
+    #[arg(short = 'I', long, default_value_t = 10_000_000)]
+    pub(crate) lastz_interval_size: u32,
+    /// Query seed chunk size, as in `run` (`-C`): the interval schedule
+    /// (`seed::chunks`) is part of the count, so this must match `run`.
+    #[arg(short = 'C', long, default_value_t = 250_000)]
+    pub(crate) wga_chunk_size: u32,
+    /// Count every S-th query window start and scale by S (approximation).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) stride: u32,
+    /// Write the plan's bin membership to this file and continue.
+    #[arg(long)]
+    pub(crate) dump_plan: Option<PathBuf>,
+}
+
 #[derive(Args, Clone)]
 pub(crate) struct Tuning {
     #[arg(short, long, default_value = "12of19")]
@@ -279,7 +342,7 @@ mod tests {
         {
             Command::Run(args) => {
                 assert_eq!(args.reference, PathBuf::from("r.fa"));
-                assert_eq!(args.query, PathBuf::from("q.fa"));
+                assert_eq!(args.query, Some(PathBuf::from("q.fa")));
                 assert_eq!(args.output, PathBuf::from("out"));
             }
             _ => panic!("wrong subcommand"),
@@ -312,5 +375,44 @@ mod tests {
             Command::Run(args) => assert_eq!(args.tarball, Some(PathBuf::from("o.tgz"))),
             _ => panic!("wrong subcommand"),
         }
+        // `--query-list` is mutually exclusive with `-q/--query`, and `-q`
+        // becomes optional so one of the two must be present.
+        assert!(
+            Cli::try_parse_from(["hspz", "run", "-r", "r.fa", "-o", "out"]).is_err(),
+            "one of -q/--query-list is required"
+        );
+        match Cli::try_parse_from([
+            "hspz",
+            "run",
+            "-r",
+            "r.fa",
+            "--query-list",
+            "q.txt",
+            "-o",
+            "out",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Run(args) => {
+                assert_eq!(args.query, None);
+                assert_eq!(args.query_list, Some(PathBuf::from("q.txt")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "hspz",
+                "run",
+                "-r",
+                "r.fa",
+                "-q",
+                "q.fa",
+                "--query-list",
+                "q.txt",
+            ])
+            .is_err(),
+            "-q and --query-list must conflict"
+        );
     }
 }
