@@ -5,10 +5,11 @@ GPU-accelerated high-scoring ungapped alignment pair backend
 Usage: hspZ <COMMAND>
 
 Commands:
-  run        Seed, extend and filter one reference/query pair
-  benchmark  Cold/warm benchmark: the optimization oracle (PLAN.md Milestone 3)
-  compare    Run the C++ CUDA reference and this implementation back to back and compare runtime and HSP output
-  help       Print this message or the help of the given subcommand(s)
+  run            Seed, extend and filter one reference/query pair
+  benchmark      Cold/warm benchmark: the optimization oracle (PLAN.md Milestone 3)
+  compare        Run the C++ CUDA reference and this implementation back to back and compare runtime and HSP output
+  hits-estimate  Exact per-unit seed-hit estimates before any GPU work (CPU-only)
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
@@ -20,13 +21,15 @@ $ hspZ run --help
 
 Seed, extend and filter one reference/query pair
 
-Usage: hspZ run [OPTIONS] --reference <REFERENCE> --query <QUERY>
+Usage: hspZ run [OPTIONS] --reference <REFERENCE>
 
 Options:
   -r, --reference <REFERENCE>
           
   -q, --query <QUERY>
           
+      --query-list <QUERY_LIST>
+          One query FASTA path per line (blank lines and `#` comments ignored). Bin-major batch: one reference × many queries, W=1 only. All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -96,7 +99,7 @@ Options:
   -D, --diagonal-partition
           Split each output file along its diagonal, KegAlign-style, emitting `*.split1.segments` onward instead of one file. Partitions the HSP structs directly — no unsplit file is written first
   -Z, --tarball [<TARBALL>]
-          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes
+          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes. In batch mode (`--query-list`) one archive per job is written (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is printed)
   -h, --help
           Print help
 
@@ -106,13 +109,15 @@ $ hspZ benchmark --help
 
 Cold/warm benchmark: the optimization oracle (PLAN.md Milestone 3)
 
-Usage: hspZ benchmark [OPTIONS] --reference <REFERENCE> --query <QUERY>
+Usage: hspZ benchmark [OPTIONS] --reference <REFERENCE>
 
 Options:
   -r, --reference <REFERENCE>
           
   -q, --query <QUERY>
           
+      --query-list <QUERY_LIST>
+          One query FASTA path per line (blank lines and `#` comments ignored). Bin-major batch: one reference × many queries, W=1 only. All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -182,7 +187,7 @@ Options:
   -D, --diagonal-partition
           Split each output file along its diagonal, KegAlign-style, emitting `*.split1.segments` onward instead of one file. Partitions the HSP structs directly — no unsplit file is written first
   -Z, --tarball [<TARBALL>]
-          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes
+          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes. In batch mode (`--query-list`) one archive per job is written (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is printed)
   -i, --iterations <ITERATIONS>
           Timed Seed + Filter iterations after the warmup [default: 20]
   -w, --warmup <WARMUP>
@@ -229,5 +234,45 @@ Options:
           [default: 3000]
   -c, --scoring <SCORING>
           
+  -h, --help
+          Print help
+
+------------------------------------------------------------------------------
+
+$ hspZ hits-estimate --help
+
+Exact per-unit seed-hit estimates before any GPU work (CPU-only)
+
+Usage: hspZ hits-estimate [OPTIONS] --reference <REFERENCE> --query <QUERY>
+
+Options:
+  -r, --reference <REFERENCE>
+          
+  -q, --query <QUERY>
+          
+  -B, --seq-block-size <SEQ_BLOCK_SIZE>
+          Target bin size in bases, as in `run` (`-B 0` resolves to the default) [default: 500000000]
+      --query-block-size <QUERY_BLOCK_SIZE>
+          Bin target for the query side; defaults to `--seq-block-size`
+      --kegalign-bins
+          Bin records the way KegAlign does (sequential fill, not LPT)
+      --seed <SEED>
+          12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts (k<=12) [default: 12of19]
+  -e, --step <STEP>
+          [default: 1]
+      --notransition
+          Don't allow one transition in a seed hit
+  -S, --strand <STRAND>
+          plus / minus / both [default: both]
+  -t, --threads <THREADS>
+          Worker threads for histogram passes; 0 uses available parallelism [default: 0]
+  -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
+          LASTZ interval size, as in `run` (`-I`): interval boundaries decide which shared window starts the pipeline seeds once and which twice [default: 10000000]
+  -C, --wga-chunk-size <WGA_CHUNK_SIZE>
+          Query seed chunk size, as in `run` (`-C`): the interval schedule (`seed::chunks`) is part of the count, so this must match `run` [default: 250000]
+      --stride <STRIDE>
+          Count every S-th query window start and scale by S (approximation) [default: 1]
+      --dump-plan <DUMP_PLAN>
+          Write the plan's bin membership to this file and continue
   -h, --help
           Print help

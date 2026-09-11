@@ -38,6 +38,31 @@ Every knob is exact: every mode produces the same HSP set and the same bytes.
 | `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array per seed batch (rollback only). |
 | `HSPZ_UNIT_PARTITION=auto\|0\|1` | `auto` | Splits the frozen plan's work units across workers by count quotas when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. |
 
+## Many queries against one reference
+
+`--query-list` runs every listed query FASTA in one process:
+
+```bash
+hspZ run \
+  --reference ref.2bit \
+  --query-list queries.txt \
+  --output OUT \
+  --gpus 1
+```
+
+`queries.txt` holds one query path per line (blank lines and `#` comments are
+ignored). Each reference bin is built and uploaded once instead of once per
+query, while every query keeps its own plan, cap, seed batches, dedup scopes
+and `-D` history, so its output under `OUT/000001/`, `OUT/000002/`, … is
+byte-identical to a standalone run. `-Z` writes one archive per job;
+`OUT/queries.tsv` maps job → path, size, sha256, blocks, units, HSPs and
+completion. A failing job aborts the batch (partial outputs may remain).
+
+In 0.0.6 batch mode requires W=1 (`--gpus 1`), all jobs must plan to identical
+reference bins, `-B 0` is rejected as a layout, and `--kegalign-bins` and
+`--from-manifest` are rejected. Bin-major order delays the first result: check
+`OUT/queries.tsv` rather than waiting on the first job directory.
+
 ## Choosing `-B`
 
 The default 500 Mbp preserves the KegAlign-matched one-GPU digest; hspZ never
