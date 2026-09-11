@@ -36,6 +36,26 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.6] — 2026-09-11
+
+One reference, many queries, and a CPU-only seed-hit estimator.
+
+- **One reference, many queries: `--query-list`.** `hspz run --reference ref.fa --query-list queries.txt --output OUT`
+  runs every listed query FASTA in one process: each reference bin is built and uploaded once instead of once per
+  query, while every query keeps its own plan, cap, seed batches, dedup scopes and `-D` history, so its output under
+  `OUT/000001/`, `OUT/000002/`, … is byte-identical to a standalone run (verified file for file on 100 queries).
+  `-Z` writes one archive per job; `OUT/queries.tsv` maps job → path, size, sha256, blocks, units, HSPs, completion.
+  Measured on an L4 against hg38: 100 queries of 5 Mbp took 10,400–11,600 s as separate runs and 1,890–1,900 s
+  batched (−82%); three 5 Mbp queries −62%; whole-chromosome queries (61–121 Mbp) −2.6% (GPU-bound); whole-genome
+  queries gain under 1%. This release: W=1 (`--gpus 1`), all jobs must plan to identical reference bins, `-B 0`,
+  `--kegalign-bins` and `--from-manifest` are rejected in batch mode, a failing job aborts the batch (partial outputs
+  may remain), dumps become per-job siblings (`out.manifest.000001`). Bin-major order delays the first result.
+- **`hspz hits-estimate` (CPU only).** Prints, before any GPU work, the exact number of seed hits each work unit
+  (reference bin × query block) will produce, from dense k-mer histograms with the transition variants folded in;
+  matches the `--time` ledger exactly (whole genome: 42 units, 6.12e12 hits). GPU time per unit is ~0.37 ns per hit on
+  a 4090, so the rows are the unit costs of a multi-GPU schedule. 56–62 s on 32 cores for hg38 × mm39 (10 GiB RSS);
+  `--stride N` samples the query side. A planning/diagnostic tool; `run` does not call it.
+
 ## [0.0.5] — 2026-09-10
 
 Unit-level static partitioning behind a device-class guard, with a per-unit ledger
