@@ -6,7 +6,8 @@ Usage: hspZ <COMMAND>
 
 Commands:
   run            Seed, extend and filter one reference/query pair
-  benchmark      Cold/warm benchmark: the optimization oracle (PLAN.md Milestone 3)
+  index          Write one reference's per-bin seed tables to an on-disk index
+  benchmark      Cold/warm benchmark: timed runs against wall clock
   compare        Run the C++ CUDA reference and this implementation back to back and compare runtime and HSP output
   hits-estimate  Exact per-unit seed-hit estimates before any GPU work (CPU-only)
   help           Print this message or the help of the given subcommand(s)
@@ -29,7 +30,7 @@ Options:
   -q, --query <QUERY>
           
       --query-list <QUERY_LIST>
-          One query FASTA path per line (blank lines and `#` comments ignored). Bin-major batch: one reference × many queries, W=1 only. All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
+          One query FASTA path per line (blank lines and `#` comments ignored). Batch: one reference × many queries, spread over `--gpus` workers by the same unit partition as single queries (a slot position never becomes a query-bin id). All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -81,17 +82,19 @@ Options:
       --from-manifest <FROM_MANIFEST>
           Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on (§Phase 5). Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one [default: 1]
+          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same workers over unit-partitioned `(job, unit)` slots [default: 1]
       --no-async-stages
           Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy
           Upload each batch's seeds with a blocking copy at the point of use. The default uploads on a second stream one batch ahead, so the DMA overlaps the previous batch's kernels: exposed `H->D seeds` 5,734 -> 72 ms on an L4. The overlap needs pinned staging and the persistent seed buffers, and turns itself off when either is missing (ZLUDA has no `cuMemHostAlloc`, and an async copy from pageable memory blocks anyway)
       --no-ref-prefetch
           Build each reference bin only when its turn comes. The default builds the next bin's pack + seed table on a worker thread while the current bin's work units run on the GPU; that build is the largest host cost the GPU cannot otherwise hide (7.1% of an L4 multi5 run)
+      --index <INDEX>
+          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The run still parses the reference and plans as usual, then requires the planned reference bins to equal the index's, or it errors naming the mismatch
   -y, --time
-          Report the full wall-time accounting (PLAN.md Milestone 2)
+          Report the full wall-time accounting
   -d, --hit-stats
-          Report the hits-per-seed distribution (PLAN.md Milestone 4)
+          Report the hits-per-seed distribution
   -u, --cpu-only
           Stop after CPU preprocessing and report seed/hit counts. Needs no GPU
       --dump-raw <DUMP_RAW>
@@ -105,9 +108,37 @@ Options:
 
 ------------------------------------------------------------------------------
 
+$ hspZ index --help
+
+Write one reference's per-bin seed tables to an on-disk index
+
+Usage: hspZ index [OPTIONS] --reference <REFERENCE> --index <INDEX>
+
+Options:
+  -r, --reference <REFERENCE>
+          Reference FASTA (or FASTA.gz / 2bit) to index
+      --index <INDEX>
+          Directory to write the index into. Required; must not exist yet (no --force: delete it or pick another path)
+  -s, --seed <SEED>
+          12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts [default: 12of19]
+  -e, --step <STEP>
+          [default: 1]
+  -B, --seq-block-size <SEQ_BLOCK_SIZE>
+          Target bin size in bases, as in `run` (`-B 0` rejected: the automatic layout is device-dependent and cannot be frozen into an index) [default: 500000000]
+      --kegalign-bins
+          Bin records the way KegAlign does — sequential fill in input order — instead of the balanced planner. Must match the `run` side
+  -t, --threads <THREADS>
+          Worker threads for seed generation; 0 uses available parallelism [default: 0]
+  -y, --time
+          Report per-bin build/write timings and payload sizes
+  -h, --help
+          Print help
+
+------------------------------------------------------------------------------
+
 $ hspZ benchmark --help
 
-Cold/warm benchmark: the optimization oracle (PLAN.md Milestone 3)
+Cold/warm benchmark: timed runs against wall clock
 
 Usage: hspZ benchmark [OPTIONS] --reference <REFERENCE>
 
@@ -117,7 +148,7 @@ Options:
   -q, --query <QUERY>
           
       --query-list <QUERY_LIST>
-          One query FASTA path per line (blank lines and `#` comments ignored). Bin-major batch: one reference × many queries, W=1 only. All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
+          One query FASTA path per line (blank lines and `#` comments ignored). Batch: one reference × many queries, spread over `--gpus` workers by the same unit partition as single queries (a slot position never becomes a query-bin id). All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -169,17 +200,19 @@ Options:
       --from-manifest <FROM_MANIFEST>
           Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on (§Phase 5). Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one [default: 1]
+          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same workers over unit-partitioned `(job, unit)` slots [default: 1]
       --no-async-stages
           Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy
           Upload each batch's seeds with a blocking copy at the point of use. The default uploads on a second stream one batch ahead, so the DMA overlaps the previous batch's kernels: exposed `H->D seeds` 5,734 -> 72 ms on an L4. The overlap needs pinned staging and the persistent seed buffers, and turns itself off when either is missing (ZLUDA has no `cuMemHostAlloc`, and an async copy from pageable memory blocks anyway)
       --no-ref-prefetch
           Build each reference bin only when its turn comes. The default builds the next bin's pack + seed table on a worker thread while the current bin's work units run on the GPU; that build is the largest host cost the GPU cannot otherwise hide (7.1% of an L4 multi5 run)
+      --index <INDEX>
+          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The run still parses the reference and plans as usual, then requires the planned reference bins to equal the index's, or it errors naming the mismatch
   -y, --time
-          Report the full wall-time accounting (PLAN.md Milestone 2)
+          Report the full wall-time accounting
   -d, --hit-stats
-          Report the hits-per-seed distribution (PLAN.md Milestone 4)
+          Report the hits-per-seed distribution
   -u, --cpu-only
           Stop after CPU preprocessing and report seed/hit counts. Needs no GPU
       --dump-raw <DUMP_RAW>
@@ -195,7 +228,7 @@ Options:
   -l, --launch-probe <LAUNCH_PROBE>
           Launches used to price ZLUDA's per-launch overhead [default: 200]
   -j, --json <JSON>
-          PLAN.md §6: append one JSON record per warm iteration to this file
+          Append one JSON record per warm iteration to this file
   -v, --variant <VARIANT>
           Variant label recorded in each JSON record (e.g. `nvidia-segment-align16`) [default: baseline]
   -k, --workload <WORKLOAD>

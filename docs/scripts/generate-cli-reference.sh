@@ -18,7 +18,7 @@ emit() {
 
 {
   emit ''
-  for command in run benchmark compare hits-estimate; do
+  for command in run index benchmark compare hits-estimate; do
     printf '\n%s\n\n' "$divider"
     emit "$command"
   done
