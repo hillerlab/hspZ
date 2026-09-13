@@ -5,11 +5,11 @@
 // Github : alejandrogzi
 // Email  : alejandrxgzi@gmail.com
 
-//! Where output goes: a directory of files, or one `.tar.gz`.
+//! Where output goes: a directory of files, or one `.tar.gz` (PLAN.md §18).
 //!
 //! Deliberately two implementations and no framework. `-Z` archives directly
 //! from the formatted bytes — it never writes files and re-reads them to tar
-//! them up, which is the whole point.
+//! them up, which is the whole point (PLAN.md §17).
 
 use crate::Fallible;
 use flate2::Compression;
@@ -23,7 +23,7 @@ pub trait OutputSink {
     fn write_entry(&mut self, name: &str, bytes: &[u8]) -> Fallible<()>;
     /// Flushes and closes. Must be called; `-Z` needs the tar trailer.
     fn finish(self: Box<Self>) -> Fallible<()>;
-    /// Total bytes handed to the sink, for the output report.
+    /// Total bytes handed to the sink, for the §22 report.
     fn bytes_in(&self) -> u64;
     /// Bytes actually landed on disk, which differs from `bytes_in` once
     /// compression is involved.
@@ -38,10 +38,7 @@ pub struct DirectorySink {
 impl DirectorySink {
     pub fn new(dir: &Path) -> Fallible<Self> {
         std::fs::create_dir_all(dir)?;
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            bytes: 0,
-        })
+        Ok(Self { dir: dir.to_path_buf(), bytes: 0 })
     }
 }
 
@@ -74,18 +71,14 @@ pub struct TarGzSink {
 }
 
 impl TarGzSink {
-    /// Default compression, not maximum — this is an output sink, not an
-    /// archival tool.
+    /// PLAN.md §20: default compression, not maximum — this is an output sink,
+    /// not an archival tool.
     pub fn new(path: &Path) -> Fallible<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
         }
         let gz = GzEncoder::new(BufWriter::new(File::create(path)?), Compression::default());
-        Ok(Self {
-            tar: tar::Builder::new(gz),
-            path: path.to_path_buf(),
-            bytes: 0,
-        })
+        Ok(Self { tar: tar::Builder::new(gz), path: path.to_path_buf(), bytes: 0 })
     }
 }
 
@@ -122,8 +115,8 @@ impl OutputSink for TarGzSink {
 mod tests {
     use super::*;
 
-    /// After extraction, `-Z` output must be byte-identical to the directory
-    /// output, and two archives of the same input must be identical.
+    /// PLAN.md §21: after extraction, `-Z` output must be byte-identical to the
+    /// directory output, and two archives of the same input must be identical.
     #[test]
     fn tar_round_trip_matches_directory_and_is_reproducible() {
         use std::io::Read;
@@ -134,10 +127,7 @@ mod tests {
         let big = vec![b'x'; 200_000];
         let files: Vec<(String, Vec<u8>)> = vec![
             ("tmp1.block0.r0.plus.segments".into(), big),
-            (
-                "tmp2.block0.r0.minus.segments".into(),
-                b"acgtacgt\n".to_vec(),
-            ),
+            ("tmp2.block0.r0.minus.segments".into(), b"acgtacgt\n".to_vec()),
             ("empty.segments".into(), Vec::new()),
         ];
 

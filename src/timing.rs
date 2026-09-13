@@ -12,11 +12,11 @@
 //! CUDA-event duration, which is what separates real GPU work from launch and
 //! synchronisation overhead.
 //!
-//! Timing and synchronisation are separated: `Stage::finish`
+//! Timing and synchronisation are separated since round 29: `Stage::finish`
 //! only records an end event and returns, and durations are resolved at the
 //! next genuine sync (`resolve_pending`). Phases that ran concurrently with
 //! another are marked `overlapped` — reported but excluded from the accounted
-//! total, so the table keeps balancing against wall clock.
+//! total, so the table keeps balancing against wall clock (rounds 11, 29).
 
 use std::time::Duration;
 
@@ -30,7 +30,7 @@ struct Row {
     has_gpu: bool,
     /// Ran concurrently with another phase, so it is reported but excluded from
     /// the accounted total — otherwise overlapped work would be counted twice
-    /// and the table would stop adding up to wall time.
+    /// and the table would stop adding up to wall time (PLAN.md §2/§14).
     overlapped: bool,
 }
 
@@ -51,7 +51,7 @@ pub struct Phases {
 impl Phases {
     /// Summed CUDA-event time across every stage that has events.
     ///
-    /// The executor reports this per worker. With 49 work units assigned by
+    /// Round 70: the executor reports this per worker. With 49 work units assigned by
     /// reference bin, 7 bins cannot split evenly across 2 workers (4/3) or 4 (2/2/2/1),
     /// and the sum over workers cannot show that — only the spread between them can.
     pub fn gpu_ms(&self) -> f64 {
@@ -120,11 +120,15 @@ impl Phases {
     /// Appends another set of phases, preserving its order.
     pub fn merge(&mut self, other: &Phases) {
         for r in &other.rows {
-            let dst = self.row(&r.name, r.has_gpu);
-            dst.host_ms += r.host_ms;
-            dst.gpu_ms += r.gpu_ms;
-            dst.calls = r.calls;
-            dst.overlapped = r.overlapped;
+            if let Some(i) = self.rows.iter().position(|x| x.name == r.name) {
+                self.rows[i].host_ms += r.host_ms;
+                self.rows[i].gpu_ms += r.gpu_ms;
+                self.rows[i].calls += r.calls;
+                self.rows[i].has_gpu |= r.has_gpu;
+                self.rows[i].overlapped |= r.overlapped;
+            } else {
+                self.rows.push(r.clone());
+            }
         }
     }
 
@@ -137,6 +141,15 @@ impl Phases {
             .map_or(0, |r| r.calls)
     }
 
+    /// Summed host ms for a named phase, or 0 when it never ran. The
+    /// per-worker attribution line reads host residuals through this.
+    pub fn ms(&self, name: &str) -> f64 {
+        self.rows
+            .iter()
+            .find(|r| r.name == name)
+            .map_or(0.0, |r| r.host_ms)
+    }
+
     pub fn total_ms(&self) -> f64 {
         self.rows
             .iter()
@@ -146,7 +159,7 @@ impl Phases {
     }
 
     /// The phase table as a JSON object body, for `benchmark --json`
-    /// Stage names are our own literals — no quotes or
+    /// (PLAN.md §6). Stage names are our own literals — no quotes or
     /// backslashes — so they need no escaping beyond what `json_key` does.
     pub fn json_stages(&self) -> String {
         let mut out = String::from("{");
@@ -224,7 +237,7 @@ impl Phases {
             "  {:<26} {:>9.2} {:>6.1}%\n",
             "total wall", wall_ms, 100.0
         ));
-        // The metric that decides whether removing host barriers
+        // Phase 1 §16: the metric that decides whether removing host barriers
         // helped. Summing the CUDA-event durations is exact per stage; stages that
         // genuinely overlap would double-count, but this pipeline is one stream.
         let gpu_ms: f64 = self.gpu_ms();
@@ -285,13 +298,13 @@ pub fn peak_rss_kib() -> u64 {
         .and_then(|s| {
             s.lines()
                 .find_map(|l| l.strip_prefix("VmHWM:"))
-                .and_then(|v| v.split_whitespace().next()?.parse().ok())
+                .and_then(|v| v.trim().split_whitespace().next()?.parse().ok())
         })
         .unwrap_or(0)
 }
 
 /// Available host memory in bytes, from the tightest cgroup v2 limit that governs
-/// this process, falling back to `/proc/meminfo` `MemAvailable`.
+/// this process, falling back to `/proc/meminfo` `MemAvailable` (Phase 1 §5).
 ///
 /// cgroup v2 exposes `memory.max` (hard OOM-kill limit) and `memory.high` (soft
 /// throttle); "available" is the tighter of the two minus `memory.current`, with
@@ -301,13 +314,14 @@ pub fn peak_rss_kib() -> u64 {
 /// The limit must be looked up on the process's **own** cgroup and its ancestors,
 /// not on the mount root: under Slurm the job lives in a nested cgroup, the root's
 /// `memory.max` reads "max", and reading only the root silently turns the preflight
-/// into a no-op on exactly the machines it exists to protect.
+/// into a no-op on exactly the machines it exists to protect (amendment C, one level
+/// deeper than stated).
 pub fn available_host_bytes() -> Option<u64> {
-    // Test/CI override: deterministic, no platform dependence.
-    if let Ok(v) = std::env::var("HSPZ_HOST_MEMORY_BYTES")
-        && let Ok(bytes) = v.parse::<u64>()
-    {
-        return Some(bytes);
+    // Test/CI override: deterministic, no platform dependence (Phase 1 §5).
+    if let Ok(v) = std::env::var("HSPZ_HOST_MEMORY_BYTES") {
+        if let Ok(bytes) = v.parse::<u64>() {
+            return Some(bytes);
+        }
     }
     let proc = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     // v2: one `0::<path>` line, unified hierarchy.
@@ -346,7 +360,7 @@ pub fn available_host_bytes() -> Option<u64> {
 /// The tightest `limit - current` over a cgroup and its ancestors.
 ///
 /// Split out from [`available_host_bytes`] so the parsing and the walk can be
-/// tested against a synthetic tree rather than a live node, and
+/// tested against a synthetic tree rather than a live node (amendment C), and
 /// parameterised by file names so one walker serves cgroup v1 and v2.
 fn cgroup_available(
     mount: &std::path::Path,
@@ -367,11 +381,11 @@ fn cgroup_available(
     let mut dir = mount.join(rel.trim_start_matches('/'));
     let mut best: Option<u64> = None;
     loop {
-        if let Some(current) = read(&dir, current_file)
-            && let Some(limit) = limit_files.iter().filter_map(|f| read(&dir, f)).min()
-        {
-            let free = limit.saturating_sub(current);
-            best = Some(best.map_or(free, |b: u64| b.min(free)));
+        if let Some(current) = read(&dir, current_file) {
+            if let Some(limit) = limit_files.iter().filter_map(|f| read(&dir, f)).min() {
+                let free = limit.saturating_sub(current);
+                best = Some(best.map_or(free, |b: u64| b.min(free)));
+            }
         }
         if dir == mount {
             break;
@@ -389,7 +403,7 @@ fn mem_available() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024);
         }
     }
@@ -400,7 +414,7 @@ fn mem_available() -> Option<u64> {
 mod tests {
     use super::*;
 
-    /// The limit that governs a Slurm job is on a *nested* cgroup,
+    /// Amendment C: the limit that governs a Slurm job is on a *nested* cgroup,
     /// so the walk must take the tightest `limit - current` over the whole chain.
     /// A root that reads "max" must not mask a job cgroup that reads 8 GiB.
     #[test]
@@ -492,6 +506,17 @@ mod tests {
         a.merge(&b);
         assert_eq!(a.total_ms(), 3.0);
         assert!(a.report(3.0).contains("kernel"));
+    }
+
+    #[test]
+    fn merge_adds_call_counts() {
+        let (mut a, mut b) = (Phases::new(), Phases::new());
+        a.add("kernel", Duration::from_millis(10));
+        a.add("kernel", Duration::from_millis(10));
+        b.add("kernel", Duration::from_millis(5));
+        a.merge(&b);
+        assert_eq!(a.calls("kernel"), 3);
+        assert_eq!(a.total_ms(), 25.0);
     }
 
     #[test]

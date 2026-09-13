@@ -10,9 +10,9 @@
 //! The script partitions an already-written `.segments` file: it reads the text
 //! back, parses coordinates, sorts, and rewrites the pieces. This does the same
 //! partitioning on the numeric [`Record`]s before anything is formatted
-//! so no unsplit file is ever created.
+//! (PLAN.md §9), so no unsplit file is ever created.
 //!
-//! Two deliberate differences from the script:
+//! Two deliberate differences from the script, both documented in PLAN.md §10:
 //!
 //! * **Sizes are exact.** The script estimates a file's line count as
 //!   `file_size / first_line_size`, because bytes are all it has. hspz knows the
@@ -80,7 +80,7 @@ impl Partitioner {
 
     /// The chunk size for a file of `count` HSPs, or `None` for "do not
     /// partition". Mirrors the script's `chunk_size < 0` estimation branch,
-    /// which is what `-D` selects (no size tuning on `-D` yet).
+    /// which is what `-D` selects (PLAN.md §25: no size tuning on `-D` yet).
     pub fn chunk_size_for(&self, count: usize) -> Option<usize> {
         if count < MIN_CHUNK_SIZE {
             return None;
@@ -139,12 +139,7 @@ pub fn split(recs: Vec<Record>, strand: char, chunk: usize) -> Vec<Vec<Record>> 
             query_order.push(*q);
         }
     }
-    let query_rank = |q: u32| {
-        query_order
-            .iter()
-            .position(|&x| x == q)
-            .unwrap_or(usize::MAX)
-    };
+    let query_rank = |q: u32| query_order.iter().position(|&x| x == q).unwrap_or(usize::MAX);
 
     // A single pair is always split: the script only builds skip_pairs when
     // there is more than one pair.
@@ -167,10 +162,6 @@ pub fn split(recs: Vec<Record>, strand: char, chunk: usize) -> Vec<Vec<Record>> 
         // Ascending by (count, pair), then greedy first-fit-by-order packing —
         // the script's `sorted([(len, pair)])` followed by its aggregation loop.
         skip.sort_by_key(|(k, v)| (v.len(), *k));
-        // the index is the partition number being filled
-        #[allow(clippy::needless_range_loop)]
-        // the tuple is the partition key; naming it would not make it clearer
-        #[allow(clippy::type_complexity)]
         let mut bins: Vec<Vec<((u32, u32), Vec<Record>)>> = vec![Vec::new()];
         let mut current = 0usize;
         for (key, group) in skip {
@@ -180,9 +171,7 @@ pub fn split(recs: Vec<Record>, strand: char, chunk: usize) -> Vec<Vec<Record>> 
                 bins.push(Vec::new());
                 current = group.len();
             }
-            bins.last_mut()
-                .expect("a bin always exists")
-                .push((key, group));
+            bins.last_mut().expect("a bin always exists").push((key, group));
         }
         for mut bin in bins {
             if bin.is_empty() {
@@ -219,10 +208,7 @@ mod tests {
         let c = rec(0, 0, 1, 1, 0); //    mids (1, 1):   sum   2, diff   0
         assert_eq!(c.diagonal_key('+').0, 2);
         assert_eq!(a.diagonal_key('+').0, b.diagonal_key('+').0, "sum key ties");
-        assert!(
-            a.diagonal_key('-').0 < c.diagonal_key('-').0,
-            "difference key orders"
-        );
+        assert!(a.diagonal_key('-').0 < c.diagonal_key('-').0, "difference key orders");
         assert!(c.diagonal_key('-').0 < b.diagonal_key('-').0);
     }
 
@@ -242,11 +228,7 @@ mod tests {
     #[test]
     fn without_history_the_cap_is_used_and_only_larger_files_split() {
         let p = Partitioner::default();
-        assert_eq!(
-            p.chunk_size_for(MAX_CHUNK_SIZE),
-            None,
-            "count <= chunk means whole"
-        );
+        assert_eq!(p.chunk_size_for(MAX_CHUNK_SIZE), None, "count <= chunk means whole");
         assert_eq!(p.chunk_size_for(MAX_CHUNK_SIZE + 1), Some(MAX_CHUNK_SIZE));
     }
 
@@ -302,7 +284,7 @@ mod tests {
         assert_eq!(before, after, "union must equal the input multiset");
     }
 
-    /// Execute the *actual* KegAlign `diagonal_partition.py`
+    /// PLAN.md §11/§14: execute the *actual* KegAlign `diagonal_partition.py`
     /// on the same records and require file-identical partition output. Skips
     /// silently when the oracle script or `bashlex` isn't available.
     #[test]
@@ -325,28 +307,12 @@ mod tests {
 
         const CHUNK: usize = 2500;
         let r_chrs = vec![
-            Chr {
-                name: "refA".into(),
-                start: 0,
-                len: 100_000,
-            },
-            Chr {
-                name: "refB".into(),
-                start: 0,
-                len: 100_000,
-            },
+            Chr { name: "refA".into(), start: 0, len: 100_000 },
+            Chr { name: "refB".into(), start: 0, len: 100_000 },
         ];
         let q_chrs = vec![
-            Chr {
-                name: "qryA".into(),
-                start: 0,
-                len: 100_000,
-            },
-            Chr {
-                name: "qryB".into(),
-                start: 0,
-                len: 100_000,
-            },
+            Chr { name: "qryA".into(), start: 0, len: 100_000 },
+            Chr { name: "qryB".into(), start: 0, len: 100_000 },
         ];
 
         // One big pair (refA, qryA) across several diagonals, and one small
@@ -357,13 +323,9 @@ mod tests {
             let len = 50 + (i % 10) as usize;
             let qs = 50 + (i / 2) as usize;
             recs.push(HspRecord {
-                r_chr: 0,
-                q_chr: 0,
-                r_start: rs,
-                r_end: rs + len,
-                q_start: qs,
-                q_end: qs + len,
-                score: 100,
+                r_chr: 0, q_chr: 0,
+                r_start: rs, r_end: rs + len,
+                q_start: qs, q_end: qs + len, score: 100,
             });
         }
         for i in 0..2000u32 {
@@ -371,13 +333,9 @@ mod tests {
             let len = 40 + (i % 5) as usize;
             let qs = 50 + i as usize;
             recs.push(HspRecord {
-                r_chr: 1,
-                q_chr: 1,
-                r_start: rs,
-                r_end: rs + len,
-                q_start: qs,
-                q_end: qs + len,
-                score: 100,
+                r_chr: 1, q_chr: 1,
+                r_start: rs, r_end: rs + len,
+                q_start: qs, q_end: qs + len, score: 100,
             });
         }
 
@@ -385,23 +343,15 @@ mod tests {
 
         let dir = std::env::temp_dir().join(format!("hspz-oracle-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(
-            dir.join("big.segments"),
-            render_records(&recs, &r_chrs, &q_chrs, '-'),
-        )
-        .unwrap();
+        std::fs::write(dir.join("big.segments"), render_records(&recs, &r_chrs, &q_chrs, '-'))
+            .unwrap();
 
         // A fixed chunk size (2500 > 0) bypasses the script's estimation branch,
         // making its output deterministic.
         let out = Command::new("python3")
             .arg(&script)
             .arg(CHUNK.to_string())
-            .args([
-                "--strand=minus",
-                "--segments=big.segments",
-                "--output=big.segments",
-                "big.err",
-            ])
+            .args(["--strand=minus", "--segments=big.segments", "--output=big.segments", "big.err"])
             .current_dir(&dir)
             .output()
             .expect("run oracle");

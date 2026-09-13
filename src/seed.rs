@@ -13,12 +13,13 @@
 //!     bucket `k` spans `index_table[k-1] .. index_table[k]`;
 //!   * `pos_table` — the reference positions, grouped by bucket.
 //!
-//! `SeedTable::build_parallel` is the two-pass, lock-free parallel builder:
-//! workers count into private tables, a two-level scan turns
+//! `SeedTable::build_parallel` is the two-pass, lock-free parallel builder
+//! (rounds 19–20): workers count into private tables, a two-level scan turns
 //! them into disjoint write cursors, and pass 2 rescans and scatters, so
 //! within-bucket order — which fixes `MAX_HITS` chunking — is preserved
 //! bit-for-bit. Query-side seeds are generated per work unit; the device-side
-//! seed kernels live in `gpu/kernels.rs` (`seed_kmers`/`scatter_seeds`).
+//! seed kernels live in `gpu/kernels.rs` (`seed_kmers`/`scatter_seeds`,
+//! round 68).
 
 use crate::sequence::{N_NT, nt_char_to_int};
 
@@ -181,8 +182,8 @@ impl SeedTable {
 
     /// [`build`](Self::build) across `threads` workers, byte-identical to it.
     ///
-    /// The serial builder is 11.4 s on hg38 chr1 — 10.1% of that run's wall
-    /// time and its largest CPU stage — which is what earned this.
+    /// PLAN.md M7. The serial builder is 11.4 s on hg38 chr1 — 10.1% of that
+    /// run's wall time and its largest CPU stage — which is what earned this.
     ///
     /// Two passes over the same strided seed-start sequence, no atomics, no
     /// locks, no final sort:
@@ -193,8 +194,8 @@ impl SeedTable {
     ///    worker a disjoint write cursor per k-mer, and each worker rescans its
     ///    own range and scatters positions directly.
     ///
-    /// Why the bucket order comes out identical (byte-identity, not just the
-    /// same multiset — hit order feeds `MAX_HITS` chunk boundaries,
+    /// Why the bucket order comes out identical (AM-B requires byte-identity,
+    /// not just the same multiset — hit order feeds `MAX_HITS` chunk boundaries,
     /// so a reordering would move HSPs without changing any count): worker
     /// ranges are contiguous and ascending in `i`, and for every k-mer worker
     /// `t`'s cursor region precedes worker `t+1`'s. Positions therefore land in
@@ -218,9 +219,8 @@ impl SeedTable {
         }
 
         let per = num_steps.div_ceil(threads);
-        let ranges: Vec<(usize, usize)> = (0..threads)
-            .map(|t| (t * per, ((t + 1) * per).min(num_steps)))
-            .collect();
+        let ranges: Vec<(usize, usize)> =
+            (0..threads).map(|t| (t * per, ((t + 1) * per).min(num_steps))).collect();
 
         // Pass 1: private counts per worker, indexed by kmer (no +1 shift yet).
         let counts: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -239,10 +239,7 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("seed count worker panicked"))
-                .collect()
+            handles.into_iter().map(|h| h.join().expect("seed count worker panicked")).collect()
         });
 
         // Prefix across workers, two-level so it does not become the new
@@ -255,9 +252,8 @@ impl SeedTable {
         // serially, then convert counts to absolute cursors in parallel.
         let nk = table_size - 1;
         let kper = nk.div_ceil(threads);
-        let kranges: Vec<(usize, usize)> = (0..threads)
-            .map(|c| (c * kper, ((c + 1) * kper).min(nk)))
-            .collect();
+        let kranges: Vec<(usize, usize)> =
+            (0..threads).map(|c| (c * kper, ((c + 1) * kper).min(nk))).collect();
 
         let chunk_totals: Vec<u64> = std::thread::scope(|scope| {
             let handles: Vec<_> = kranges
@@ -267,8 +263,6 @@ impl SeedTable {
                     scope.spawn(move || {
                         let mut sum = 0u64;
                         for c in counts.iter() {
-                            // the index is the k-mer position being accumulated
-                            #[allow(clippy::needless_range_loop)]
                             for k in lo..hi {
                                 sum += c[k] as u64;
                             }
@@ -277,10 +271,7 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().expect("prefix worker panicked"))
-                .collect()
+            handles.into_iter().map(|h| h.join().expect("prefix worker panicked")).collect()
         });
 
         let mut chunk_base = Vec::with_capacity(kranges.len());
@@ -300,10 +291,8 @@ impl SeedTable {
             // pointers exist only because the disjointness is by k while the
             // owning containers are indexed by t first.
             let idx_ptr = index_table.as_mut_ptr() as usize;
-            let cur_ptrs: Vec<usize> = cursors
-                .iter_mut()
-                .map(|c| c.as_mut_ptr() as usize)
-                .collect();
+            let cur_ptrs: Vec<usize> =
+                cursors.iter_mut().map(|c| c.as_mut_ptr() as usize).collect();
             std::thread::scope(|scope| {
                 for (ci, &(lo, hi)) in kranges.iter().enumerate() {
                     let cur_ptrs = &cur_ptrs;
@@ -354,10 +343,7 @@ impl SeedTable {
             }
         });
 
-        SeedTable {
-            index_table,
-            pos_table,
-        }
+        SeedTable { index_table, pos_table }
     }
 
     /// Number of reference hits for a seed — what `find_num_hits` computes.
@@ -421,8 +407,7 @@ pub fn chunk_seeds_parallel(
 /// The per-worker pieces of [`chunk_seeds_parallel`], before concatenation.
 ///
 /// Split out so a caller can concatenate straight into pinned host memory
-/// (into pinned host memory) instead of into a `Vec` it would then have to
-/// copy again. The
+/// (PLAN.md N1) instead of into a `Vec` it would then have to copy again. The
 /// pieces are in original position order, so concatenating them reproduces
 /// `chunk_seeds` exactly.
 pub fn chunk_seeds_parts(
@@ -454,10 +439,7 @@ pub fn chunk_seeds_parts(
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .map(|h| h.join().expect("seed worker panicked"))
-            .collect()
+        handles.into_iter().map(|h| h.join().expect("seed worker panicked")).collect()
     })
 }
 
@@ -477,10 +459,320 @@ pub fn concat_parts(parts: &[Vec<u64>], dst: &mut [u64]) -> usize {
 /// Worst-case seeds one chunk of `span` query positions can emit: every
 /// position yields the exact k-mer plus, with transitions on, one variant per
 /// care position. Used to size the pinned staging buffers once up front so the
-/// seed worker never allocates.
+/// seed worker never allocates (PLAN.md N1).
 pub fn max_seeds(span: u32, shape: &Shape, transitions: bool) -> usize {
     let per_pos = if transitions { 1 + shape.kmer_size } else { 1 };
     span as usize * per_pos
+}
+
+// ---------------------------------------------------------------------------
+// R92 PR1: exact per-unit seed-hit estimator (host histograms, no GPU).
+//
+// `hits(r,q) = Σ_key refcount_r[key] × qrycount_q[key]` over the pipeline's
+// compact seeds, equal to the `unit ledger:` hits column EXACTLY (u64). The
+// reference counts use the same strided starts as `SeedTable::build`; the
+// query counts use the same `kmer_at` validity over the same chunked LASTZ
+// interval schedule (`seed::chunks`) on both strands, counting base k-mers
+// only. Transition variants are folded into the reference side
+// (`fold_transitions`): each valid query window emits
+// its base k-mer plus one single-transition variant per transition care
+// position (`push_seeds`, identical XOR mapping), so dotting base query
+// counts against folded reference weights is exact.
+
+/// Dense-table guard: one `u32` table is `4^k` entries; `k > 12` needs 1 GiB+
+/// per table and is out of scope (12of19 default).
+pub fn estimator_table_size(shape: &Shape) -> Result<usize, String> {
+    if shape.kmer_size > 12 {
+        return Err(format!(
+            "hits-estimate needs k<=12 (dense 4^k table); seed has k={}",
+            shape.kmer_size
+        ));
+    }
+    Ok(1usize << (2 * shape.kmer_size))
+}
+
+/// Strided start sequence shared with `SeedTable::build`: positions
+/// `start + i*step` for `i in 0..num` over a block of `len` bases.
+fn ref_starts(len: usize, shape: &Shape, step: u32) -> (usize, usize) {
+    let step = step.max(1) as usize;
+    let offset = (shape.size + 1) % step;
+    let num = (len + offset).saturating_sub(shape.size) / step;
+    (step - offset, num)
+}
+
+/// Serial reference histogram over a packed block.
+pub fn count_ref_block(buf: &[u8], shape: &Shape, step: u32) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let mut hist = vec![0u32; nkeys];
+    for i in 0..num {
+        let k = shape.kmer_at(buf, start + i * step);
+        if k != INVALID_KMER {
+            hist[k as usize] += 1;
+        }
+    }
+    Ok(hist)
+}
+
+/// Adds `part` into `acc` (the histogram merge; counts commute).
+fn merge_hist(acc: &mut [u32], part: &[u32]) {
+    for (a, b) in acc.iter_mut().zip(part.iter()) {
+        *a += *b;
+    }
+}
+
+/// Parallel reference histogram: the step-index range is split into `threads`
+/// contiguous pieces, each counted into a private table, then summed.
+/// Exact — the same positions, the same `kmer_at`, addition commutes.
+pub fn count_ref_block_parallel(
+    buf: &[u8],
+    shape: &Shape,
+    step: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let threads = threads.max(1).min(num.max(1));
+    if threads <= 1 || num < 1 << 16 {
+        return count_ref_block(buf, shape, step as u32);
+    }
+    let per = num.div_ceil(threads);
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let hs: Vec<_> = (0..threads)
+            .map(|t| {
+                let (lo, hi) = (t * per, ((t + 1) * per).min(num));
+                s.spawn(move || {
+                    let mut h = vec![0u32; nkeys];
+                    for i in lo..hi {
+                        let k = shape.kmer_at(buf, start + i * step);
+                        if k != INVALID_KMER {
+                            h[k as usize] += 1;
+                        }
+                    }
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("ref count worker panicked"))
+            .collect()
+    });
+    let mut out = vec![0u32; nkeys];
+    for p in &parts {
+        merge_hist(&mut out, p);
+    }
+    Ok(out)
+}
+
+/// Key-sharded reference histogram (the alternative strategy, test-only):
+/// the key space is split into `threads` shards and every worker scans all
+/// positions, counting only keys in its shard — one final table, no merge,
+/// but `kmer_at` is recomputed per worker. Used by the strategy-comparison
+/// test; production uses the private-tables path above.
+#[cfg(test)]
+pub fn count_ref_block_sharded(
+    buf: &[u8],
+    shape: &Shape,
+    step: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    let (start, num) = ref_starts(buf.len(), shape, step);
+    let step = step.max(1) as usize;
+    let threads = threads.max(1).min(nkeys);
+    if threads <= 1 || num < 1 << 16 {
+        return count_ref_block(buf, shape, step as u32);
+    }
+    let kper = nkeys.div_ceil(threads);
+    let mut out = vec![0u32; nkeys];
+    {
+        let ptr = out.as_mut_ptr() as usize;
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let (lo, hi) = (t * kper, ((t + 1) * kper).min(nkeys));
+                s.spawn(move || {
+                    for i in 0..num {
+                        let k = shape.kmer_at(buf, start + i * step);
+                        if k != INVALID_KMER && (k as usize) >= lo && (k as usize) < hi {
+                            // SAFETY: shard `[lo,hi)` is disjoint across workers.
+                            unsafe { *(ptr as *mut u32).add(k as usize) += 1 };
+                        }
+                    }
+                });
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// Base-k-mer query histogram over one packed query bin: `fwd[..block_len]`
+/// plus its reverse complement `rc`, over the pipeline's LASTZ intervals on
+/// the strands `plus`/`minus` select. Counts base k-mers only (variants are
+/// folded on the reference side). `stride` S counts window starts `j % S == 0`
+/// only (S=1 is exact); `lastz_interval` is the pipeline's `-I` tiling and
+/// `wga_chunk` its `-C` chunk size. Interval ranges are split across `threads`
+/// workers with private tables, then merged.
+///
+/// The window starts are exactly the ones `seed_and_filter_all` batches: each
+/// interval is cut with [`chunks`] (whose exclusive upper bound includes the
+/// interval end only when the chunk walk does not land on it — an interval
+/// whose length is a multiple of `wga_chunk` leaves its end to the next
+/// interval), and the minus strand chunks its RC mirror
+/// `(qbl - end, qbl - start)`, whose own chunk alignment decides the mirror's
+/// duplicate windows. Counting raw interval ends as inclusive, as the first
+/// version of this estimator did, double-counts every shared endpoint.
+pub fn count_query_block(
+    fwd: &[u8],
+    rc: &[u8],
+    block_len: usize,
+    shape: &Shape,
+    plus: bool,
+    minus: bool,
+    lastz_interval: u32,
+    wga_chunk: u32,
+    stride: u32,
+    threads: usize,
+) -> Result<Vec<u32>, String> {
+    let nkeys = estimator_table_size(shape)?;
+    if block_len <= shape.size {
+        return Ok(vec![0u32; nkeys]);
+    }
+    let stride = stride.max(1);
+    let qbl = (block_len - shape.size) as u32;
+    let ivs = crate::sequence::intervals(block_len, shape.size, lastz_interval);
+    // (is_rc, lo, hi-exclusive) window-start ranges, exactly the pipeline's.
+    let mut ranges: Vec<(bool, u32, u32)> = Vec::new();
+    if plus {
+        for &(s, e) in &ivs {
+            ranges.extend(
+                chunks(s, e, wga_chunk)
+                    .into_iter()
+                    .map(|(lo, hi)| (false, lo, hi)),
+            );
+        }
+    }
+    if minus {
+        for &(s, e) in &ivs {
+            let (lo, hi) = (qbl - e, qbl - s);
+            ranges.extend(
+                chunks(lo, hi, wga_chunk)
+                    .into_iter()
+                    .map(|(l, h)| (true, l, h)),
+            );
+        }
+    }
+    let threads = threads.max(1).min(ranges.len().max(1));
+    if threads <= 1 {
+        let mut hist = vec![0u32; nkeys];
+        count_query_ranges(&mut hist, fwd, rc, &ranges, shape, stride);
+        return Ok(hist);
+    }
+    let chunk = ranges.len().div_ceil(threads);
+    let parts: Vec<Vec<u32>> = std::thread::scope(|s| {
+        let hs: Vec<_> = ranges
+            .chunks(chunk)
+            .map(|ch| {
+                s.spawn(move || {
+                    let mut h = vec![0u32; nkeys];
+                    count_query_ranges(&mut h, fwd, rc, ch, shape, stride);
+                    h
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("query count worker panicked"))
+            .collect()
+    });
+    let mut out = vec![0u32; nkeys];
+    for p in &parts {
+        merge_hist(&mut out, p);
+    }
+    Ok(out)
+}
+
+/// Counts base k-mers over `ranges` (exclusive upper bounds, as [`chunks`]
+/// returns them), skipping window starts `j % stride != 0`.
+fn count_query_ranges(
+    hist: &mut [u32],
+    fwd: &[u8],
+    rc: &[u8],
+    ranges: &[(bool, u32, u32)],
+    shape: &Shape,
+    stride: u32,
+) {
+    for &(is_rc, lo, hi) in ranges {
+        let seq = if is_rc { rc } else { fwd };
+        for j in lo..hi {
+            if j % stride != 0 {
+                continue;
+            }
+            let k = shape.kmer_at(seq, j as usize);
+            if k != INVALID_KMER {
+                hist[k as usize] += 1;
+            }
+        }
+    }
+}
+
+/// Folds transition variants into reference weights (exact): each valid query
+/// window with base k-mer K scores `ref[K] + Σ_t ref[K ^ (2 << 2t)]` over the
+/// transition care positions — the same XOR mapping `push_seeds` emits — so
+/// the dot product over base query counts reproduces the pipeline's compact
+/// seed stream. `transitions=false` (`--notransition`) is the identity. u64:
+/// a 3 Gbp bin holds < 2^32 positions per key, but the 13-term sum can exceed
+/// u32 (up to 13× the bin length in the adversarial case).
+pub fn fold_transitions(ref_hist: &[u32], shape: &Shape, transitions: bool) -> Vec<u64> {
+    let mut out: Vec<u64> = ref_hist.iter().map(|&c| c as u64).collect();
+    if !transitions {
+        return out;
+    }
+    let n = out.len();
+    for t in 0..shape.kmer_size {
+        if !shape.transition[t] {
+            continue;
+        }
+        let flip = 2u32 << (2 * t);
+        for k in 0..n {
+            out[k] += ref_hist[(k as u32 ^ flip) as usize] as u64;
+        }
+    }
+    out
+}
+
+/// Row-major `r*Q+q` exact hit counts: each reference histogram is folded
+/// once, then dotted against every query histogram (base counts). One scoped
+/// worker per reference bin (R is small); the histogram passes above carry
+/// the thread budget.
+pub fn unit_hits(
+    ref_hists: &[Vec<u32>],
+    qry_hists: &[Vec<u32>],
+    shape: &Shape,
+    transitions: bool,
+) -> Vec<u64> {
+    let q = qry_hists.len();
+    if ref_hists.is_empty() || q == 0 {
+        return Vec::new();
+    }
+    let rows: Vec<Vec<u64>> = std::thread::scope(|s| {
+        let hs: Vec<_> = ref_hists
+            .iter()
+            .map(|rh| {
+                s.spawn(move || {
+                    let w = fold_transitions(rh, shape, transitions);
+                    qry_hists
+                        .iter()
+                        .map(|qh| w.iter().zip(qh.iter()).map(|(&a, &b)| a * b as u64).sum())
+                        .collect::<Vec<u64>>()
+                })
+            })
+            .collect();
+        hs.into_iter()
+            .map(|h| h.join().expect("dot worker panicked"))
+            .collect()
+    });
+    rows.into_iter().flatten().collect()
 }
 
 /// The `[i, e)` chunk bounds `seeder.cpp` walks for one interval. `end` is
@@ -510,10 +802,7 @@ mod tests {
 
     #[test]
     fn kmer_packs_care_positions_only() {
-        assert!(
-            Shape::parse("101").is_err(),
-            "3 care positions is below the k-mer floor"
-        );
+        assert!(Shape::parse("101").is_err(), "3 care positions is below the k-mer floor");
         let s = Shape::parse("1111").unwrap();
         assert_eq!(s.kmer_at(b"ACGT", 0), 0b00_01_10_11);
         // A separator anywhere in the window invalidates it.
@@ -536,8 +825,8 @@ mod tests {
         assert!(out.iter().all(|o| o & 0xFFFF_FFFF == 7));
     }
 
-    /// The parallel builder must be byte-identical to the serial one for every
-    /// thread count, on both tables.
+    /// PLAN.md M8 + AM-B: the parallel builder must be byte-identical to the
+    /// serial one for every thread count, on both tables.
     ///
     /// `pos_table` order matters as much as its contents: within-bucket order is
     /// hit order, hit order sets `MAX_HITS` chunk boundaries, and those decide
@@ -647,10 +936,7 @@ mod tests {
 
     #[test]
     fn chunking_matches_seeder_loop() {
-        assert_eq!(
-            chunks(0, 376657, 250_000),
-            vec![(0, 250_000), (250_000, 376_658)]
-        );
+        assert_eq!(chunks(0, 376657, 250_000), vec![(0, 250_000), (250_000, 376_658)]);
         assert_eq!(chunks(0, 10, 250_000), vec![(0, 11)]);
     }
 }

@@ -8,7 +8,7 @@
 //! FASTA, FASTA.gz and 2bit readers, and the concatenated buffer layout
 //! KegAlign feeds to the GPU.
 //!
-//! Formats are detected by magic bytes and decode to the same
+//! Formats are detected by magic bytes (round 16) and decode to the same
 //! packed representation, so the input format never changes the HSP hash.
 //! KegAlign packs every record of a file into one buffer separated by a single
 //! `&` byte, then hands the GPU a *block* of that buffer. The trailing `&` of
@@ -101,13 +101,13 @@ pub struct Genome {
     /// Bytes of `buf` that make up block 0 — i.e. `buf.len()` minus the
     /// trailing separator.
     pub block_len: usize,
-    /// Which reader produced this, for the input report.
+    /// Which reader produced this, for the §1 input report.
     pub format: Format,
     /// On-disk size of the source file, so input throughput is reportable.
     pub bytes_read: u64,
 }
 
-/// Which reader a path needs.
+/// Which reader a path needs (PLAN.md §2).
 ///
 /// Chosen from magic bytes, never from the extension: a `.fa` that is really
 /// gzipped, or a `.2bit` named `.bin`, both still work. The extension only
@@ -125,9 +125,7 @@ impl Format {
     pub fn detect(path: &Path) -> Result<Self, String> {
         let mut head = [0u8; 4];
         let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let n = f
-            .read(&mut head)
-            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = f.read(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
         if n >= 4 {
             let be = u32::from_be_bytes(head);
             let le = u32::from_le_bytes(head);
@@ -152,11 +150,11 @@ impl Format {
 
 /// Reads a 2bit file into the same `(name, bases)` records a FASTA yields.
 ///
-/// Soft masks must survive, so `enable_softmask(true)` is mandatory — without
-/// it every base comes back uppercase and the seeding alphabet silently changes
-/// (lowercase kills a seed, uppercase does not).
+/// PLAN.md §6: soft masks must survive, so `enable_softmask(true)` is
+/// mandatory — without it every base comes back uppercase and the seeding
+/// alphabet silently changes (lowercase kills a seed, uppercase does not).
 /// Record order is the file's own index order, which `chrom_names()` preserves;
-/// that order is load-bearing because the `&` separator, the chr table and
+/// §1 makes that order load-bearing because the `&` separator, the chr table and
 /// interval chunking all depend on it.
 fn read_2bit(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut tb = twobit::TwoBitFile::open(path)
@@ -175,7 +173,7 @@ fn read_2bit(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Packs records into the single buffer the engine consumes: bases joined by
 /// `SEP`, with a trailing separator present in the buffer but excluded from
-/// `block_len`.
+/// `block_len` (PLAN.md §9.2 / AM-A2).
 ///
 /// Extracted as a free function precisely so a bin and a whole genome cannot
 /// drift apart: `Genome::load` and `PackedBin` both call this, so byte-identity
@@ -190,17 +188,15 @@ pub fn pack<'a>(
     let mut chrs = Vec::new();
     let mut block_len: usize = 0;
     for (name, seq) in records {
-        chrs.push(Chr {
-            name: format!("{prefix}{name}"),
-            start: buf.len(),
-            len: seq.len() as u32,
-        });
+        chrs.push(Chr { name: format!("{prefix}{name}"), start: buf.len(), len: seq.len() as u32 });
         buf.extend_from_slice(seq);
         block_len += seq.len();
         buf.push(SEP);
         block_len += 1;
     }
-    block_len = block_len.saturating_sub(1);
+    if block_len > 0 {
+        block_len -= 1; // the last '&' is in the buffer but not in the block
+    }
     (buf, chrs, block_len)
 }
 
@@ -220,21 +216,15 @@ pub fn reverse_complement(buf: &[u8], chrs: &[Chr], block_len: usize) -> (Vec<u8
     let rc_chrs = chrs
         .iter()
         .rev()
-        .map(|c| Chr {
-            name: c.name.clone(),
-            start: n - c.start - c.len as usize,
-            len: c.len,
-        })
+        .map(|c| Chr { name: c.name.clone(), start: n - c.start - c.len as usize, len: c.len })
         .collect();
     (rc, rc_chrs)
 }
 
 /// Reads a file into its raw `(name, bases)` records, format and byte count,
-/// without packing or any block-size guard. The multi-block
+/// without packing or any block-size guard (PLAN.md §9/§10). The multi-block
 /// executor needs the records themselves so it can bin them; [`Genome::load`]
 /// is the single-block wrapper that packs and enforces the old guard.
-// (format, records, bytes) is the reader's return, documented at the fn
-#[allow(clippy::type_complexity)]
 pub fn read_records(path: &Path) -> Result<(Format, Vec<(String, Vec<u8>)>, u64), String> {
     let format = Format::detect(path)?;
     let records = match format {
@@ -249,19 +239,17 @@ impl Genome {
     /// Loads FASTA, gzipped FASTA or 2bit — whichever the magic bytes say.
     ///
     /// Returns an error when the input would spill into a second block, which
-    /// v1 does not implement — block/interval partitioning of the reference is
-    /// part of the KegAlign runner, not Seed+Filter.
+    /// v1 does not implement (see PLAN.md §14 — block/interval partitioning of
+    /// the reference is part of the KegAlign runner, not Seed+Filter).
     pub fn load(path: &Path, prefix: &str, seq_block_size: u32) -> Result<Self, String> {
         let (format, records, bytes_read) = read_records(path)?;
 
-        let (buf, chrs, block_len) = pack(
-            records.iter().map(|(n, s)| (n.as_str(), s.as_slice())),
-            prefix,
-        );
+        let (buf, chrs, block_len) =
+            pack(records.iter().map(|(n, s)| (n.as_str(), s.as_slice())), prefix);
         if block_len > seq_block_size as usize {
-            // This guard stays until the multi-block executor is the selected
-            // path; removing it earlier would swap a clear message for a host
-            // OOM or a doomed single-block run.
+            // PLAN.md §9.12: this guard stays until the multi-block executor is
+            // the selected path; removing it earlier would swap a clear message
+            // for a host OOM or a doomed single-block run.
             return Err(format!(
                 "{} exceeds one sequence block ({} > {} bytes); multi-block input is out of \
                  scope for v1 — raise --seq_block_size",
@@ -281,7 +269,8 @@ impl Genome {
     }
 
     /// FNV-1a hash of everything the core consumes from this genome: the record
-    /// order, every name, every base including case, and the block length.
+    /// order, every name, every base including case, and the block length
+    /// (PLAN.md §3 / AM-7).
     ///
     /// This is what makes a reader bug attributable. If FASTA, gzipped FASTA and
     /// 2bit disagree, the hash differs *here*, before any GPU work, so a lost
@@ -339,10 +328,10 @@ pub fn intervals(block_len: usize, seed_size: usize, interval_size: u32) -> Vec<
 /// Reads by block and splits on newlines in place. The obvious
 /// `BufReader::lines()` version allocated a `String` per line — ~1.1 M of them
 /// for an hg38 chromosome — and ran at ~350 MB/s; this one does no per-line
-/// allocation. Input loading measured 2.3% of a cold run and 0% of warm (it
-/// happens once, outside the benchmark loop), so an mmap specialization cannot
-/// be earned here — this version is strictly *less* code than what it
-/// replaces.
+/// allocation. PLAN.md §4's gate put input at 2.3% of a cold run and 0% of warm
+/// (it happens once, outside the benchmark loop), so that gate also says an
+/// mmap specialization (candidate D) cannot be earned here — this is candidate
+/// E, which is strictly *less* code than what it replaces.
 fn read_fasta(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let err = |e: std::io::Error| format!("{}: {e}", path.display());
     let file = File::open(path).map_err(err)?;
@@ -405,8 +394,8 @@ fn push_line(line: &[u8], records: &mut Vec<(String, Vec<u8>)>) {
         // line that really does carry interior whitespace. It matters because `Filter`'s
         // `size_hint` is `(0, Some(n))`, so `extend` cannot reserve and pushes one byte at a
         // time with a capacity check each — 3.03 billion of them for hg38. Measured on the
-        // real assembly: parse 6.07 s -> 3.51 s here, 2.75 s with the memchr scan
-        // below, records byte-identical.
+        // real assembly (round 77): parse 6.07 s -> 3.51 s here, 2.75 s with the memchr
+        // scan below, records byte-identical.
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.iter().any(|b| b.is_ascii_whitespace()) {
             seq.extend(line.iter().copied().filter(|b| !b.is_ascii_whitespace()));
@@ -426,10 +415,7 @@ mod tests {
         for (a, b) in [(b'A', b'T'), (b'C', b'G'), (b'G', b'C'), (b'T', b'A')] {
             assert_eq!(REV_COMP[a as usize], b);
         }
-        assert_eq!(
-            REV_COMP[SEP as usize], SEP,
-            "separators must survive revcomp"
-        );
+        assert_eq!(REV_COMP[SEP as usize], SEP, "separators must survive revcomp");
         assert_eq!(REV_COMP[b'a' as usize], b't', "soft-masking is preserved");
         assert_eq!(REV_COMP[b'N' as usize], b'N');
     }
@@ -445,16 +431,8 @@ mod tests {
     #[test]
     fn chr_lookup_is_upper_bound_minus_one() {
         let chrs = vec![
-            Chr {
-                name: "a".into(),
-                start: 0,
-                len: 10,
-            },
-            Chr {
-                name: "b".into(),
-                start: 11,
-                len: 10,
-            },
+            Chr { name: "a".into(), start: 0, len: 10 },
+            Chr { name: "b".into(), start: 11, len: 10 },
         ];
         assert_eq!(chr_at(&chrs, 0), 0);
         assert_eq!(chr_at(&chrs, 10), 0); // the separator belongs to the left chr
@@ -462,14 +440,14 @@ mod tests {
         assert_eq!(chr_at(&chrs, 20), 1);
     }
 
-    /// The invariant: FASTA, FASTA.gz and 2bit must load to the
+    /// The PLAN.md §3 invariant: FASTA, FASTA.gz and 2bit must load to the
     /// identical SequenceSet (record order, names, case, Ns). The `.2bit` is
     /// hand-encoded against the UCSC spec, so the reader is tested against the
     /// real file format rather than the crate's own writer.
     #[test]
     fn three_formats_load_to_the_same_sequence_set() {
-        use flate2::Compression;
         use flate2::write::GzEncoder;
+        use flate2::Compression;
         use std::io::Write;
 
         let records = vec![
@@ -495,10 +473,7 @@ mod tests {
 
         let gz_path = dir.join("x.fa.gz");
         {
-            let mut enc = GzEncoder::new(
-                std::fs::File::create(&gz_path).unwrap(),
-                Compression::default(),
-            );
+            let mut enc = GzEncoder::new(std::fs::File::create(&gz_path).unwrap(), Compression::default());
             enc.write_all(fa.as_bytes()).unwrap();
             enc.finish().unwrap();
         }
@@ -516,11 +491,7 @@ mod tests {
             assert_eq!(g.buf, expected_buf, "{label}: plain FASTA buf");
             assert_eq!(other.buf, expected_buf, "{label}: buf differs from FASTA");
             assert_eq!(other.block_len, g.block_len, "{label}: block_len");
-            assert_eq!(
-                other.digest(),
-                g.digest(),
-                "{label}: SequenceSet digest differs"
-            );
+            assert_eq!(other.digest(), g.digest(), "{label}: SequenceSet digest differs");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -555,10 +526,7 @@ mod tests {
         // One record: seqLen u32 + nBlockCount u32 + (start,size) pairs +
         // mBlockCount u32 + (start,size) pairs + reserved u32 + bases.
         let rec_len = |_name: &str, seq: &[u8]| -> u32 {
-            (4 + 4
-                + 8 * n_blocks(seq).len()
-                + 4
-                + 8 * mask_blocks(seq).len()
+            (4 + 4 + 8 * n_blocks(seq).len() + 4 + 8 * mask_blocks(seq).len()
                 + 4
                 + seq.len().div_ceil(4)) as u32
         };
@@ -639,4 +607,5 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&file).unwrap();
     }
+
 }

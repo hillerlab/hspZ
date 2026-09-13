@@ -36,6 +36,114 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.6] — 2026-09-11
+
+One reference, many queries, and a CPU-only seed-hit estimator.
+
+- **One reference, many queries: `--query-list`.** `hspz run --reference ref.fa --query-list queries.txt --output OUT`
+  runs every listed query FASTA in one process: each reference bin is built and uploaded once instead of once per
+  query, while every query keeps its own plan, cap, seed batches, dedup scopes and `-D` history, so its output under
+  `OUT/000001/`, `OUT/000002/`, … is byte-identical to a standalone run (verified file for file on 100 queries).
+  `-Z` writes one archive per job; `OUT/queries.tsv` maps job → path, size, sha256, blocks, units, HSPs, completion.
+  Measured on an L4 against hg38: 100 queries of 5 Mbp took 10,400–11,600 s as separate runs and 1,890–1,900 s
+  batched (−82%); three 5 Mbp queries −62%; whole-chromosome queries (61–121 Mbp) −2.6% (GPU-bound); whole-genome
+  queries gain under 1%. This release: W=1 (`--gpus 1`), all jobs must plan to identical reference bins, `-B 0`,
+  `--kegalign-bins` and `--from-manifest` are rejected in batch mode, a failing job aborts the batch (partial outputs
+  may remain), dumps become per-job siblings (`out.manifest.000001`). Bin-major order delays the first result.
+- **`hspz hits-estimate` (CPU only).** Prints, before any GPU work, the exact number of seed hits each work unit
+  (reference bin × query block) will produce, from dense k-mer histograms with the transition variants folded in;
+  matches the `--time` ledger exactly (whole genome: 42 units, 6.12e12 hits). GPU time per unit is ~0.37 ns per hit on
+  a 4090, so the rows are the unit costs of a multi-GPU schedule. 56–62 s on 32 cores for hg38 × mm39 (10 GiB RSS);
+  `--stride N` samples the query side. A planning/diagnostic tool; `run` does not call it.
+
+## [0.0.5] — 2026-09-10
+
+Unit-level static partitioning behind a device-class guard, with a per-unit ledger
+and emitter-side receiver checks. Output bytes are unchanged.
+
+- **Unit-level static partition (default on for matching GPUs).** With two or more
+  GPUs the frozen plan's work units are now split across workers by count quotas
+  (whole bins first, then contiguous query slices of as few bins as possible, one
+  extra reference build per split bin) instead of whole-bin ownership, when every
+  device the run uses is the same class (equal SM count and L2, nominal clocks
+  within 10%) and each worker has its own device. Output bytes are unchanged.
+  Measured on canonical hg38 × mm39 at `MAX_HITS=16,711,680`: seed-and-filter
+  wall **−11.9%** on 2× RTX 4090 (1,400 → 1,233 s) and **−5.1%** on 4× RTX 4090
+  (718 → 681 s), identical output. `HSPZ_UNIT_PARTITION=0` restores whole-bin
+  ownership, `1` forces the partition; W=1, time-sliced workers and mixed device
+  classes keep whole-bin ownership. The static-attribute guard cannot detect
+  same-model cards with different sustained clocks (on such a pair the balance
+  depends on device order).
+- **Per-unit ledger.** `--time` prints one `unit ledger:` row per work unit
+  (worker, device, bins, bp, GPU ms, host start/end, pack/swap ms, seeds, hits,
+  raw/final HSPs) plus per-worker finish/busy lines, and every run prints
+  `schedule:` lines with the policy, its reason, and each worker's visits.
+- **Receiver checks.** The emitter now rejects duplicate or out-of-plan work units
+  and verifies completeness after joining the workers, reporting a worker's own
+  error first.
+- **Automatic layout (`-B 0`, opt-in measurement tool).** `-B 0` resolves a
+  count-balanced layout for the current machine instead of the fixed 500 Mbp
+  default; it changes the HSP set (a different frozen plan), so measure per machine
+  before adopting it (a 2× T4 screen was 17–22% slower than the default). At `--gpus W ≥ 2` the reference
+  takes `R = min(records, ceil(R_default/W)·W)` LPT-balanced bins, and the query
+  collapses to one bin when the whole query fits both the per-worker device budget
+  and the host preflight (an explicit `--query-block-size` is honoured); `W=1`
+  resolves to exactly the 500 Mbp plan, and a candidate that fails the final fit
+  falls back to the default policy rather than erroring. Resolved sizes are stored
+  in the manifest/`--dump-plan`, and one `layout: auto W=…` line prints the flags
+  that reproduce them. `-B 0` with `--kegalign-bins` is an error.
+  `HSPZ_LAYOUT_FORCE_WORKERS` exercises the W≥2 path on one device.
+- **Diagnostics.** The ref-buckets autotune drops and restarts an OFF block that
+  reaches twice the block span with fewer than four settled chunks (an
+  inconclusive ON block decides OFF, with a ledger line). `--time` attributes
+  gap pairs per worker, counts the >1 s transitions the gap accounting discards,
+  and totals the host phases (query pack, swap, chunk prep, seed table,
+  standalone reference prep).
+
+## [0.0.4] — 2026-09-09
+
+Two exact speed-ups, both byte-identical to 0.0.3 on every device tested (NVIDIA L4,
+RTX 4090, AMD via ZLUDA), plus the foundation repairs behind them.
+
+- **Reference-locality bucketing (`ref-loc-buckets`, default feature).** Between
+  `find_hits` and the score gate, each hit chunk is stably reordered into
+  reference-address buckets so consecutive warps gather from an L2-resident
+  reference window; survivors are restored to their original order before
+  `find_hsps`, so the HSP set and file bytes are unchanged. On a 72 W L4 the
+  lower DRAM traffic lets the SM clock rise (1142 → 1370 MHz) and the whole-genome
+  wall falls **6.5%** (hg38 × mm39, one GPU, disjoint reversed pairs). Cards that
+  already run near their boost clock pay the bucketing pass instead (RTX 4090:
+  +3.7%), so the choice is made at runtime: `HSPZ_REF_BUCKETS` unset means `auto`
+  — each engine alternates both paths in blocks of ≥3 s of gate time, discards
+  each block's first second, and commits to the faster settled path (L4 → on,
+  4090 → off, measured). `1`/`0` force a path; `HSPZ_REF_BUCKET_SHIFT=<16..31>`
+  pins the window size; cards whose L2 cannot hold the smallest window (T4) stay
+  off. `--time` prints the per-block measurements and the decision per engine.
+  The window budget is three quarters of the L2: on an L4 that selects the
+  32 MiB window, measured 2.8–3.0% less GPU time than 16 MiB on two whole-genome
+  work units and 2.75% less wall on the full hg38 × mm39 run (9,877 vs 10,156 s),
+  with identical output.
+- **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits`
+  used to copy its whole cumulative hit array to the host (~6.8 MB, pageable) to
+  locate two or three chunk boundaries. The walk now fetches only the ≤1 KB block
+  holding each boundary, producing the same chunks. On two RTX 4090s at whole
+  genome this is **−9.6%** wall (1,634 → 1,480 s, disjoint reversed pairs); on
+  an L4 the copy was hidden under the gate, so nothing changes.
+  `HSPZ_CHUNK_WALK=full` restores the old path.
+- **Foundations.** The `--max-hits` target (semantic, decides chunk boundaries and
+  therefore output) is now separated from the physical hit capacity derived from
+  free VRAM (decides success or failure only); the historical over-cap tail that
+  aborted whole-genome runs is admitted without changing any chunk. `--dump-plan`
+  / `--dump-manifest` / `--from-manifest` freeze and replay a plan (a second node
+  validates fit and fails rather than replanning). The `--time` ledger gained
+  query-pack / swap timers, per-worker GPU-busy and stage-gap notes, and an
+  explicit host-memory budget line. Multi-GPU output is byte-identical to the
+  one-GPU output at the same plan and cap.
+- **Measured but not shipped** (recorded so nobody repeats them): certified
+  query-context rejection (0.19% of hits), nibble-packed reference at genome
+  scale (+0.1%), a 64 M hit cap (+1%), per-chunk and paired-chunk autotuning of
+  the bucketing pass (both misread the clock-mediated L4 win).
+
 ## [0.0.3] — 2026-08-21
 
 Warp-per-seed `find_hits` for dense launches, on by default.

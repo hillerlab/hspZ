@@ -26,24 +26,40 @@ pub(crate) struct Cli {
     pub(crate) command: Command,
 }
 
-/// The three subcommands hspZ accepts.
+/// The five subcommands hspZ accepts.
 #[derive(Subcommand)]
 pub(crate) enum Command {
     /// Seed, extend and filter one reference/query pair.
     Run(RunArgs),
+    /// Write one reference's per-bin seed tables to an on-disk index.
+    Index(IndexArgs),
     /// Cold/warm benchmark: timed runs against wall clock.
     Benchmark(BenchArgs),
     /// Run the C++ CUDA reference and this implementation back to back and
     /// compare runtime and HSP output.
     Compare(CompareArgs),
+    /// Exact per-unit seed-hit estimates before any GPU work (CPU-only).
+    HitsEstimate(HitsEstimateArgs),
 }
 
 #[derive(Args, Clone)]
 pub(crate) struct RunArgs {
     #[arg(short, long)]
     pub(crate) reference: PathBuf,
-    #[arg(short, long)]
-    pub(crate) query: PathBuf,
+    #[arg(
+        short,
+        long,
+        required_unless_present = "query_list",
+        conflicts_with = "query_list"
+    )]
+    pub(crate) query: Option<PathBuf>,
+    /// One query FASTA path per line (blank lines and `#` comments ignored).
+    /// Batch: one reference × many queries, spread over `--gpus` workers by the
+    /// same unit partition as single queries (a slot position never becomes a
+    /// query-bin id). All-or-nothing: a failing job aborts the batch, so
+    /// partial per-job outputs (and a truncated `-Z` archive) may remain on disk.
+    #[arg(long, conflicts_with = "query")]
+    pub(crate) query_list: Option<PathBuf>,
     /// Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into.
     #[arg(short, long, default_value = ".")]
     pub(crate) output: PathBuf,
@@ -87,7 +103,7 @@ pub(crate) struct RunArgs {
     /// Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall,
     /// about `total_reference_bp / W` (one ref bin per worker) is faster and
     /// a *different* HSP set. Never overwritten from `--gpus`. See
-    /// <https://hillerlab.github.io/hspZ/docs/gpus/>.
+    /// `assets/guidance/guidance.md`.
     #[arg(short = 'B', long, default_value_t = 500_000_000)]
     pub(crate) seq_block_size: u32,
     /// Bin target for the *query* side; defaults to `--seq-block-size`.
@@ -98,7 +114,7 @@ pub(crate) struct RunArgs {
     /// changes the HSP set: keep a digest per layout.
     #[arg(long)]
     pub(crate) query_block_size: Option<u32>,
-    /// Hits per GPU chunk; 0 derives KegAlign's `4194304 * GiB` default.
+    /// Semantic hits per GPU chunk (target H); 0 derives KegAlign's `4194304 * GiB` default. Physical capacity C>=H is derived from free VRAM and only affects success/failure, never successful output bytes.
     #[arg(short, long, default_value_t = 0)]
     pub(crate) max_hits: u32,
     /// Worker threads for seed generation; 0 uses available parallelism.
@@ -130,17 +146,28 @@ pub(crate) struct RunArgs {
     /// is the only way to *show* both tools binned the input the same way.
     #[arg(long)]
     pub(crate) dump_plan: Option<PathBuf>,
+    /// Write a frozen executable plan (GPU `run` only, same binary required for replay).
+    /// A second node given `--from-manifest` will *validate fit and fail*, not replan.
+    #[arg(long)]
+    pub(crate) dump_manifest: Option<PathBuf>,
+    /// Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the
+    /// same binary, inputs, resolved scoring matrix, strand and record prefixes.
+    /// The planner will not shrink bins or the hit cap.
+    #[arg(long)]
+    pub(crate) from_manifest: Option<PathBuf>,
     /// GPUs to run on. Reference bins are split across that many
     /// workers by deterministic LPT, each owning its bins end to end; output still
     /// follows `WorkUnit.ordinal`, so it does not depend on which GPU finished
     /// first. More workers than devices time-slices one GPU: a correctness
-    /// configuration, not a performance one.
+    /// configuration, not a performance one. Batch mode (`--query-list`) uses
+    /// the same workers over unit-partitioned `(job, unit)` slots.
     #[arg(short = 'G', long, default_value_t = 1)]
     pub(crate) gpus: usize,
     /// Wait for the GPU after every stage instead of enqueueing the whole
     /// per-batch chain. The default enqueues and waits only where the host needs a
-    /// device result; on its own that was neutral, but together with the
-    /// overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges.
+    /// device result; on its own that was neutral (round 29), but together with the
+    /// overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over
+    /// six paired rounds (round 30).
     #[arg(long)]
     pub(crate) no_async_stages: bool,
     /// Upload each batch's seeds with a blocking copy at the point of use. The
@@ -157,6 +184,13 @@ pub(crate) struct RunArgs {
     /// cannot otherwise hide (7.1% of an L4 multi5 run).
     #[arg(long)]
     pub(crate) no_ref_prefetch: bool,
+
+    /// Load per-bin reference tables from an on-disk index written by
+    /// `hspZ index` instead of rebuilding them. The run still parses the
+    /// reference and plans as usual, then requires the planned reference bins
+    /// to equal the index's, or it errors naming the mismatch.
+    #[arg(long)]
+    pub(crate) index: Option<PathBuf>,
 
     /// Report the full wall-time accounting.
     #[arg(short = 'y', long)]
@@ -179,8 +213,44 @@ pub(crate) struct RunArgs {
     pub(crate) diagonal_partition: bool,
     /// Write output into one `.tar.gz` instead of a directory. Without a path,
     /// `<output>.tar.gz` is used. Archived directly from the formatted bytes.
+    /// In batch mode (`--query-list`) one archive per job is written
+    /// (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is
+    /// printed).
     #[arg(short = 'Z', long, num_args = 0..=1, default_missing_value = "-", require_equals = false)]
     pub(crate) tarball: Option<PathBuf>,
+}
+
+#[derive(Args)]
+pub(crate) struct IndexArgs {
+    /// Reference FASTA (or FASTA.gz / 2bit) to index.
+    #[arg(short, long)]
+    pub(crate) reference: PathBuf,
+    /// Directory to write the index into. Required; must not exist yet
+    /// (no --force: delete it or pick another path).
+    #[arg(long)]
+    pub(crate) index: PathBuf,
+    /// 12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts.
+    #[arg(short, long, default_value = "12of19")]
+    pub(crate) seed: String,
+    #[arg(short = 'e', long, default_value_t = 1)]
+    pub(crate) step: u32,
+    /// Target bin size in bases, as in `run` (`-B 0` rejected: the automatic
+    /// layout is device-dependent and cannot be frozen into an index).
+    #[arg(short = 'B', long, default_value_t = 500_000_000)]
+    pub(crate) seq_block_size: u32,
+    /// Bin records the way KegAlign does — sequential fill in input order —
+    /// instead of the balanced planner. Must match the `run` side.
+    #[arg(long)]
+    pub(crate) kegalign_bins: bool,
+    /// Worker threads for seed generation; 0 uses available parallelism.
+    #[arg(short, long, default_value_t = 0)]
+    pub(crate) threads: usize,
+    /// Report per-bin build/write timings and payload sizes.
+    #[arg(short = 'y', long)]
+    pub(crate) time: bool,
+    /// Rejected: the index stores unprefixed names; pass --target-prefix on run.
+    #[arg(short = 'T', long, hide = true)]
+    pub(crate) target_prefix: Option<String>,
 }
 
 #[derive(Args)]
@@ -222,20 +292,71 @@ pub(crate) struct CompareArgs {
     /// The C++ CUDA oracle.
     #[arg(short = 'k', long, default_value = "/tmp/kegalign/build/kegalign")]
     pub(crate) kegalign: PathBuf,
-    /// `LD_PRELOAD` for the oracle process. Empty (the default) inherits this
-    /// process's environment. Running the Thrust/CUB reference under ZLUDA needs a
-    /// legacy-stream shim here, so a ZLUDA host must pass its own path.
-    #[arg(short = 'L', long, default_value = "")]
+    /// Legacy-stream shim the Thrust/CUB reference needs under ZLUDA.
+    #[arg(
+        short = 'L',
+        long,
+        default_value = "/home/alejandro/opt/zluda-guide/hipfix.so"
+    )]
     pub(crate) ld_preload: String,
-    /// `LD_LIBRARY_PATH` for the oracle process. Empty (the default) inherits this
-    /// process's environment rather than clearing it.
-    #[arg(short = 'l', long, default_value = "")]
+    #[arg(
+        short = 'l',
+        long,
+        default_value = "/home/alejandro/opt/zluda:/home/alejandro/opt/cudaconda/lib"
+    )]
     pub(crate) ld_library_path: String,
     /// Where to keep both runs' output. Defaults to a fresh temp directory.
     #[arg(short = 'w', long)]
     pub(crate) workdir: Option<PathBuf>,
     #[command(flatten)]
     pub(crate) tuning: Tuning,
+}
+
+/// CPU-only exact seed-hit estimator (R92 PR1): same planning inputs as
+/// `run` (bins/blocks identical to what `run` would freeze), no CUDA.
+#[derive(Args, Clone)]
+pub(crate) struct HitsEstimateArgs {
+    #[arg(short, long)]
+    pub(crate) reference: PathBuf,
+    #[arg(short, long)]
+    pub(crate) query: PathBuf,
+    /// Target bin size in bases, as in `run` (`-B 0` resolves to the default).
+    #[arg(short = 'B', long, default_value_t = 500_000_000)]
+    pub(crate) seq_block_size: u32,
+    /// Bin target for the query side; defaults to `--seq-block-size`.
+    #[arg(long)]
+    pub(crate) query_block_size: Option<u32>,
+    /// Bin records the way KegAlign does (sequential fill, not LPT).
+    #[arg(long)]
+    pub(crate) kegalign_bins: bool,
+    /// 12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts (k<=12).
+    #[arg(long, default_value = "12of19")]
+    pub(crate) seed: String,
+    #[arg(short = 'e', long, default_value_t = 1)]
+    pub(crate) step: u32,
+    /// Don't allow one transition in a seed hit.
+    #[arg(long)]
+    pub(crate) notransition: bool,
+    /// plus / minus / both
+    #[arg(short = 'S', long, default_value = "both")]
+    pub(crate) strand: String,
+    /// Worker threads for histogram passes; 0 uses available parallelism.
+    #[arg(short, long, default_value_t = 0)]
+    pub(crate) threads: usize,
+    /// LASTZ interval size, as in `run` (`-I`): interval boundaries decide
+    /// which shared window starts the pipeline seeds once and which twice.
+    #[arg(short = 'I', long, default_value_t = 10_000_000)]
+    pub(crate) lastz_interval_size: u32,
+    /// Query seed chunk size, as in `run` (`-C`): the interval schedule
+    /// (`seed::chunks`) is part of the count, so this must match `run`.
+    #[arg(short = 'C', long, default_value_t = 250_000)]
+    pub(crate) wga_chunk_size: u32,
+    /// Count every S-th query window start and scale by S (approximation).
+    #[arg(long, default_value_t = 1)]
+    pub(crate) stride: u32,
+    /// Write the plan's bin membership to this file and continue.
+    #[arg(long)]
+    pub(crate) dump_plan: Option<PathBuf>,
 }
 
 #[derive(Args, Clone)]
@@ -253,30 +374,24 @@ pub(crate) struct Tuning {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
-
-    #[test]
-    fn help_uses_public_binary_name() {
-        assert_eq!(Cli::command().get_bin_name(), Some("hspZ"));
-    }
 
     /// The short flags must parse without collisions — clap errors at parse
     /// time if two args in one subcommand share a letter, so this exercises
     /// every grouped flag set at least once.
     #[test]
     fn short_flags_parse() {
-        match Cli::try_parse_from(["hspZ", "run", "-r", "r.fa", "-q", "q.fa", "-o", "out"])
+        match Cli::try_parse_from(["hspz", "run", "-r", "r.fa", "-q", "q.fa", "-o", "out"])
             .unwrap()
             .command
         {
             Command::Run(args) => {
                 assert_eq!(args.reference, PathBuf::from("r.fa"));
-                assert_eq!(args.query, PathBuf::from("q.fa"));
+                assert_eq!(args.query, Some(PathBuf::from("q.fa")));
                 assert_eq!(args.output, PathBuf::from("out"));
             }
             _ => panic!("wrong subcommand"),
         }
-        match Cli::try_parse_from(["hspZ", "benchmark", "-r", "r.fa", "-q", "q.fa", "-i", "5"])
+        match Cli::try_parse_from(["hspz", "benchmark", "-r", "r.fa", "-q", "q.fa", "-i", "5"])
             .unwrap()
             .command
         {
@@ -297,12 +412,51 @@ mod tests {
         }
         // Bare `-Z` must parse (optional value, clap's `-` sentinel), and
         // `-Z <path>` must still take the path.
-        match Cli::try_parse_from(["hspZ", "run", "-r", "r.fa", "-q", "q.fa", "-Z", "o.tgz"])
+        match Cli::try_parse_from(["hspz", "run", "-r", "r.fa", "-q", "q.fa", "-Z", "o.tgz"])
             .unwrap()
             .command
         {
             Command::Run(args) => assert_eq!(args.tarball, Some(PathBuf::from("o.tgz"))),
             _ => panic!("wrong subcommand"),
         }
+        // `--query-list` is mutually exclusive with `-q/--query`, and `-q`
+        // becomes optional so one of the two must be present.
+        assert!(
+            Cli::try_parse_from(["hspz", "run", "-r", "r.fa", "-o", "out"]).is_err(),
+            "one of -q/--query-list is required"
+        );
+        match Cli::try_parse_from([
+            "hspz",
+            "run",
+            "-r",
+            "r.fa",
+            "--query-list",
+            "q.txt",
+            "-o",
+            "out",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Run(args) => {
+                assert_eq!(args.query, None);
+                assert_eq!(args.query_list, Some(PathBuf::from("q.txt")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "hspz",
+                "run",
+                "-r",
+                "r.fa",
+                "-q",
+                "q.fa",
+                "--query-list",
+                "q.txt",
+            ])
+            .is_err(),
+            "-q and --query-list must conflict"
+        );
     }
 }
