@@ -30,7 +30,7 @@ struct Row {
     has_gpu: bool,
     /// Ran concurrently with another phase, so it is reported but excluded from
     /// the accounted total — otherwise overlapped work would be counted twice
-    /// and the table would stop adding up to wall time (PLAN.md §2/§14).
+    /// and the table would stop adding up to wall time.
     overlapped: bool,
 }
 
@@ -158,8 +158,8 @@ impl Phases {
             .sum()
     }
 
-    /// The phase table as a JSON object body, for `benchmark --json`
-    /// (PLAN.md §6). Stage names are our own literals — no quotes or
+    /// The phase table as a JSON object body, for `benchmark --json`.
+    /// Stage names are our own literals — no quotes or
     /// backslashes — so they need no escaping beyond what `json_key` does.
     pub fn json_stages(&self) -> String {
         let mut out = String::from("{");

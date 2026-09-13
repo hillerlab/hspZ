@@ -72,14 +72,14 @@ pub struct FilterOutput {
     pub audit: Vec<crate::census::AcceptedHsp>,
 }
 
-/// Hits-per-seed distribution for one chunk (PLAN.md Milestone 4).
+/// Hits-per-seed distribution for one chunk.
 #[derive(Debug, Default, Clone)]
 pub struct HitStats {
     /// Seeds with 0, 1, 2-4, 5-32, 33-256, >256 reference hits.
     pub buckets: [u64; 6],
     /// Hits contributed by each bucket. Seed-weighted buckets alone cannot say
     /// where the *work* is: a heavy-tailed reference puts most seeds in the low
-    /// buckets and most hits in the high ones (PLAN.md round 82 gate).
+    /// buckets and most hits in the high ones.
     pub hits: [u64; 6],
     pub max: u32,
     pub total_hits: u64,
@@ -259,7 +259,7 @@ impl HitStats {
 }
 
 /// `find_hsps` behaviour, reduced from the per-hit records the `counters`
-/// feature makes the kernel emit (PLAN.md M2).
+/// feature makes the kernel emit.
 ///
 /// Tile counts are histogrammed rather than stored per hit: a mammalian block
 /// has 162 M hits, and 1.3 GB of raw samples buys nothing a histogram cannot
@@ -818,7 +818,7 @@ impl HspStats {
 
 /// Everything the GPU stage needs that outlives a single chunk.
 ///
-/// Scoped to one *reference bin* (PLAN.md §1 / AM-B1): construction uploads the
+/// Scoped to one *reference bin*: construction uploads the
 /// reference index, reference sequence and scoring matrix, and every query bin
 /// then arrives through [`swap_query`](Engine::swap_query). One `Engine` per
 /// reference bin, not per work unit — the difference is ~1 GB of `pos_table`
@@ -848,7 +848,7 @@ pub struct Engine {
     /// Accumulate the hits-per-seed distribution.
     pub collect_hit_stats: bool,
     /// S0 survivor audit (`HSPZ_ANCHOR_CENSUS`). Off the timed path; folds into
-    /// scalars and never accumulates anchors (PLAN.md review 9 §AE2).
+    /// scalars and never accumulates anchors.
     pub census: Option<crate::census::SurvivorAudit>,
     pub phases: Phases,
     pub hit_stats: HitStats,
@@ -921,7 +921,7 @@ pub struct Engine {
     /// block line names its engine.
     #[cfg(feature = "ref-loc-buckets")]
     bucket_eng_id: u32,
-    /// N3 (PLAN.md §8): reuse `d_seeds` / `d_hit_num` across batches instead of
+    /// N3: reuse `d_seeds` / `d_hit_num` across batches instead of
     /// allocating and freeing them per batch. Off by default; the earlier
     /// `d_hsp`/`d_done` result showed `cuMemFree` can cost more than the named
     /// allocation stage, so this is judged on whole runtime, not on alloc time.
@@ -936,7 +936,7 @@ pub struct Engine {
     /// Retained until `seed_and_filter` drains the stream; a per-call temporary
     /// could be freed while the async add-offset kernel still reads it.
     buf_seed_offsets: DeviceBuffer<u32>,
-    /// Free list of pinned host staging buffers (PLAN.md N1). Page-locking is
+    /// Free list of pinned host staging buffers. Page-locking is
     /// expensive — `cuMemHostAlloc` of two 26 MB buffers cost ~13 ms per pass
     /// when this was done per pass — so they live for the engine's lifetime and
     /// are handed out and returned instead of reallocated.
@@ -1694,7 +1694,7 @@ pub struct EngineConfig<'a> {
     /// chunk walk. `0` defaults to `max_hits`.
     pub hit_capacity: u32,
     pub timing: bool,
-    /// N8 (PLAN.md §3): `find_hsps` grid. `0` uses [`HSP_BLOCKS`], the ZLUDA
+    /// N8: `find_hsps` grid. `0` uses [`HSP_BLOCKS`], the ZLUDA
     /// optimum. Runtime rather than `const` so the L4 sweep needs no rebuild.
     pub hsp_blocks: u32,
 }
@@ -1911,8 +1911,7 @@ impl Engine {
     }
 
     /// Replaces only the query-side device state, keeping this reference bin's
-    /// `index_table`, `pos_table`, `ref_seq` and `sub_mat` resident
-    /// (PLAN.md §9.6 / AM-A1).
+    /// `index_table`, `pos_table`, `ref_seq` and `sub_mat` resident.
     ///
     /// This is what makes reference-bin reuse real. Constructing a fresh
     /// `Engine` per work unit would re-upload `index_table` (~67 MB) and
@@ -1947,8 +1946,8 @@ impl Engine {
         self.query_swaps
     }
 
-    /// Hands out a pinned host staging buffer of at least `cap` elements
-    /// (PLAN.md N1), reusing one from the pool when possible.
+    /// Hands out a pinned host staging buffer of at least `cap` elements,
+    /// reusing one from the pool when possible.
     ///
     /// Pinned pages let the driver DMA straight out of host memory instead of
     /// staging a pageable copy, and they are the prerequisite for a genuinely
@@ -1972,7 +1971,7 @@ impl Engine {
         self.pinned_ok = true;
     }
 
-    /// Whether pinned staging actually engaged (PLAN.md §1.2). False when the
+    /// Whether pinned staging actually engaged. False when the
     /// driver refused `cuMemHostAlloc` and the run fell back to pageable pages,
     /// which must not be reported as a pinned result.
     pub fn pinned_seeds_active(&self) -> bool {
@@ -1999,7 +1998,7 @@ impl Engine {
 
     /// Mean wall-clock cost of one kernel launch, measured with an empty
     /// kernel. Under ZLUDA every launch pays PTX-to-HIP dispatch, so this is
-    /// what tells kernel time apart from launch time (PLAN.md Milestone 2).
+    /// what tells kernel time apart from launch time.
     pub fn launch_overhead_ms(&self, iters: u32) -> Result<f64, DriverError> {
         let sink = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
         let mut out = DeviceBuffer::<u32>::zeroed(&self.stream, 1)?;
@@ -2321,7 +2320,7 @@ impl Engine {
         }
         let num_seeds = self.seed_len[slot];
 
-        // PLAN.md §4: allocation and transfer are timed apart, because the
+        // Allocation and transfer are timed apart, because the
         // remedies are different — a grown-once buffer fixes one and does
         // nothing for the other.
         let t = Instant::now();
@@ -2329,13 +2328,13 @@ impl Engine {
         // ZLUDA does not implement cuMemAllocAsync (DriverError 801), so the
         // zeroing memset is counted as part of allocation. That is the right
         // grouping for the decision anyway: a grown-once buffer removes both.
-        // N7 (PLAN.md §5). Both memsets are provably dead: `d_seeds` is fully
+        // N7. Both memsets are provably dead: `d_seeds` is fully
         // overwritten by the copy below, and `d_hit_num` by `find_num_hits`'
         // grid-stride loop over every `id < num_seeds`, before `scan_blocks`
         // reads it. Under ZLUDA this cut `alloc seeds + counts` 38.3 -> 31.3 ms
         // but left whole runtime inside noise, so production keeps the zeroing.
         //
-        // N3 (PLAN.md §8) instead keeps both buffers across batches. The two are
+        // N3 instead keeps both buffers across batches. The two are
         // deliberately separate experiments: N7 changes initialization, N3
         // changes lifetime.
         if self.persistent_seed_buffers {
@@ -2416,7 +2415,7 @@ impl Engine {
             None
         };
 
-        // PLAN.md M8: the cumulative counts stay on the device. A block-local
+        // The cumulative counts stay on the device. A block-local
         // scan plus an add-back turns them into the global inclusive scan, and
         // only the per-block sums (num_seeds/256 u32) cross the bus instead of
         // the whole array in each direction.
@@ -3555,7 +3554,7 @@ impl Engine {
             #[cfg(feature = "counters")]
             let _ = &d_stats;
 
-            // PLAN.md §3.0: scan the done flags in place on the device with the
+            // Scan the done flags in place on the device with the
             // same two-kernel machinery already accepted for the hit counts, so
             // only the per-block sums (`materializer_hits/256` u32) cross the bus
             // instead of the whole flag array in each direction. `num_anchors`
@@ -3848,7 +3847,7 @@ impl Engine {
     }
 }
 
-/// Lifecycle counters for the reference-scoped contract (PLAN.md §2).
+/// Lifecycle counters for the reference-scoped contract.
 ///
 /// Not statistics: the executor asserts these, because the failure they guard
 /// against — rebuilding or re-uploading the reference index per work unit instead
@@ -4842,7 +4841,7 @@ mod tests {
     /// and the same total work must come out with very different numbers, or
     /// these statistics cannot do the job the mean was failing at. This checks
     /// separation only — lane utilisation is descriptive, not a predictor of
-    /// which mapping is faster (PLAN.md round 82 amendment §3).
+    /// which mapping is faster.
     #[test]
     fn density_statistics_separate_uniform_density_from_a_repeat_tail() {
         // Uniformly dense: 64 seeds of 32 hits each. Every warp step is full
@@ -4920,7 +4919,7 @@ mod tests {
     #[cfg(feature = "dense-anchors")]
     use super::SCAN_BLOCK;
 
-    /// PLAN.md §2 / AM-C. The counters exist to catch a reference index rebuilt
+    /// The counters exist to catch a reference index rebuilt
     /// per work unit instead of per reference bin — a regression that changes no
     /// output and shows up only as ~1 GB of extra H->D traffic per work unit.
     #[test]

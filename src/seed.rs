@@ -182,7 +182,7 @@ impl SeedTable {
 
     /// [`build`](Self::build) across `threads` workers, byte-identical to it.
     ///
-    /// PLAN.md M7. The serial builder is 11.4 s on hg38 chr1 — 10.1% of that
+    /// The serial builder is 11.4 s on hg38 chr1 — 10.1% of that
     /// run's wall time and its largest CPU stage — which is what earned this.
     ///
     /// Two passes over the same strided seed-start sequence, no atomics, no
@@ -407,7 +407,7 @@ pub fn chunk_seeds_parallel(
 /// The per-worker pieces of [`chunk_seeds_parallel`], before concatenation.
 ///
 /// Split out so a caller can concatenate straight into pinned host memory
-/// (PLAN.md N1) instead of into a `Vec` it would then have to copy again. The
+/// instead of into a `Vec` it would then have to copy again. The
 /// pieces are in original position order, so concatenating them reproduces
 /// `chunk_seeds` exactly.
 pub fn chunk_seeds_parts(
@@ -459,7 +459,7 @@ pub fn concat_parts(parts: &[Vec<u64>], dst: &mut [u64]) -> usize {
 /// Worst-case seeds one chunk of `span` query positions can emit: every
 /// position yields the exact k-mer plus, with transitions on, one variant per
 /// care position. Used to size the pinned staging buffers once up front so the
-/// seed worker never allocates (PLAN.md N1).
+/// seed worker never allocates.
 pub fn max_seeds(span: u32, shape: &Shape, transitions: bool) -> usize {
     let per_pos = if transitions { 1 + shape.kmer_size } else { 1 };
     span as usize * per_pos
@@ -825,7 +825,7 @@ mod tests {
         assert!(out.iter().all(|o| o & 0xFFFF_FFFF == 7));
     }
 
-    /// PLAN.md M8 + AM-B: the parallel builder must be byte-identical to the
+    /// The parallel builder must be byte-identical to the
     /// serial one for every thread count, on both tables.
     ///
     /// `pos_table` order matters as much as its contents: within-bucket order is

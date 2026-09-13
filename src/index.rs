@@ -1297,6 +1297,14 @@ mod tests {
         }
     }
 
+    /// Fixture inputs live outside the repository, so their location comes from
+    /// the environment instead of a path baked into the source: `HSPZ_FIXTURE_CHR20`
+    /// and `HSPZ_FIXTURE_R90` name directories holding them. A fixture test whose
+    /// variable is unset skips.
+    fn fixture_dir(var: &str) -> Option<PathBuf> {
+        std::env::var_os(var).map(PathBuf::from)
+    }
+
     /// One helper for the repeated scratch-dir + FASTA + `hspz index` triple.
     /// Returns the scratch base (for cleanup), the reference path, the index
     /// dir, the parsed manifest, and the parsed reference records.
@@ -1863,7 +1871,11 @@ mod tests {
     #[ignore]
     fn chr20_index_arrays_match_fresh_build() {
         let base = scratch();
-        let rf = PathBuf::from("/tmp/hspz-cycle3-chr20/ref.fa");
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_CHR20") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_CHR20 to a directory holding ref.fa");
+            return;
+        };
+        let rf = dir.join("ref.fa");
         let dir = base.join("chr20.idx");
         run(&index_args(rf.clone(), dir.clone(), 500_000_000)).unwrap();
         let man = load_manifest(&dir).unwrap();
@@ -1896,7 +1908,11 @@ mod tests {
     #[ignore]
     fn ref5_index_arrays_match_fresh_build() {
         let base = scratch();
-        let rf = PathBuf::from("/tmp/opencode/r90/ref5.fa");
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_R90") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_R90 to a directory holding ref5.fa");
+            return;
+        };
+        let rf = dir.join("ref5.fa");
         let dir = base.join("ref5.idx");
         run(&index_args(rf.clone(), dir.clone(), 10_000_000)).unwrap();
         let man = load_manifest(&dir).unwrap();

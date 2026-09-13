@@ -67,7 +67,7 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
         hit_stats: false,
         cpu_only: false,
         dump_raw: None,
-        // PLAN.md §25/AM-7: `compare` is oracle parity only. The oracle writes a
+        // `compare` is oracle parity only. The oracle writes a
         // directory of unsplit FASTA-derived segments, so -D/-Z are not offered
         // here; their correctness is self-parity, checked in `run`.
         diagonal_partition: false,
@@ -130,8 +130,17 @@ fn run_kegalign_once(args: &CompareArgs, dir: &Path) -> Fallible<(f64, Stats)> {
             Some(p) => vec!["--scoring".to_string(), p.display().to_string()],
             None => vec![],
         })
-        .env("LD_PRELOAD", &args.ld_preload)
-        .env("LD_LIBRARY_PATH", &args.ld_library_path)
+        // Only override what the caller actually set. Passing an empty value would
+        // *clear* the inherited variable, and clearing LD_LIBRARY_PATH breaks the
+        // oracle on any host that needs it to find its CUDA runtime.
+        .envs(
+            [
+                ("LD_PRELOAD", &args.ld_preload),
+                ("LD_LIBRARY_PATH", &args.ld_library_path),
+            ]
+            .into_iter()
+            .filter(|(_, v)| !v.is_empty()),
+        )
         .output()
         .map_err(|e| format!("{}: {e}", args.kegalign.display()))?;
     let secs = start.elapsed().as_secs_f64();

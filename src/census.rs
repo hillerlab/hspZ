@@ -6,7 +6,7 @@
 // Email  : alejandrxgzi@gmail.com
 
 //! S0 survivor audit — an env-gated diagnostic (`HSPZ_ANCHOR_CENSUS`), off the
-//! timed path (PLAN.md review 9 §AE2, review 10 §AH).
+//! timed path.
 //!
 //! The question S0 answers is whether the repeat tail is removable: of the
 //! candidate hits that come from high-copy k-mer buckets, how many survive the
@@ -232,7 +232,7 @@ impl SurvivorAudit {
         // Review 10 AH3: this screen is one-directional.
         out.push_str(
             "  reading: ~0% common survivors licenses rank 2; a non-zero share is an UPPER\n  \
-             bound on raw-HSP damage only, never a rejection (PLAN.md review 10 AH3).\n",
+             bound on raw-HSP damage only, never a rejection.\n",
         );
         out
     }

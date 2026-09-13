@@ -124,7 +124,7 @@ pub fn dedup_and_order(hsps: &mut Vec<SegmentPair>, mut groups: Option<&mut Grou
     *hsps = kept;
 }
 
-/// Raw-HSP provenance through the production dedup (PLAN.md M6).
+/// Raw-HSP provenance through the production dedup.
 #[derive(Debug, Default, Clone)]
 pub struct Groups {
     /// Raw HSPs collapsing into each surviving HSP, one entry per survivor.
@@ -170,7 +170,7 @@ impl Groups {
 
 /// One printed `.segments` record, still numeric.
 ///
-/// This is the unit `-D` partitions (PLAN.md §9: partition structs, never text).
+/// This is the unit `-D` partitions (partition structs, never text).
 /// Coordinates are exactly what gets printed — 1-based, chromosome-relative,
 /// inclusive at both ends — because the oracle's partitioner reads them off the
 /// printed file and its diagonal keys are defined on those values.

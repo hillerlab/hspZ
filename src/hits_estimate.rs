@@ -535,10 +535,30 @@ mod tests {
         assert!(estimate(&args).is_err());
     }
 
+    /// Fixture inputs live outside the repository, so their location comes from
+    /// the environment instead of a path baked into the source: point
+    /// `HSPZ_FIXTURE_CHR20` at a directory holding `ref.fa` and `qry.fa`, and
+    /// `HSPZ_FIXTURE_R90` at one holding `ref5.fa` and `qry3.fa`. A fixture test
+    /// whose variable is unset skips instead of failing on someone else's layout.
+    fn fixture_dir(var: &str) -> Option<std::path::PathBuf> {
+        std::env::var_os(var).map(std::path::PathBuf::from)
+    }
+
+    /// `chr20_args` bound to a fixture directory.
+    fn chr20_fixture(dir: &std::path::Path) -> HitsEstimateArgs {
+        HitsEstimateArgs {
+            reference: dir.join("ref.fa"),
+            query: dir.join("qry.fa"),
+            ..chr20_args()
+        }
+    }
+
+    /// `chr20_args` with a placeholder pair: every caller that actually reads the
+    /// files overrides both paths from `HSPZ_FIXTURE_CHR20` first.
     fn chr20_args() -> HitsEstimateArgs {
         HitsEstimateArgs {
-            reference: "/tmp/hspz-cycle3-chr20/ref.fa".into(),
-            query: "/tmp/hspz-cycle3-chr20/qry.fa".into(),
+            reference: "ref.fa".into(),
+            query: "qry.fa".into(),
             seq_block_size: 500_000_000,
             query_block_size: None,
             kegalign_bins: false,
@@ -561,7 +581,11 @@ mod tests {
     #[test]
     #[ignore]
     fn chr20_single_unit_matches_seed_hits() {
-        let (plan, pred, _) = estimate(&chr20_args()).unwrap();
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_CHR20") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_CHR20 to a directory holding ref.fa and qry.fa");
+            return;
+        };
+        let (plan, pred, _) = estimate(&chr20_fixture(&dir)).unwrap();
         assert_eq!((plan.reference_bins.len(), plan.query_bins.len()), (1, 1));
         assert_eq!(pred, vec![192_899_566]);
     }
@@ -574,9 +598,13 @@ mod tests {
     #[test]
     #[ignore]
     fn chr20_interval_1000000_matches_seed_hits() {
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_CHR20") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_CHR20 to a directory holding ref.fa and qry.fa");
+            return;
+        };
         let args = HitsEstimateArgs {
             lastz_interval_size: 1_000_000,
-            ..chr20_args()
+            ..chr20_fixture(&dir)
         };
         let (plan, pred, _) = estimate(&args).unwrap();
         assert_eq!((plan.reference_bins.len(), plan.query_bins.len()), (1, 1));
@@ -589,9 +617,13 @@ mod tests {
     #[test]
     #[ignore]
     fn chr20_interval_300000_matches_seed_hits() {
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_CHR20") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_CHR20 to a directory holding ref.fa and qry.fa");
+            return;
+        };
         let args = HitsEstimateArgs {
             lastz_interval_size: 300_000,
-            ..chr20_args()
+            ..chr20_fixture(&dir)
         };
         let (plan, pred, _) = estimate(&args).unwrap();
         assert_eq!((plan.reference_bins.len(), plan.query_bins.len()), (1, 1));
@@ -605,9 +637,13 @@ mod tests {
     #[test]
     #[ignore]
     fn synthetic_5x3_plan_matches_ledger_hits() {
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_R90") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_R90 to a directory holding ref5.fa and qry3.fa");
+            return;
+        };
         let args = HitsEstimateArgs {
-            reference: "/tmp/opencode/r90/ref5.fa".into(),
-            query: "/tmp/opencode/r90/qry3.fa".into(),
+            reference: dir.join("ref5.fa"),
+            query: dir.join("qry3.fa"),
             seq_block_size: 10_000_000,
             query_block_size: Some(1_000_000),
             kegalign_bins: false,
@@ -642,7 +678,12 @@ mod tests {
     #[ignore]
     fn chr20_private_vs_sharded_strategy() {
         let shape = Shape::parse("12of19").unwrap();
-        let (_, records, _) = sequence::read_records(chr20_args().reference.as_path()).unwrap();
+        let Some(dir) = fixture_dir("HSPZ_FIXTURE_CHR20") else {
+            eprintln!("skipped: set HSPZ_FIXTURE_CHR20 to a directory holding ref.fa and qry.fa");
+            return;
+        };
+        let (_, records, _) =
+            sequence::read_records(chr20_fixture(&dir).reference.as_path()).unwrap();
         let (buf, _, block_len) =
             sequence::pack(records.iter().map(|(n, s)| (n.as_str(), s.as_slice())), "");
         let threads = crate::run::resolve_threads(0);

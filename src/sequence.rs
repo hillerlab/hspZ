@@ -107,7 +107,7 @@ pub struct Genome {
     pub bytes_read: u64,
 }
 
-/// Which reader a path needs (PLAN.md §2).
+/// Which reader a path needs.
 ///
 /// Chosen from magic bytes, never from the extension: a `.fa` that is really
 /// gzipped, or a `.2bit` named `.bin`, both still work. The extension only
@@ -150,7 +150,7 @@ impl Format {
 
 /// Reads a 2bit file into the same `(name, bases)` records a FASTA yields.
 ///
-/// PLAN.md §6: soft masks must survive, so `enable_softmask(true)` is
+/// Soft masks must survive, so `enable_softmask(true)` is
 /// mandatory — without it every base comes back uppercase and the seeding
 /// alphabet silently changes (lowercase kills a seed, uppercase does not).
 /// Record order is the file's own index order, which `chrom_names()` preserves;
@@ -173,7 +173,7 @@ fn read_2bit(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
 
 /// Packs records into the single buffer the engine consumes: bases joined by
 /// `SEP`, with a trailing separator present in the buffer but excluded from
-/// `block_len` (PLAN.md §9.2 / AM-A2).
+/// `block_len`.
 ///
 /// Extracted as a free function precisely so a bin and a whole genome cannot
 /// drift apart: `Genome::load` and `PackedBin` both call this, so byte-identity
@@ -222,7 +222,7 @@ pub fn reverse_complement(buf: &[u8], chrs: &[Chr], block_len: usize) -> (Vec<u8
 }
 
 /// Reads a file into its raw `(name, bases)` records, format and byte count,
-/// without packing or any block-size guard (PLAN.md §9/§10). The multi-block
+/// without packing or any block-size guard. The multi-block
 /// executor needs the records themselves so it can bin them; [`Genome::load`]
 /// is the single-block wrapper that packs and enforces the old guard.
 pub fn read_records(path: &Path) -> Result<(Format, Vec<(String, Vec<u8>)>, u64), String> {
@@ -239,7 +239,7 @@ impl Genome {
     /// Loads FASTA, gzipped FASTA or 2bit — whichever the magic bytes say.
     ///
     /// Returns an error when the input would spill into a second block, which
-    /// v1 does not implement (see PLAN.md §14 — block/interval partitioning of
+    /// v1 does not implement (block/interval partitioning of
     /// the reference is part of the KegAlign runner, not Seed+Filter).
     pub fn load(path: &Path, prefix: &str, seq_block_size: u32) -> Result<Self, String> {
         let (format, records, bytes_read) = read_records(path)?;
@@ -247,7 +247,7 @@ impl Genome {
         let (buf, chrs, block_len) =
             pack(records.iter().map(|(n, s)| (n.as_str(), s.as_slice())), prefix);
         if block_len > seq_block_size as usize {
-            // PLAN.md §9.12: this guard stays until the multi-block executor is
+            // This guard stays until the multi-block executor is
             // the selected path; removing it earlier would swap a clear message
             // for a host OOM or a doomed single-block run.
             return Err(format!(
@@ -269,8 +269,7 @@ impl Genome {
     }
 
     /// FNV-1a hash of everything the core consumes from this genome: the record
-    /// order, every name, every base including case, and the block length
-    /// (PLAN.md §3 / AM-7).
+    /// order, every name, every base including case, and the block length.
     ///
     /// This is what makes a reader bug attributable. If FASTA, gzipped FASTA and
     /// 2bit disagree, the hash differs *here*, before any GPU work, so a lost
@@ -328,7 +327,7 @@ pub fn intervals(block_len: usize, seed_size: usize, interval_size: u32) -> Vec<
 /// Reads by block and splits on newlines in place. The obvious
 /// `BufReader::lines()` version allocated a `String` per line — ~1.1 M of them
 /// for an hg38 chromosome — and ran at ~350 MB/s; this one does no per-line
-/// allocation. PLAN.md §4's gate put input at 2.3% of a cold run and 0% of warm
+/// allocation. Profiling put input at 2.3% of a cold run and 0% of warm
 /// (it happens once, outside the benchmark loop), so that gate also says an
 /// mmap specialization (candidate D) cannot be earned here — this is candidate
 /// E, which is strictly *less* code than what it replaces.
@@ -440,7 +439,7 @@ mod tests {
         assert_eq!(chr_at(&chrs, 20), 1);
     }
 
-    /// The PLAN.md §3 invariant: FASTA, FASTA.gz and 2bit must load to the
+    /// The reader invariant: FASTA, FASTA.gz and 2bit must load to the
     /// identical SequenceSet (record order, names, case, Ns). The `.2bit` is
     /// hand-encoded against the UCSC spec, so the reader is tested against the
     /// real file format rather than the crate's own writer.

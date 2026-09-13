@@ -24,7 +24,7 @@ use std::path::Path;
 use std::time::Instant;
 
 // ---------------------------------------------------------------------------
-// benchmark — PLAN.md Milestone 3
+// benchmark
 
 /// One timed warm iteration: its wall elapsed and that same iteration's phase
 /// rows, kept together so a stage table always describes the pass it was
@@ -97,7 +97,7 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     engine.persistent_seed_buffers = !run_args.no_persistent_seed_buffers;
     engine.async_stages = !run_args.no_async_stages;
 
-    // -D / -Z put partition/format/archive on the critical path (PLAN.md §15/§22);
+    // -D / -Z put partition/format/archive on the critical path;
     // without them the benchmark never touches the output layer, so the core
     // numbers stay identical to before.
     let output_mode = run_args.tarball.is_some() || run_args.diagonal_partition;
@@ -321,7 +321,7 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     Ok(())
 }
 
-/// One JSON record per warm iteration (PLAN.md §6), appended so a whole matrix
+/// One JSON record per warm iteration, appended so a whole matrix
 /// lands in a single `results.jsonl`. Hand-rolled rather than pulling in serde:
 /// this is the only JSON the binary emits and every value is a number, a bool,
 /// or one of our own label strings.
@@ -351,7 +351,7 @@ fn write_json_records(
         hash_pass(first),
         segments_hash,
     );
-    // PLAN.md §1.2: every variant must prove its mechanism activated before any
+    // Every variant must prove its mechanism activated before any
     // timing delta is read. Job 49359833 produced a full performance table from
     // six arms that had all silently run the baseline config, so these are
     // recorded per run and `report.py` marks a mismatch VOID rather than

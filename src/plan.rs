@@ -1628,7 +1628,8 @@ impl PlanManifest {
                 self.features
             ));
         }
-        // ponytail: byte-identical executable ceiling; source/toolchain identity if independently rebuilt artifacts must replay
+        // A byte-identical executable is the ceiling here: replaying across independently
+        // rebuilt artifacts would need source/toolchain identity instead.
         let got = executable_hash()?;
         if self.executable_hash != got {
             return Err(format!(
@@ -1887,7 +1888,7 @@ fn validate_side_records(side: &str, bins: &[Bin], records: &[RecordMeta]) -> Re
     Ok(())
 }
 
-/// A bin turned into exactly what the engine consumes (PLAN.md §9.1, AM-A2).
+/// A bin turned into exactly what the engine consumes.
 ///
 /// Mirrors what `Prepared` holds for a whole genome: raw bytes for seeding and
 /// encoded bytes for the GPU, and for a query side both strands of each. Built

@@ -5,11 +5,11 @@
 // Github : alejandrogzi
 // Email  : alejandrxgzi@gmail.com
 
-//! Where output goes: a directory of files, or one `.tar.gz` (PLAN.md §18).
+//! Where output goes: a directory of files, or one `.tar.gz`.
 //!
 //! Deliberately two implementations and no framework. `-Z` archives directly
 //! from the formatted bytes — it never writes files and re-reads them to tar
-//! them up, which is the whole point (PLAN.md §17).
+//! them up, which is the whole point.
 
 use crate::Fallible;
 use flate2::Compression;
@@ -71,7 +71,7 @@ pub struct TarGzSink {
 }
 
 impl TarGzSink {
-    /// PLAN.md §20: default compression, not maximum — this is an output sink,
+    /// Default compression, not maximum — this is an output sink,
     /// not an archival tool.
     pub fn new(path: &Path) -> Fallible<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -115,7 +115,7 @@ impl OutputSink for TarGzSink {
 mod tests {
     use super::*;
 
-    /// PLAN.md §21: after extraction, `-Z` output must be byte-identical to the
+    /// After extraction, `-Z` output must be byte-identical to the
     /// directory output, and two archives of the same input must be identical.
     #[test]
     fn tar_round_trip_matches_directory_and_is_reproducible() {

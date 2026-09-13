@@ -9,10 +9,10 @@
 //!
 //! The script partitions an already-written `.segments` file: it reads the text
 //! back, parses coordinates, sorts, and rewrites the pieces. This does the same
-//! partitioning on the numeric [`Record`]s before anything is formatted
-//! (PLAN.md §9), so no unsplit file is ever created.
+//! partitioning on the numeric [`Record`]s before anything is formatted, so
+//! no unsplit file is ever created.
 //!
-//! Two deliberate differences from the script, both documented in PLAN.md §10:
+//! Two deliberate differences from the script:
 //!
 //! * **Sizes are exact.** The script estimates a file's line count as
 //!   `file_size / first_line_size`, because bytes are all it has. hspz knows the
@@ -80,7 +80,7 @@ impl Partitioner {
 
     /// The chunk size for a file of `count` HSPs, or `None` for "do not
     /// partition". Mirrors the script's `chunk_size < 0` estimation branch,
-    /// which is what `-D` selects (PLAN.md §25: no size tuning on `-D` yet).
+    /// which is what `-D` selects (no size tuning on `-D` yet).
     pub fn chunk_size_for(&self, count: usize) -> Option<usize> {
         if count < MIN_CHUNK_SIZE {
             return None;
@@ -284,7 +284,7 @@ mod tests {
         assert_eq!(before, after, "union must equal the input multiset");
     }
 
-    /// PLAN.md §11/§14: execute the *actual* KegAlign `diagonal_partition.py`
+    /// Execute the *actual* KegAlign `diagonal_partition.py`
     /// on the same records and require file-identical partition output. Skips
     /// silently when the oracle script or `bashlex` isn't available.
     #[test]

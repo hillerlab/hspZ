@@ -62,7 +62,7 @@ pub mod device {
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, thread, warp};
 
     /// Does nothing. Launched in a loop to price a launch under ZLUDA, where
-    /// every dispatch pays PTX-to-HIP translation (PLAN.md Milestone 2). The
+    /// every dispatch pays PTX-to-HIP translation. The
     /// single argument keeps some marshalling in the measurement; a kernel with
     /// twelve arguments costs more, so treat this as a floor.
     #[kernel]
@@ -88,7 +88,7 @@ pub mod device {
 
         while id < num_seeds {
             let i = id as usize;
-            // N4 (PLAN.md §5). Both checks the safe path emits are provably
+            // N4. Both checks the safe path emits are provably
             // dead: `id < num_seeds` is the loop condition and the host sizes
             // `seed_offsets` from `seeds.len()`; `seed` is a k-mer index, so
             // `seed < 4^kmer_size == index_table.len()` (`seed.rs: kmer_at`
@@ -124,7 +124,7 @@ pub mod device {
     }
 
     /// Block-local inclusive scan of the per-seed hit counts, in place, plus
-    /// this block's total into `block_sums` (PLAN.md M8.3).
+    /// this block's total into `block_sums`.
     ///
     /// Hand-rolled from `shuffle_up_sync` + shared memory rather than
     /// cooperative-groups `block_scan`: these are the primitives already proven
@@ -2196,7 +2196,7 @@ pub mod device {
                 unsafe {
                     // Two words per candidate: the tile/termination record, and
                     // the anchor, from which the host derives the diagonal and
-                    // the tile-quantized evaluated interval (PLAN.md M8.1).
+                    // the tile-quantized evaluated interval.
                     *stats.get_unchecked_mut(2 * hid as usize) = (right_tiles & 0xF_FFFF)
                         | ((left_tiles & 0xF_FFFF) << 20)
                         | term
@@ -2400,7 +2400,7 @@ pub mod device {
 
 /// Host models of the per-tile maximum logic, used to prove that carrying the
 /// position through the prefix scan and recovering it once at the end agree on
-/// every tie case (PLAN.md M7.1) before any of it reaches the GPU.
+/// every tie case before any of it reaches the GPU.
 #[cfg(test)]
 mod tests {
     const W: usize = 32;

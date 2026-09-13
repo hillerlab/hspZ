@@ -95,7 +95,7 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
     let sub_mat = scoring::build_sub_mat(&args.ambiguous, args.xdrop, args.scoring.as_deref())?;
 
     let t = Instant::now();
-    // PLAN.md §1: reference and query input are timed separately and kept out
+    // Reference and query input are timed separately and kept out
     // of `core`, so a format change can never be confused with a core change.
     // `-B 0` (automatic layout) is a planner decision this single-block path
     // never makes: resolve to the default target so the guard below keeps
@@ -131,7 +131,7 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
     phases.add("revcomp + encode", t.elapsed());
 
     let t = Instant::now();
-    // PLAN.md M7/M9.1: the reference index is the largest CPU stage (10.1% of a
+    // The reference index is the largest CPU stage (10.1% of a
     // chr1 run), and it uses the one existing --threads budget rather than a
     // knob of its own.
     let table = SeedTable::build_parallel(
@@ -257,7 +257,7 @@ pub(crate) struct Pass {
 
 /// One `seed_and_filter` call: a wga_chunk of one strand of one interval.
 ///
-/// The interval/strand/chunk nest is flattened into a flat list (PLAN.md §3) so
+/// The interval/strand/chunk nest is flattened into a flat list so
 /// the seed worker can always run exactly one batch ahead, including across
 /// strand and interval boundaries. The order is identical to the original
 /// nesting — plus strand then minus strand, chunks ascending — because that
@@ -268,7 +268,7 @@ struct Batch {
     range: (u32, u32),
 }
 
-/// Host staging for one batch's seeds (PLAN.md N1).
+/// Host staging for one batch's seeds.
 ///
 /// The GPU path only ever sees `&[u64]`, so whether the pages are pinned is
 /// invisible to it — that is what makes N1 a buffer-placement experiment rather
@@ -319,8 +319,7 @@ impl SeedSlot {
 
 /// Runs every Seed + Filter batch for one prepared pair, overlapping seed
 /// generation with GPU work across two host slots.
-/// Everything one (reference, query-bin) pass needs from the query side
-/// (PLAN.md §3 / AM-B2).
+/// Everything one (reference, query-bin) pass needs from the query side.
 ///
 /// Seeding reads **raw** bytes, not the device alphabet: `fwd` is the raw forward
 /// block and `rc` the raw reverse complement. `Engine::swap_query` handles the
@@ -424,9 +423,9 @@ pub(crate) fn seed_and_filter_all(
     {
         let fwd = q.fwd;
         let rc = q.rc;
-        // Identical call to the one the serial loop made — PLAN.md §3 forbids
-        // touching the seed-generation algorithm in this experiment, so the seed
-        // sequence stays bit-identical.
+        // Identical call to the one the serial loop made: this experiment must
+        // not touch the seed-generation algorithm, so the seed sequence stays
+        // bit-identical.
         let parts = |b: &Batch| -> Vec<Vec<u64>> {
             let seq: &[u8] = if b.rev { rc } else { fwd };
             seed::chunk_seeds_parts(seq, shape, transitions, b.range, threads)
@@ -479,7 +478,7 @@ pub(crate) fn seed_and_filter_all(
         // Standalone generation time summed across workers, versus the part of it
         // that the GPU could not cover. `exposed` is measured as the time the main
         // thread actually blocks in `join` after its own GPU work finished, which
-        // is exactly `max(0, seed_end[N+1] - gpu_end[N])` (PLAN.md §4).
+        // is exactly `max(0, seed_end[N+1] - gpu_end[N])`.
         let (mut standalone, mut exposed) = (Duration::ZERO, Duration::ZERO);
 
         std::thread::scope(|scope| -> Fallible<()> {
@@ -571,7 +570,7 @@ pub(crate) fn seed_and_filter_all(
         })?;
 
         // Give the pinned buffers back so the next pass reuses them rather than
-        // paying cuMemHostAlloc again (PLAN.md N1).
+        // paying cuMemHostAlloc again.
         for slot in ring {
             if let Some(buf) = slot.into_pinned() {
                 engine.give_pinned(buf);
@@ -612,7 +611,7 @@ fn tarball_path(args: &RunArgs) -> Option<PathBuf> {
     })
 }
 
-/// Formats and emits every logical output file (PLAN.md §9, §17, §19).
+/// Formats and emits every logical output file.
 ///
 /// What a `write_outputs` call produced, for the benchmark's per-iteration
 /// `-D`/`-Z` accounting and the `--time` report.
@@ -628,7 +627,7 @@ pub(crate) struct OutputReport {
 
 /// One output pass: a sink and a `Partitioner` hoisted out of the old
 /// `write_outputs` so the multi-bin executor emits every work unit into the
-/// same archive (`-Z`) and shares one `-D` history (PLAN.md §9.10 / AM-A4).
+/// same archive (`-Z`) and shares one `-D` history.
 pub(crate) struct Emitter {
     sink: Box<dyn OutputSink>,
     part: Partitioner,
@@ -718,7 +717,7 @@ impl Emitter {
         }
         for (n, (fw, rc)) in pass.intervals.iter().enumerate() {
             // `segment_printer.cpp` names files by 1-based interval index,
-            // query block index and reference block index (PLAN.md §5 / AM-A3).
+            // query block index and reference block index.
             let base = format!("tmp{}.block{}.r{}", n + 1, query_bin, ref_bin);
             for (hsps, q_chrs, strand) in [(fw, query_chrs, '+'), (rc, rc_chrs, '-')] {
                 if hsps.is_empty() {
@@ -1027,7 +1026,7 @@ pub(crate) fn record_meta(records: &[(String, Vec<u8>)]) -> Vec<RecordMeta> {
 
 /// Single-block convenience for the benchmark's output-mode timing path. A
 /// single block is a 1×1 plan, so this emits one unit with bin ids 0/0 and
-/// reuses the executor's `Emitter` (PLAN.md §9: one output path, not two).
+/// reuses the executor's `Emitter` (one output path, not two).
 pub(crate) fn write_outputs(
     args: &RunArgs,
     p: &Prepared,
@@ -1415,7 +1414,7 @@ pub(crate) fn build_slot_lists(
 }
 
 /// Runs one worker's visits on `device`, streaming finished units to the
-/// emitter (§Phase 5: build/upload each visited reference once, reuse it
+/// emitter (build/upload each visited reference once, reuse it
 /// across its slice; no GPU is shared for performance).
 ///
 /// This is the serial executor, parameterised by which visits it owns: with one
@@ -1877,7 +1876,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let devices = crate::gpu::device_count().max(1);
     let probe = args.gpus.max(1).min(devices);
     let free = crate::gpu::min_free_bytes(probe)?;
-    // ponytail: min(gpus, n_records) overcharges when bins < records; upgrade on measured false rejections
+    // `min(gpus, n_records)` overcharges when the plan has fewer bins than records;
+    // tighten it only if that is ever measured to reject a run that would have fit.
     let workers_upper = args.gpus.max(1).min(ref_meta.len().max(1));
     let budget = plan::worker_device_budget(free, workers_upper, devices);
     // `-B 0` is the automatic layout, resolved here before planning. It needs

@@ -292,18 +292,14 @@ pub(crate) struct CompareArgs {
     /// The C++ CUDA oracle.
     #[arg(short = 'k', long, default_value = "/tmp/kegalign/build/kegalign")]
     pub(crate) kegalign: PathBuf,
-    /// Legacy-stream shim the Thrust/CUB reference needs under ZLUDA.
-    #[arg(
-        short = 'L',
-        long,
-        default_value = "/home/alejandro/opt/zluda-guide/hipfix.so"
-    )]
+    /// `LD_PRELOAD` for the oracle process. Empty (the default) inherits this
+    /// process's environment. Running the Thrust/CUB reference under ZLUDA needs a
+    /// legacy-stream shim here, so a ZLUDA host must pass its own path.
+    #[arg(short = 'L', long, default_value = "")]
     pub(crate) ld_preload: String,
-    #[arg(
-        short = 'l',
-        long,
-        default_value = "/home/alejandro/opt/zluda:/home/alejandro/opt/cudaconda/lib"
-    )]
+    /// `LD_LIBRARY_PATH` for the oracle process. Empty (the default) inherits this
+    /// process's environment rather than clearing it.
+    #[arg(short = 'l', long, default_value = "")]
     pub(crate) ld_library_path: String,
     /// Where to keep both runs' output. Defaults to a fresh temp directory.
     #[arg(short = 'w', long)]

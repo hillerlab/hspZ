@@ -254,9 +254,9 @@ Options:
   -k, --kegalign <KEGALIGN>
           The C++ CUDA oracle [default: /tmp/kegalign/build/kegalign]
   -L, --ld-preload <LD_PRELOAD>
-          Legacy-stream shim the Thrust/CUB reference needs under ZLUDA [default: /home/alejandro/opt/zluda-guide/hipfix.so]
+          `LD_PRELOAD` for the oracle process. Empty (the default) inherits this process's environment. Running the Thrust/CUB reference under ZLUDA needs a legacy-stream shim here, so a ZLUDA host must pass its own path [default: ""]
   -l, --ld-library-path <LD_LIBRARY_PATH>
-          [default: /home/alejandro/opt/zluda:/home/alejandro/opt/cudaconda/lib]
+          `LD_LIBRARY_PATH` for the oracle process. Empty (the default) inherits this process's environment rather than clearing it [default: ""]
   -w, --workdir <WORKDIR>
           Where to keep both runs' output. Defaults to a fresh temp directory
   -s, --seed <SEED>
