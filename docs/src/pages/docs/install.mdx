@@ -47,12 +47,21 @@ Use `:0.0.4` and `:0.0.4-zluda` when reproducibility matters.
 
 Use the checked-in nightly toolchain and the cuda-oxide revision pinned by
 `Cargo.lock`. Set `CUDA_HOME` to a CUDA toolkit compatible with the target
-driver, install the matching `cargo-oxide`, then build with:
+driver, install `cargo-oxide` and seed its codegen-backend source at that same
+revision (on first use `cargo-oxide` otherwise clones the backend from upstream
+HEAD, which tracks newer nightlies), then build:
 
 ```bash
+pin=$(grep -m1 -o 'cuda-oxide\.git#[0-9a-f]\{40\}' Cargo.lock | cut -d'#' -f2)
+cargo install cargo-oxide --git https://github.com/NVlabs/cuda-oxide.git --rev "$pin" --locked
+src=${CARGO_HOME:-$HOME/.cargo}/cuda-oxide/src
+git init -q "$src" && git -C "$src" fetch -q --depth 1 https://github.com/NVlabs/cuda-oxide.git "$pin" \
+  && git -C "$src" checkout -q --detach FETCH_HEAD
 cargo oxide build -- --release --locked
 target/release/hspZ --version
 ```
+
+The backend links `libffi` (Debian/Ubuntu: `libffi-dev`).
 
 A bare build targets `sm_80`, the default in `.cargo/cuda-oxide.toml` and the
 architecture ZLUDA expects. The NVIDIA image builds `sm_75` instead, whose PTX
