@@ -117,9 +117,10 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA); the score-gate die
   variant, output identical to the frozen digest): score gate **−30.1%**, GPU busy −26.1%, wall **−25.3%** with
   the default reference-bucketed kernel; −25.9% gate / −23.4% wall with the plain kernel (two arms per variant,
   one reversed pair). On an RTX 4090 (same unit, plain kernel, four reversed arms per variant, output identical):
-  score gate **−24.1%**, GPU busy −21.9%, wall **−18.4%**. Measured on one work unit (hg38 × mm39 unit 0, one of
-  the 42 in the default whole-genome plan) with the device seeder on and the gate kernel forced per pass; not yet
-  measured on a whole genome or on a Tesla T4.
+  score gate **−24.1%**, GPU busy −21.9%, wall **−18.4%**. Those unit-0 arms ran with the device seeder on and the
+  gate kernel forced per pass. The whole genome on an L4 at production defaults (W=1, `auto` bucketing on in all
+  seven engines), one reversed pair, output identical to the frozen digest: wall 9,949 → 7,352 s (**−26.1%**),
+  score gate −30.2%, GPU busy −26.3%. Not yet measured on a Tesla T4.
 - **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits` used to copy its whole cumulative hit
   array to the host (~6.8 MB, pageable) to locate two or three chunk boundaries. The walk now fetches only the
   ≤1 KB block holding each boundary, producing the same chunks. On two RTX 4090s at whole genome this is **−9.6%**
