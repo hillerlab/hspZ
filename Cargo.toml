@@ -27,7 +27,7 @@ twobit = "0.2.2"
 tar = "0.4.46"
 
 [features]
-default = ["simd-prelude", "find-hits-warp", "ref-loc-buckets"]
+default = ["simd-prelude", "find-hits-warp", "ref-loc-buckets", "gate-int-keep", "gate-payload-ballot"]
 
 # Benchmark-only find_hsps counters. Never time a build with this
 # on — per-hit stores and per-tile increments shift register pressure.
@@ -75,6 +75,21 @@ left-pair-tile = ["dense-anchors"]
 # Score 32 right + 64 left as packed 4-base groups in one warp
 # (lanes 0-7 / 8-23), width-8 and width-16 scans.
 simd-prelude = ["left-pair-tile"]
+
+# Score-gate instruction diet. Both are byte-identical and default. L4, unit 0
+# of hg38 x mm39 at W=1, reversed arms, output digest unchanged: with the
+# reference-bucketed gate kernel gate-int-keep alone takes the score gate -6.5%
+# and both together -30.1% (wall -25.3%); with the plain kernel both together
+# take it -25.9% (wall -23.4%).
+#
+# Lane 0's keep compares `total >= t_min` in integers instead of rounding
+# through f32 and f64; the host computes t_min = keep_threshold(hspthresh) once
+# per engine. find_hsps keeps its own f32 threshold.
+gate-int-keep = []
+# The SIMD prelude's first-drop recovery from one payload ballot (each lane
+# offers its maximum before its own first drop) instead of four ballots, the
+# first-of decodes, the min cascades and the recover branches.
+gate-payload-ballot = ["simd-prelude"]
 
 [profile.release]
 # `debug = 1` used to live here; `strip = true` discards it immediately, so it only cost

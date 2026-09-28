@@ -21,7 +21,7 @@
 
 use crate::Fallible;
 use crate::cli::{IndexArgs, RunArgs};
-use crate::plan::{self, Bin, PackedBin};
+use crate::plan::{self, Bin, PackedBin, RecordMeta};
 use crate::run::{build_ref_bin, record_meta, resolve_threads, sha256_file};
 use crate::seed::{SeedTable, Shape};
 use crate::sequence::{self, E_NT};
@@ -93,6 +93,29 @@ impl IndexManifest {
     /// One-line pre-schedule summary for the `index: using` ledger line.
     pub(crate) fn run_summary(&self) -> (usize, u64, &str, u32) {
         (self.bins.len(), self.seq_block_size, &self.seed, self.step)
+    }
+
+    /// The reference's `records_hash` without the FASTA: the value
+    /// `plan::records_hash(read_records(fasta))` would give for the indexed
+    /// reference.
+    pub(crate) fn ref_records_hash(&self) -> u64 {
+        self.ref_records_hash
+    }
+
+    /// The planner's `Vec<RecordMeta>` for the indexed reference, without the
+    /// FASTA. `id`/`ordinal` are the input indices, so bin `record_ids` index
+    /// straight back into this vector exactly as `record_meta` would give.
+    pub(crate) fn ref_record_meta(&self) -> Vec<RecordMeta> {
+        let mut all: Vec<&RecEntry> = self.bins.iter().flat_map(|b| b.recs.iter()).collect();
+        all.sort_by_key(|r| r.id);
+        all.into_iter()
+            .map(|r| RecordMeta {
+                id: r.id,
+                name: r.name.clone(),
+                len: r.len,
+                ordinal: r.ordinal,
+            })
+            .collect()
     }
 }
 
@@ -645,6 +668,23 @@ fn parse_manifest(dir: &Path, text: &str) -> Result<IndexManifest, String> {
             name,
         });
     }
+    // The loader and `ref_record_meta` index by rec id: the ids must be
+    // exactly 0..n_records, each once. A hand-edited MANIFEST with a gap or
+    // duplicate would otherwise panic on indexing (`ref_meta[id]`).
+    {
+        let mut ids: Vec<u64> = bins
+            .iter()
+            .flat_map(|b| b.recs.iter().map(|r| u64::from(r.id)))
+            .collect();
+        ids.sort_unstable();
+        if ids.len() != n_records || ids.iter().enumerate().any(|(i, &id)| id != i as u64) {
+            return Err(format!(
+                "index {} MANIFEST rec ids are not exactly 0..{n_records}, each once; \
+                 the index is corrupt or hand-edited, rebuild it",
+                dir.display()
+            ));
+        }
+    }
     for (line_no, t) in &cks_lines {
         if t.len() != 3 {
             return Err(err(
@@ -727,16 +767,14 @@ fn parse_manifest(dir: &Path, text: &str) -> Result<IndexManifest, String> {
 // Compatibility (`run --index`)
 // ---------------------------------------------------------------------------
 
-/// Requires the resolved run (seed/step, layout, reference identity, exact bin
-/// membership) to equal the index. `res_seq` is the resolved `--seq-block-size`
-/// (the frozen manifest's on replay, where the CLI default is meaningless).
-/// Pure so it is unit-testable without a GPU or an index directory.
-pub(crate) fn check_run(
+/// FASTA-free half of [`check_run`]: format/packing/seed-builder versions,
+/// byte order, seed/step, kegalign_bins/seq_block_size, R and per-bin
+/// record_ids/total_bp vs the plan. Runs before any upload without the FASTA.
+pub(crate) fn check_run_fasta_free(
     dir: &Path,
     manifest: &IndexManifest,
     args: &RunArgs,
     res_seq: u64,
-    ref_records: &[(String, Vec<u8>)],
     plan: &plan::Plan,
 ) -> Result<(), String> {
     for (name, v) in [
@@ -794,16 +832,6 @@ pub(crate) fn check_run(
             args.kegalign_bins as u8,
         ));
     }
-    let got_hash = plan::records_hash(ref_records);
-    if manifest.ref_records_hash != got_hash {
-        return Err(format!(
-            "index {} records_hash {:016x} != this reference {:016x} (reference content \
-             differs; rebuild the index)",
-            dir.display(),
-            manifest.ref_records_hash,
-            got_hash,
-        ));
-    }
     if manifest.bins.len() != plan.reference_bins.len() {
         return Err(format!(
             "index {} has R={} reference bins; this run planned R={} (plan_within_budget \
@@ -831,10 +859,62 @@ pub(crate) fn check_run(
             ));
         }
     }
+    Ok(())
+}
+
+/// FASTA half of [`check_run`]: `records_hash` equality and the per-bin
+/// names/lengths binding against the parsed reference. Runs in the background
+/// verifier; error texts are exactly [`check_run`]'s. The trailing record-set
+/// comparison closes the self-consistency hole of planning from the MANIFEST:
+/// R and the bins above are compared against a plan built from the MANIFEST's
+/// own records, so a hand-edited MANIFEST (a dropped record with edited bin
+/// membership) is accepted unless the index's record set is required to equal
+/// the FASTA's here.
+pub(crate) fn check_run_fasta(
+    dir: &Path,
+    manifest: &IndexManifest,
+    ref_records: &[(String, Vec<u8>)],
+) -> Result<(), String> {
+    let got_hash = plan::records_hash(ref_records);
+    if manifest.ref_records_hash != got_hash {
+        return Err(format!(
+            "index {} records_hash {:016x} != this reference {:016x} (reference content \
+             differs; rebuild the index)",
+            dir.display(),
+            manifest.ref_records_hash,
+            got_hash,
+        ));
+    }
     for entry in &manifest.bins {
         check_bin_recs(dir, entry, ref_records)?;
     }
+    if crate::run::record_meta(ref_records) != manifest.ref_record_meta() {
+        return Err(format!(
+            "index {} reference records differ from the index's; rebuild the index",
+            dir.display(),
+        ));
+    }
     Ok(())
+}
+
+/// Requires the resolved run (seed/step, layout, reference identity, exact bin
+/// membership) to equal the index. `res_seq` is the resolved `--seq-block-size`
+/// (the frozen manifest's on replay, where the CLI default is meaningless).
+/// Pure so it is unit-testable without a GPU or an index directory. The
+/// production `run --index` path calls the two halves separately (the FASTA
+/// half in the background verifier); this composition is exactly their
+/// sequence, kept for the tests below.
+#[cfg(test)]
+pub(crate) fn check_run(
+    dir: &Path,
+    manifest: &IndexManifest,
+    args: &RunArgs,
+    res_seq: u64,
+    ref_records: &[(String, Vec<u8>)],
+    plan: &plan::Plan,
+) -> Result<(), String> {
+    check_run_fasta_free(dir, manifest, args, res_seq, plan)?;
+    check_run_fasta(dir, manifest, ref_records)
 }
 
 /// Structural half of the `rec` binding (no FASTA): counts, pack-order ids,
@@ -1316,7 +1396,7 @@ mod tests {
             .command
         {
             Command::Run(mut a) => {
-                a.reference = reference;
+                a.reference = Some(reference);
                 a
             }
             _ => unreachable!(),
@@ -1474,6 +1554,161 @@ mod tests {
                 assert_eq!(g.start, w.start);
             }
         }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The MANIFEST-derived `RecordMeta` is exactly what
+    /// `record_meta(read_records(fasta))` gives on the fixture.
+    #[test]
+    fn manifest_record_meta_matches_fasta() {
+        let f = build_default_fixture(8000);
+        let (base, man, records) = (f.base, f.man, f.records);
+        let meta = man.ref_record_meta();
+        assert_eq!(meta, record_meta(&records));
+        // Names and lengths agree record by record as well.
+        assert_eq!(meta.len(), records.len());
+        for (i, (m, (want_name, want_seq))) in meta.iter().zip(records.iter()).enumerate() {
+            assert_eq!(m.id, i as u32, "record {i}");
+            assert_eq!(m.ordinal, i as u32, "record {i}");
+            assert_eq!(m.name, *want_name, "record {i}");
+            assert_eq!(m.len, want_seq.len() as u64, "record {i}");
+        }
+        // ... and the stored hash is the FASTA's hash.
+        assert_eq!(man.ref_records_hash(), plan::records_hash(&records));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The split check: the FASTA-free half passes on a matching fixture, and
+    /// the background FASTA half reports exactly `check_run`'s error text for
+    /// a changed base, a renamed record and a changed length. The plan is
+    /// built from the MANIFEST-derived metadata, as the `run --index` path
+    /// does, so a mutated FASTA cannot move the plan out from under the
+    /// comparison (a changed length would otherwise fail the bin-membership
+    /// check first, which production never reaches).
+    #[test]
+    fn split_check_matches_check_run_errors() {
+        let f = build_default_fixture(8000);
+        let (base, rf, dir, man, records) = (f.base, f.rf, f.dir, f.man, f.records);
+        // Production plans from the MANIFEST, not the FASTA.
+        let plan = plan::plan_with(
+            &man.ref_record_meta(),
+            &man.ref_record_meta(),
+            8000,
+            8000,
+            false,
+        );
+        let args = run_args_for(rf);
+        // Matching fixture: both halves pass, so the split equals the whole.
+        assert!(check_run_fasta_free(&dir, &man, &args, 8000, &plan).is_ok());
+        assert!(check_run_fasta(&dir, &man, &records).is_ok());
+        assert!(check_run(&dir, &man, &args, 8000, &records, &plan).is_ok());
+
+        // (i) a changed base, (ii) a renamed record, (iii) a changed length.
+        // The unsplit check rejected all three with its records_hash text
+        // (checked before R and the bins), so the background half must
+        // reproduce those literal texts, not merely agree with `check_run`.
+        let mut changed_base = records.clone();
+        let i = changed_base[0].1.iter().position(|&b| b == b'A').unwrap();
+        changed_base[0].1[i] = b'C';
+        let mut renamed = records.clone();
+        renamed[1].0 = "renamed_record".to_string();
+        let mut changed_len = records.clone();
+        changed_len[2].1.push(b'A');
+        for (what, stale) in [
+            ("changed base", changed_base),
+            ("renamed record", renamed),
+            ("changed length", changed_len),
+        ] {
+            let literal = format!(
+                "index {} records_hash {:016x} != this reference {:016x} (reference content \
+                 differs; rebuild the index)",
+                dir.display(),
+                man.ref_records_hash(),
+                plan::records_hash(&stale),
+            );
+            let want =
+                check_run(&dir, &man, &args, 8000, &stale, &plan).expect_err("check_run must fail");
+            let got = check_run_fasta(&dir, &man, &stale).expect_err("background check must fail");
+            assert_eq!(
+                got, literal,
+                "{what}: background text differs from the literal records_hash text"
+            );
+            assert_eq!(
+                want, literal,
+                "{what}: check_run text differs from the literal records_hash text"
+            );
+        }
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// A hand-edited MANIFEST that drops a record (with edited bin
+    /// membership, so the tiling still passes) is rejected by the record-set
+    /// comparison even though the stored hash is honest: the plan is built
+    /// from the MANIFEST's own records, so nothing else sees the hole.
+    #[test]
+    fn tampered_manifest_record_set_is_rejected() {
+        let f = build_default_fixture(8000);
+        let (base, dir, man, records) = (f.base, f.dir, f.man, f.records);
+        let mut man = man;
+        let b = &mut man.bins[0];
+        let dropped = b.recs.pop().expect("bin holds a record");
+        b.bin.record_ids.retain(|&id| id != dropped.id);
+        b.bin.total_bp -= dropped.len;
+        b.block_len = b.recs.last().map(|r| r.bin_start + r.len).unwrap_or(0);
+        let err = check_run_fasta(&dir, &man, &records).expect_err("tampered manifest must fail");
+        assert_eq!(
+            err,
+            format!(
+                "index {} reference records differ from the index's; rebuild the index",
+                dir.display()
+            )
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Rec ids that are not exactly 0..n_records (a gap, a duplicate) are
+    /// rejected at MANIFEST parse, naming the index dir — before any
+    /// `ref_meta[id]` indexing can panic.
+    #[test]
+    fn non_contiguous_rec_ids_rejected_at_load() {
+        let f = build_default_fixture(8000);
+        let (base, dir) = (f.base, f.dir);
+        let text = std::fs::read_to_string(dir.join("MANIFEST")).unwrap();
+        let rewrite = |n: usize, new_id: &str| -> String {
+            let mut out = String::new();
+            let mut seen = 0;
+            for line in text.lines() {
+                if line.starts_with("rec ") && seen == n {
+                    let mut toks: Vec<&str> = line.split_whitespace().collect();
+                    toks[1] = new_id;
+                    out.push_str(&toks.join(" "));
+                    seen += 1;
+                } else {
+                    if line.starts_with("rec ") {
+                        seen += 1;
+                    }
+                    out.push_str(line);
+                }
+                out.push('\n');
+            }
+            out
+        };
+        // Gap: first rec id 0 becomes 99.
+        let err = parse_manifest(&dir, &rewrite(0, "99")).expect_err("gapped ids must fail");
+        assert!(err.contains("rec ids"), "{err}");
+        assert!(err.contains(&dir.display().to_string()), "{err}");
+        // Duplicate: second rec takes the first rec's id.
+        let first_id = text
+            .lines()
+            .find(|l| l.starts_with("rec "))
+            .unwrap()
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .to_string();
+        let err =
+            parse_manifest(&dir, &rewrite(1, &first_id)).expect_err("duplicate ids must fail");
+        assert!(err.contains("rec ids"), "{err}");
         std::fs::remove_dir_all(&base).unwrap();
     }
 

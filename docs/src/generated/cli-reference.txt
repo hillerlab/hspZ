@@ -22,11 +22,11 @@ $ hspZ run --help
 
 Seed, extend and filter one reference/query pair
 
-Usage: hspZ run [OPTIONS] --reference <REFERENCE>
+Usage: hspZ run [OPTIONS]
 
 Options:
   -r, --reference <REFERENCE>
-          
+          Reference FASTA. Optional with `--index`: the index then supplies the records, and a FASTA given here is verified against the index in the background; no output is written until it matches
   -q, --query <QUERY>
           
       --query-list <QUERY_LIST>
@@ -90,7 +90,7 @@ Options:
       --no-ref-prefetch
           Build each reference bin only when its turn comes. The default builds the next bin's pack + seed table on a worker thread while the current bin's work units run on the GPU; that build is the largest host cost the GPU cannot otherwise hide (7.1% of an L4 multi5 run)
       --index <INDEX>
-          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The run still parses the reference and plans as usual, then requires the planned reference bins to equal the index's, or it errors naming the mismatch
+          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The index MANIFEST supplies the reference records for planning, so `-r` is optional; a reference given with `-r` is verified against the index in the background before any output is written. The planned reference bins must equal the index's, or it errors naming the mismatch
   -y, --time
           Report the full wall-time accounting
   -d, --hit-stats

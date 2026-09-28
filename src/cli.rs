@@ -34,6 +34,25 @@ pub(crate) enum Command {
     /// Write one reference's per-bin seed tables to an on-disk index.
     Index(IndexArgs),
     /// Cold/warm benchmark: timed runs against wall clock.
+    // `BenchArgs` flattens `RunArgs`, but benchmark never takes `--index`
+    // (it errors at startup): restore the original `-r` (required, no help)
+    // and `--index` texts so `benchmark --help` stays byte-identical to what
+    // it was before `run` made `-r` optional. The inherited
+    // `required_unless_present("index")` is reset first: clap's debug
+    // assertions reject `required` together with `required_unless*`.
+    #[command(
+        mut_arg("reference", |a| a
+            .required_unless_present(clap::builder::Resettable::<clap::Id>::Reset)
+            .required(true)
+            .help(None)
+            .long_help(None)),
+        mut_arg("index", |a| a
+            .help("Load per-bin reference tables from an on-disk index written by `hspZ index` \
+                instead of rebuilding them. The run still parses the reference and plans as \
+                usual, then requires the planned reference bins to equal the index's, or it \
+                errors naming the mismatch")
+            .long_help(None))
+    )]
     Benchmark(BenchArgs),
     /// Run the C++ CUDA reference and this implementation back to back and
     /// compare runtime and HSP output.
@@ -44,8 +63,11 @@ pub(crate) enum Command {
 
 #[derive(Args, Clone)]
 pub(crate) struct RunArgs {
-    #[arg(short, long)]
-    pub(crate) reference: PathBuf,
+    /// Reference FASTA. Optional with `--index`: the index then supplies the
+    /// records, and a FASTA given here is verified against the index in the
+    /// background; no output is written until it matches.
+    #[arg(short, long, required_unless_present = "index")]
+    pub(crate) reference: Option<PathBuf>,
     #[arg(
         short,
         long,
@@ -193,9 +215,11 @@ pub(crate) struct RunArgs {
     pub(crate) no_ref_prefetch: bool,
 
     /// Load per-bin reference tables from an on-disk index written by
-    /// `hspZ index` instead of rebuilding them. The run still parses the
-    /// reference and plans as usual, then requires the planned reference bins
-    /// to equal the index's, or it errors naming the mismatch.
+    /// `hspZ index` instead of rebuilding them. The index MANIFEST supplies
+    /// the reference records for planning, so `-r` is optional; a reference
+    /// given with `-r` is verified against the index in the background
+    /// before any output is written. The planned reference bins must equal
+    /// the index's, or it errors naming the mismatch.
     #[arg(long)]
     pub(crate) index: Option<PathBuf>,
 
@@ -388,7 +412,7 @@ mod tests {
             .command
         {
             Command::Run(args) => {
-                assert_eq!(args.reference, PathBuf::from("r.fa"));
+                assert_eq!(args.reference, Some(PathBuf::from("r.fa")));
                 assert_eq!(args.query, Some(PathBuf::from("q.fa")));
                 assert_eq!(args.output, PathBuf::from("out"));
             }
@@ -470,5 +494,25 @@ mod tests {
                 "{flag} 0 must be rejected"
             );
         }
+    }
+
+    /// With `--index` the reference comes from the MANIFEST, so `-r` is
+    /// optional; without it, the run still requires `-r`.
+    #[test]
+    fn reference_optional_only_with_index() {
+        match Cli::try_parse_from(["hspz", "run", "--index", "idx", "-q", "q.fa"])
+            .unwrap()
+            .command
+        {
+            Command::Run(args) => {
+                assert_eq!(args.reference, None);
+                assert_eq!(args.index, Some(PathBuf::from("idx")));
+            }
+            _ => panic!("wrong subcommand"),
+        }
+        assert!(
+            Cli::try_parse_from(["hspz", "run", "-q", "q.fa"]).is_err(),
+            "-r is required without --index"
+        );
     }
 }

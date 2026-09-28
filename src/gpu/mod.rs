@@ -56,6 +56,33 @@ fn use_warp_find_hits(num_hits: u32, num_seeds: u32) -> bool {
         && u64::from(num_hits) >= FIND_HITS_WARP_MIN_DENSITY * u64::from(num_seeds)
 }
 
+/// Least `total` the score gate keeps at `hspthresh` (`gate-int-keep`).
+///
+/// The gate keeps a hit when `((total as f32 as f64) as i32) >= hspthresh`:
+/// production rounds the score through f32 before comparing. Round-to-nearest
+/// i32 -> f32 and the saturating f64 -> i32 cast are both monotone, so the kept
+/// totals are exactly `total >= keep_threshold(hspthresh)` and one integer
+/// compare on the device decides the same. The threshold always exists
+/// (`i32::MAX` rounds to 2^31, which saturates back to `i32::MAX`). It equals
+/// `hspthresh` for -2^24 < `hspthresh` <= 2^24, where every integer is an f32;
+/// past that it can move either way: at 16,777,220 the total 16,777,219 rounds
+/// up and is kept, at 16,777,217 the total 16,777,217 rounds down and is not.
+/// `find_hsps` keeps its own f32 test on the original `hspthresh`.
+fn keep_threshold(hspthresh: i32) -> i32 {
+    let keeps = |t: i64| ((t as i32) as f32 as f64) as i32 >= hspthresh;
+    // Lower bound over [i32::MIN, i32::MAX]: `hi` always keeps, nothing below `lo` does.
+    let (mut lo, mut hi) = (i64::from(i32::MIN), i64::from(i32::MAX));
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if keeps(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    lo as i32
+}
+
 /// Result of one `SeedAndFilter` call.
 pub struct FilterOutput {
     pub hsps: Vec<SegmentPair>,
@@ -837,6 +864,10 @@ pub struct Engine {
     seed_size: u32,
     xdrop: i32,
     hspthresh: i32,
+    /// What the score-gate kernels receive as `hspthresh`: `hspthresh` itself,
+    /// or with `gate-int-keep` its [`keep_threshold`]. Resolved once here.
+    #[cfg_attr(not(feature = "dense-anchors"), allow(dead_code))]
+    gate_thresh: i32,
     noentropy: u32,
     max_hits: u32,
     hit_capacity: u32,
@@ -1809,6 +1840,11 @@ impl Engine {
             seed_size: cfg.seed_size,
             xdrop: cfg.xdrop,
             hspthresh: cfg.hspthresh,
+            gate_thresh: if cfg!(feature = "gate-int-keep") {
+                keep_threshold(cfg.hspthresh)
+            } else {
+                cfg.hspthresh
+            },
             noentropy: cfg.noentropy as u32,
             max_hits,
             hit_capacity,
@@ -3102,7 +3138,7 @@ impl Engine {
                             self.query_len,
                             &self.sub_mat,
                             self.xdrop,
-                            self.hspthresh,
+                            self.gate_thresh,
                             iter_num_hits,
                             &self.buf_anchor,
                             &mut self.buf_flags,
@@ -3128,7 +3164,7 @@ impl Engine {
                             self.query_len,
                             &self.sub_mat,
                             self.xdrop,
-                            self.hspthresh,
+                            self.gate_thresh,
                             iter_num_hits,
                             &self.buf_sorted_anchor,
                             &mut self.buf_flags_bits,
@@ -4493,6 +4529,7 @@ mod tests {
     use super::use_warp_find_hits;
     use super::{
         HitStats, Lifecycle, chunk_limits, chunk_limits_sparse, exclusive_scan_hit_totals,
+        keep_threshold,
     };
 
     #[cfg(feature = "find-hits-warp")]
@@ -4502,6 +4539,70 @@ mod tests {
         assert!(use_warp_find_hits(16, 1));
         assert!(!use_warp_find_hits(159, 10));
         assert!(use_warp_find_hits(160, 10));
+    }
+
+    /// `gate-int-keep`: `total >= keep_threshold(h)` is the gate's f32-rounded
+    /// keep `((total as f32 as f64) as i32) >= h` for every total tried, at
+    /// thresholds across the i32 range: every total within 4096 of the threshold
+    /// and of each ±2^k (k = 23..31, where f32 spacing reaches and passes 1), plus
+    /// 2,000,000 PRNG totals per threshold.
+    #[test]
+    fn integer_keep_threshold_matches_the_f32_rounded_keep() {
+        const P24: i32 = 1 << 24;
+        let keeps = |t: i32, h: i32| (t as f32 as f64) as i32 >= h;
+        // Above 2^24 the rounding can keep a total below the threshold, or
+        // reject a total equal to it.
+        assert_eq!(keep_threshold(16_777_220), 16_777_219);
+        assert!(keeps(16_777_219, 16_777_220) && !keeps(16_777_218, 16_777_220));
+        assert_eq!(keep_threshold(P24 + 1), P24 + 2);
+        assert!(!keeps(P24 + 1, P24 + 1) && keeps(P24 + 2, P24 + 1));
+
+        let thresholds = [
+            i32::MIN,
+            i32::MIN + 1,
+            -1,
+            0,
+            1,
+            2000,
+            3000,
+            9400,
+            P24 - 1,
+            P24,
+            P24 + 1,
+            16_777_220,
+            (1 << 25) - 1,
+            1 << 25,
+            (1 << 25) + 1,
+            1 << 30,
+            i32::MAX - 1,
+            i32::MAX,
+        ];
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for h in thresholds {
+            let t_min = keep_threshold(h);
+            if -P24 < h && h <= P24 {
+                assert_eq!(t_min, h, "every integer of this range is an f32");
+            }
+            let mut centres = vec![i64::from(t_min)];
+            for k in 23..=31 {
+                centres.extend([1i64 << k, -(1i64 << k)]);
+            }
+            for c in centres {
+                let lo = (c - 4096).max(i64::from(i32::MIN));
+                let hi = (c + 4096).min(i64::from(i32::MAX));
+                for t in lo..=hi {
+                    let t = t as i32;
+                    assert_eq!(keeps(t, h), t >= t_min, "h {h} t {t} t_min {t_min}");
+                }
+            }
+            for _ in 0..2_000_000 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let t = state as i32;
+                assert_eq!(keeps(t, h), t >= t_min, "h {h} t {t} t_min {t_min}");
+            }
+        }
     }
 
     /// Cycle 4/5: the smallest legal window (`B <= 32`) for a 427 Mbp reference

@@ -29,7 +29,7 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
 
     eprintln!("running Rust implementation ...");
     let run_args = RunArgs {
-        reference: args.reference.clone(),
+        reference: Some(args.reference.clone()),
         query: Some(args.query.clone()),
         query_list: None,
         output: rust_dir.clone(),

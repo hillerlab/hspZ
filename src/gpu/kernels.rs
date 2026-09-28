@@ -969,6 +969,9 @@ pub mod device {
     }
 
     /// Body of the score gate, shared by the plain and the reordered kernel.
+    ///
+    /// `hspthresh` is read only by lane 0's keep test. With `gate-int-keep` the
+    /// host passes `keep_threshold(hspthresh)` in its place (`gpu/mod.rs`).
     #[cfg(feature = "dense-anchors")]
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
@@ -1220,51 +1223,102 @@ pub mod device {
                     let after0 = before_max.max(c0);
                     let after1 = after0.max(c1);
                     let after2 = after1.max(c2);
-                    let d0 = warp::ballot_sync(FULL_MASK, after0.wrapping_sub(c0) > xdrop);
-                    let d1 = warp::ballot_sync(FULL_MASK, after1.wrapping_sub(c1) > xdrop);
-                    let d2 = warp::ballot_sync(FULL_MASK, after2.wrapping_sub(c2) > xdrop);
-                    let d3 = warp::ballot_sync(FULL_MASK, scanned.wrapping_sub(c3) > xdrop);
+                    #[cfg(not(feature = "gate-payload-ballot"))]
+                    let (right_done, left_done, right_max, left_max) = {
+                        let d0 = warp::ballot_sync(FULL_MASK, after0.wrapping_sub(c0) > xdrop);
+                        let d1 = warp::ballot_sync(FULL_MASK, after1.wrapping_sub(c1) > xdrop);
+                        let d2 = warp::ballot_sync(FULL_MASK, after2.wrapping_sub(c2) > xdrop);
+                        let d3 = warp::ballot_sync(FULL_MASK, scanned.wrapping_sub(c3) > xdrop);
 
-                    let first_of = |bits: u32, shift: u32, n_lanes: u32| -> u32 {
-                        let tz = (bits >> shift).trailing_zeros();
-                        if tz >= n_lanes { 255 } else { tz }
-                    };
-                    let right_first = (4 * first_of(d0, 0, 8))
-                        .min(4 * first_of(d1, 0, 8) + 1)
-                        .min(4 * first_of(d2, 0, 8) + 2)
-                        .min(4 * first_of(d3, 0, 8) + 3);
-                    let left_first = (4 * first_of(d0, 8, 16))
-                        .min(4 * first_of(d1, 8, 16) + 1)
-                        .min(4 * first_of(d2, 8, 16) + 2)
-                        .min(4 * first_of(d3, 8, 16) + 3);
-                    let right_edge = ref_loc.wrapping_add(31) >= ref_len
-                        || query_loc.wrapping_add(31) >= query_len;
-                    let left_edge = ref_loc < 64 || query_loc < 64;
-                    let right_done = right_first < 32 || right_edge;
-                    let left_done = left_first < 64 || left_edge;
+                        let first_of = |bits: u32, shift: u32, n_lanes: u32| -> u32 {
+                            let tz = (bits >> shift).trailing_zeros();
+                            if tz >= n_lanes { 255 } else { tz }
+                        };
+                        let right_first = (4 * first_of(d0, 0, 8))
+                            .min(4 * first_of(d1, 0, 8) + 1)
+                            .min(4 * first_of(d2, 0, 8) + 2)
+                            .min(4 * first_of(d3, 0, 8) + 3);
+                        let left_first = (4 * first_of(d0, 8, 16))
+                            .min(4 * first_of(d1, 8, 16) + 1)
+                            .min(4 * first_of(d2, 8, 16) + 2)
+                            .min(4 * first_of(d3, 8, 16) + 3);
+                        let right_edge = ref_loc.wrapping_add(31) >= ref_len
+                            || query_loc.wrapping_add(31) >= query_len;
+                        let left_edge = ref_loc < 64 || query_loc < 64;
+                        let right_done = right_first < 32 || right_edge;
+                        let left_done = left_first < 64 || left_edge;
 
-                    let recover = |first: u32, n_bases: u32, origin: u32| -> i32 {
-                        let f = if first >= n_bases { n_bases } else { first };
-                        if f == 0 {
-                            0
-                        } else {
-                            let sub = f & 3;
-                            let src_gl = if sub == 0 { f / 4 - 1 } else { f / 4 };
-                            let src = origin + src_gl;
-                            let value = if sub == 0 {
-                                scanned
-                            } else if sub == 1 {
-                                after0
-                            } else if sub == 2 {
-                                after1
+                        let recover = |first: u32, n_bases: u32, origin: u32| -> i32 {
+                            let f = if first >= n_bases { n_bases } else { first };
+                            if f == 0 {
+                                0
                             } else {
-                                after2
-                            };
-                            warp::shuffle_sync(FULL_MASK, value as u32, src) as i32
-                        }
+                                let sub = f & 3;
+                                let src_gl = if sub == 0 { f / 4 - 1 } else { f / 4 };
+                                let src = origin + src_gl;
+                                let value = if sub == 0 {
+                                    scanned
+                                } else if sub == 1 {
+                                    after0
+                                } else if sub == 2 {
+                                    after1
+                                } else {
+                                    after2
+                                };
+                                warp::shuffle_sync(FULL_MASK, value as u32, src) as i32
+                            }
+                        };
+                        let right_max = recover(right_first, 32, 0);
+                        let left_max = recover(left_first, 64, 8);
+                        (right_done, left_done, right_max, left_max)
                     };
-                    let right_max = recover(right_first, 32, 0);
-                    let left_max = recover(left_first, 64, 8);
+                    // `gate-payload-ballot`: the same four values from one ballot. A
+                    // group's first drop is its first lane with any drop and, inside that
+                    // lane, the first base; the maximum before it is local to that lane
+                    // (`before_max` before base 0, else `after0..after2`), and a group
+                    // without a drop ends on its last lane's `scanned`. Each lane offers
+                    // that value, one ballot finds the lanes and the two shuffles
+                    // `recover` already paid for read it — no first-of decodes, min
+                    // cascades or `recover` branches. The host model
+                    // `payload_ballot_matches_first_drop_recovery` checks it against the
+                    // default path.
+                    #[cfg(feature = "gate-payload-ballot")]
+                    let (right_done, left_done, right_max, left_max) = {
+                        let q0 = after0.wrapping_sub(c0) > xdrop;
+                        let q1 = after1.wrapping_sub(c1) > xdrop;
+                        let q2 = after2.wrapping_sub(c2) > xdrop;
+                        let q3 = scanned.wrapping_sub(c3) > xdrop;
+                        let payload = if q0 {
+                            before_max
+                        } else if q1 {
+                            after0
+                        } else if q2 {
+                            after1
+                        } else if q3 {
+                            after2
+                        } else {
+                            scanned
+                        };
+                        let dropped = warp::ballot_sync(
+                            FULL_MASK,
+                            (is_right || is_left) && (q0 || q1 || q2 || q3),
+                        );
+                        // Lanes 7 and 23 stand in for "no drop": their payload is then
+                        // `scanned`, the maximum over the whole group.
+                        let right_src = (dropped | 0x80).trailing_zeros();
+                        let left_src = 8 + ((dropped >> 8) | 0x8000).trailing_zeros();
+                        let right_max = warp::shuffle_sync(FULL_MASK, payload as u32, right_src);
+                        let left_max = warp::shuffle_sync(FULL_MASK, payload as u32, left_src);
+                        let right_edge = ref_loc.wrapping_add(31) >= ref_len
+                            || query_loc.wrapping_add(31) >= query_len;
+                        let left_edge = ref_loc < 64 || query_loc < 64;
+                        (
+                            dropped & 0xff != 0 || right_edge,
+                            dropped & 0xff_ff00 != 0 || left_edge,
+                            right_max as i32,
+                            left_max as i32,
+                        )
+                    };
                     // The two end broadcasts feed the continuation loops only, and those
                     // run for ~8% of hits. `right_done`/`left_done` are warp-uniform, so
                     // the shuffles sink into the branches: two dependent shuffles removed
@@ -1524,7 +1578,13 @@ pub mod device {
 
                 if hid < num_hits && lane_id == 0 {
                     // Production rounds through f32 before this comparison.
+                    #[cfg(not(feature = "gate-int-keep"))]
                     let keep = ((total as f32 as f64) as i32 >= hspthresh) as u8;
+                    // `gate-int-keep`: the host passed `keep_threshold(hspthresh)` in
+                    // this slot — the least total the rounded comparison keeps — so one
+                    // integer compare decides the same, with no FP64 on the gate.
+                    #[cfg(feature = "gate-int-keep")]
+                    let keep = (total >= hspthresh) as u8;
                     if reordered {
                         chunk_bits |= (keep as u32) << slot;
                     } else {
@@ -3137,6 +3197,293 @@ mod tests {
             if left_valid <= 64 {
                 assert_eq!(gl.1, sl, "case {case} left max valid={left_valid}");
             }
+        }
+    }
+
+    /// One warp of `score_gate`'s SIMD prelude, lane for lane, up to what the
+    /// first-drop recovery reads: lanes 0-7 hold the right extension's bases
+    /// 0-31 (four per lane), lanes 8-23 the left's 0-63, lanes 24-31 idle with
+    /// zero scores. Same wrapping arithmetic, the same `dual_prefix_sum_max`
+    /// steps and the same `before_max` shuffle as the kernel.
+    struct PreludeWarp {
+        active: [bool; W],
+        c: [[i32; 4]; W],
+        before_max: [i32; W],
+        after: [[i32; 3]; W],
+        scanned: [i32; W],
+    }
+
+    /// `(right_done, left_done, right_max, left_max)`.
+    type Recovery = (bool, bool, i32, i32);
+
+    fn prelude_warp(s: &[[i32; 4]; W]) -> PreludeWarp {
+        let is_left = |l: usize| (8..24).contains(&l);
+        let gl = |l: usize| if is_left(l) { l - 8 } else { l };
+        let active: [bool; W] = core::array::from_fn(|l| l < 24);
+        let seg: [i32; W] = core::array::from_fn(|l| {
+            let [s0, s1, s2, s3] = s[l];
+            s0.wrapping_add(s1).wrapping_add(s2).wrapping_add(s3)
+        });
+        let local_max: [i32; W] = core::array::from_fn(|l| {
+            let [s0, s1, s2, s3] = s[l];
+            let p1 = s0.wrapping_add(s1);
+            let p2 = p1.wrapping_add(s2);
+            let p3 = p2.wrapping_add(s3);
+            s0.max(p1).max(p2).max(p3).max(0)
+        });
+        // `dual_prefix_sum_max`: every lane shuffles the pre-step values.
+        let (mut sum, mut max) = (seg, local_max);
+        let mut offset = 1usize;
+        while offset < 16 {
+            let (up_s, up_m) = (sum, max);
+            for l in 0..W {
+                if active[l] && gl(l) >= offset {
+                    let cand = up_s[l - offset].wrapping_add(up_m[l]);
+                    max[l] = if up_m[l - offset] >= cand {
+                        up_m[l - offset]
+                    } else {
+                        cand
+                    };
+                    sum[l] = up_s[l - offset].wrapping_add(up_s[l]);
+                }
+            }
+            offset <<= 1;
+        }
+        let scanned = max;
+        let mut c = [[0i32; 4]; W];
+        let mut before_max = [0i32; W];
+        let mut after = [[0i32; 3]; W];
+        for l in 0..W {
+            let mut acc = sum[l].wrapping_sub(seg[l]);
+            for k in 0..4 {
+                acc = acc.wrapping_add(s[l][k]);
+                c[l][k] = acc;
+            }
+            before_max[l] = if gl(l) == 0 || !active[l] {
+                0
+            } else {
+                scanned[l - 1]
+            };
+            let a0 = before_max[l].max(c[l][0]);
+            let a1 = a0.max(c[l][1]);
+            after[l] = [a0, a1, a1.max(c[l][2])];
+        }
+        PreludeWarp {
+            active,
+            c,
+            before_max,
+            after,
+            scanned,
+        }
+    }
+
+    /// Drop flags of one lane, base by base, exactly as the kernel tests them.
+    fn drop_flags(p: &PreludeWarp, l: usize, xdrop: i32) -> [bool; 4] {
+        [
+            p.after[l][0].wrapping_sub(p.c[l][0]) > xdrop,
+            p.after[l][1].wrapping_sub(p.c[l][1]) > xdrop,
+            p.after[l][2].wrapping_sub(p.c[l][2]) > xdrop,
+            p.scanned[l].wrapping_sub(p.c[l][3]) > xdrop,
+        ]
+    }
+
+    /// Default path, part 1: four ballots decoded by `first_of` and the min
+    /// cascades into each group's first dropping base `4 * lane + k` (lane
+    /// counted within the group), or >= 1020 when the group has no drop.
+    fn default_first_drops(p: &PreludeWarp, xdrop: i32) -> (u32, u32) {
+        let mut d = [0u32; 4];
+        for l in 0..W {
+            for (k, dropped) in drop_flags(p, l, xdrop).into_iter().enumerate() {
+                d[k] |= u32::from(dropped) << l;
+            }
+        }
+        let first_of = |bits: u32, shift: u32, n_lanes: u32| -> u32 {
+            let tz = (bits >> shift).trailing_zeros();
+            if tz >= n_lanes { 255 } else { tz }
+        };
+        let right_first = (4 * first_of(d[0], 0, 8))
+            .min(4 * first_of(d[1], 0, 8) + 1)
+            .min(4 * first_of(d[2], 0, 8) + 2)
+            .min(4 * first_of(d[3], 0, 8) + 3);
+        let left_first = (4 * first_of(d[0], 8, 16))
+            .min(4 * first_of(d[1], 8, 16) + 1)
+            .min(4 * first_of(d[2], 8, 16) + 2)
+            .min(4 * first_of(d[3], 8, 16) + 3);
+        (right_first, left_first)
+    }
+
+    /// Default path, part 2: `recover` shuffles the running maximum before the
+    /// first drop (base `n_bases` when there is none) from its lane.
+    fn default_recovery(
+        p: &PreludeWarp,
+        xdrop: i32,
+        right_edge: bool,
+        left_edge: bool,
+    ) -> Recovery {
+        let (right_first, left_first) = default_first_drops(p, xdrop);
+        let recover = |first: u32, n_bases: u32, origin: u32| -> i32 {
+            let f = if first >= n_bases { n_bases } else { first };
+            if f == 0 {
+                0
+            } else {
+                let sub = f & 3;
+                let src_gl = if sub == 0 { f / 4 - 1 } else { f / 4 };
+                let src = (origin + src_gl) as usize;
+                if sub == 0 {
+                    p.scanned[src]
+                } else {
+                    p.after[src][sub as usize - 1]
+                }
+            }
+        };
+        (
+            right_first < 32 || right_edge,
+            left_first < 64 || left_edge,
+            recover(right_first, 32, 0),
+            recover(left_first, 64, 8),
+        )
+    }
+
+    /// `gate-payload-ballot`: one ballot of "this active lane drops somewhere",
+    /// each lane's payload is its maximum before its own first drop, and each
+    /// group reads the payload of its first dropping lane (or of its last lane).
+    #[allow(clippy::needless_range_loop)]
+    fn payload_recovery(
+        p: &PreludeWarp,
+        xdrop: i32,
+        right_edge: bool,
+        left_edge: bool,
+    ) -> Recovery {
+        let mut dropped = 0u32;
+        let mut payload = [0i32; W];
+        for l in 0..W {
+            let [q0, q1, q2, q3] = drop_flags(p, l, xdrop);
+            payload[l] = if q0 {
+                p.before_max[l]
+            } else if q1 {
+                p.after[l][0]
+            } else if q2 {
+                p.after[l][1]
+            } else if q3 {
+                p.after[l][2]
+            } else {
+                p.scanned[l]
+            };
+            dropped |= u32::from(p.active[l] && (q0 || q1 || q2 || q3)) << l;
+        }
+        let right_src = (dropped | 0x80).trailing_zeros();
+        let left_src = 8 + ((dropped >> 8) | 0x8000).trailing_zeros();
+        // The same two lanes, written as "first dropping lane of the group,
+        // else its last lane".
+        let (mr, ml) = (dropped & 0xff, (dropped >> 8) & 0xffff);
+        assert_eq!(right_src, if mr != 0 { mr.trailing_zeros() } else { 7 });
+        assert_eq!(left_src, if ml != 0 { 8 + ml.trailing_zeros() } else { 23 });
+        (
+            dropped & 0xff != 0 || right_edge,
+            dropped & 0xff_ff00 != 0 || left_edge,
+            payload[right_src as usize],
+            payload[left_src as usize],
+        )
+    }
+
+    /// `gate-payload-ballot` against the default first-drop recovery on
+    /// random warps: substitution-like scores, ties, base-0 drops, wrapping
+    /// totals, xdrop across [0, 1e6] (and beyond, for the idle-lane mask), random
+    /// edge flags. Every result the continuation and the keep read must agree.
+    #[test]
+    fn payload_ballot_matches_first_drop_recovery() {
+        const HOXD70: [i32; 9] = [91, -114, -31, -123, 100, -125, -31, -114, -125];
+        const RICH: [i32; 5] = [100, 91, 91, -31, -114];
+        const CLIFFS: [i32; 4] = [-1000, 5, 0, 100];
+        const TIES: [i32; 6] = [0, 0, 1, -1, 100, 100];
+        const WARPS: u32 = 400_000;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Per group: first drop at base 0 of lane 0, at k = 0..3 elsewhere, in
+        // the group's last lane, and no drop at all.
+        let mut seen = [[0u32; 7]; 2];
+        for warp in 0..WARPS {
+            let mut s = [[0i32; 4]; W];
+            for lane in s.iter_mut().take(24) {
+                for v in lane.iter_mut() {
+                    let r = rnd();
+                    *v = match warp % 5 {
+                        0 => HOXD70[(r % 9) as usize],
+                        1 => RICH[(r % 5) as usize],
+                        2 => CLIFFS[(r % 4) as usize],
+                        3 => TIES[(r % 6) as usize],
+                        // Any magnitude up to the full range, so sums wrap.
+                        _ => (r as i32) >> (r >> 59),
+                    };
+                }
+            }
+            let r = rnd();
+            let xdrop = if warp >= WARPS - 20_000 {
+                [-1, -1000, i32::MIN, i32::MAX][(r % 4) as usize]
+            } else {
+                match r % 8 {
+                    0 => 0,
+                    1 => 910,
+                    2 => 50,
+                    3 => 1_000_000,
+                    _ => ((r >> 8) % 1_000_001) as i32,
+                }
+            };
+            let right_edge = (r >> 40) & 3 == 0;
+            let left_edge = (r >> 42) & 3 == 0;
+            let p = prelude_warp(&s);
+            let want = default_recovery(&p, xdrop, right_edge, left_edge);
+            let got = payload_recovery(&p, xdrop, right_edge, left_edge);
+            assert_eq!(
+                got, want,
+                "warp {warp} xdrop {xdrop} edges {right_edge}/{left_edge}"
+            );
+            // While no partial sum wraps (every mode but the full-range one), the
+            // warp model agrees with the per-group model that
+            // `simd4_prelude_matches_scalar_tiles` checks against scalar tiles; a
+            // prelude starts from score 0, maximum 0. Past a wrap the kernel's
+            // (sum, max) scan and that model's absolute prefix maxima part ways,
+            // and `prelude_warp` follows the kernel.
+            if warp % 5 != 4 {
+                let bases = |lanes: core::ops::Range<usize>| -> Vec<i32> {
+                    lanes.flat_map(|l| s[l]).collect()
+                };
+                let (rf, rmax, _) = simd4_prelude(&bases(0..8), 32, 8, xdrop, 0, 0);
+                let (lf, lmax, _) = simd4_prelude(&bases(8..24), 64, 16, xdrop, 0, 0);
+                assert_eq!(
+                    (rf < 32 || right_edge, lf < 64 || left_edge, rmax, lmax),
+                    want,
+                    "warp {warp}: warp model vs simd4_prelude"
+                );
+            }
+
+            let (right_first, left_first) = default_first_drops(&p, xdrop);
+            for (g, (first, n_bases)) in [(right_first, 32), (left_first, 64)]
+                .into_iter()
+                .enumerate()
+            {
+                let case = if first >= n_bases {
+                    6
+                } else if first == 0 {
+                    0
+                } else if first / 4 == n_bases / 4 - 1 {
+                    5
+                } else {
+                    1 + (first & 3) as usize
+                };
+                seen[g][case] += 1;
+            }
+        }
+        for (g, cases) in seen.iter().enumerate() {
+            assert!(
+                cases.iter().all(|&n| n > 0),
+                "group {g} left a case untested: {cases:?}"
+            );
         }
     }
 }

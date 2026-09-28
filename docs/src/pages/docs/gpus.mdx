@@ -98,10 +98,11 @@ All jobs must plan to identical reference bins; `-B 0`, `--kegalign-bins` and
 `--from-manifest` are rejected in batch mode, and a job whose standalone plan the
 multi-worker device budget would change is refused rather than replanned.
 Bin-major order delays the first result, so amortized time per query is not
-request latency. Job directories (or archives) are created at the start and fill
-as units finish; `OUT/queries.tsv` is written only after every job has
-succeeded, so in a fresh `OUT` its presence marks a complete batch; a rerun into
-the same `OUT` does not remove an earlier `queries.tsv`.
+request latency. Job directories (or archives) are created at the start (with
+`--index`, when a job's first unit is written) and fill as units finish;
+`OUT/queries.tsv` is written only after every job has succeeded, so in a fresh
+`OUT` its presence marks a complete batch; a rerun into the same `OUT` does not
+remove an earlier `queries.tsv`.
 
 ## Reusing a reference across runs
 
@@ -109,7 +110,7 @@ When queries arrive in separate runs, build the reference's tables once:
 
 ```bash
 hspZ index --reference ref.2bit --index /local/ref.hspz-index
-hspZ run --reference ref.2bit --query q.fa --index /local/ref.hspz-index --output OUT
+hspZ run --query q.fa --index /local/ref.hspz-index --output OUT
 ```
 
 `hspZ index` writes each reference bin's seed tables and encoded bases as raw
@@ -117,28 +118,44 @@ arrays with a text manifest, published atomically once a `READY` marker is
 written: the directory holds `MANIFEST`, `READY` and one subdirectory per bin
 (`000`, `001`, …) with little-endian `index_table`, `pos_table` and `enc` files
 without headers. It is built in a sibling `.tmp` directory and renamed onto the
-`--index` path, which must not exist yet. A run given `--index` loads the arrays
-instead of rebuilding, inside the same prefetch, and its output is
-byte-identical to a run without the index. Before any upload the run proves
-the index matches: `--seed`, `--step`, `-B` and `--kegalign-bins` must equal the
-values it was built with, the parsed reference records must hash to the value
-recorded at index time (an edit of the same size is caught), and the resolved
-plan must have exactly the index's bins, record names and lengths. Each bin's
-arrays are then checked against their recorded lengths and checksums as the bin
-loads, so a damaged file never reaches the device. The run prints an
-`index: using …` line before the workers start and an `index: loaded …` line
-with what it validated at the end; with `--time`, the `lifecycle:` line adds a
-`loads` count.
+`--index` path, which must not exist yet. A run given `--index` plans from the
+reference record names and lengths stored in the `MANIFEST` and loads the arrays
+instead of rebuilding, inside the same prefetch; its output is byte-identical
+to a run without the index. Before any upload the run proves the index
+matches: `--seed`, `--step`, `-B` and `--kegalign-bins` must equal the values it
+was built with, and the resolved plan must have exactly the index's bins. Each
+bin's arrays are then checked against their recorded lengths and checksums as
+the bin loads, so a damaged file never reaches the device.
+
+`--reference` is optional with `--index`. When it is given, the FASTA is
+verified against the index in the background while the run proceeds: its
+records must hash to the value recorded at index time (an edit of the same size
+is caught) and carry exactly the index's record names and lengths. No output is
+written until it matches; a mismatch exits non-zero and leaves no output files.
+Without `--reference` no FASTA is read and the index is trusted; its arrays are
+still checksum-verified as bins load. The run prints an `index: using …` line
+before the workers start and an `index: loaded …` line with what it validated at
+the end; with `--time`, the `lifecycle:` line adds a `loads` count, and a run
+given `--reference` reports the background parse as
+`input.reference (background)` and time the run spends blocked on the
+verification as `index.verify wait` (plus the overlapped
+`index.verify wait (emitter)`, the wait at a job's first unit).
 
 hg38 at the default layout takes about 120 s to index and 8.9 GB on disk, and
 each run then loads its seven bins in roughly 12 s. On an L4 all but the first
 load (about 1.7 s) hide behind the GPU; on faster cards a small query's GPU time
 per bin (about 0.6 s for 5 Mbp on an RTX 4090) is shorter than a bin load (about
-1.8 s), so the loads set the pace. Each run also re-reads the reference and
-re-hashes it to prove the index matches (about 4–5 s for hg38). On an L4, with
-bucketing pinned on, the device seeder and the index on local NVMe with a warm
-page cache, 100 queries of 5 Mbp run as separate processes fall from 10,800 s to
-2,680 s.
+1.8 s), so the loads set the pace. On an L4, with bucketing pinned on, the device
+seeder and the index on local NVMe with a warm page cache, 100 queries of 5 Mbp
+run as separate processes fall from 10,800 s to 2,680 s; those runs also
+re-read and re-hashed the reference before planning (about 4–5 s for hg38). A
+run without `--reference` skips that work entirely. On an L4 at the default
+settings, separate 5 Mbp runs against an hg38 index (20 runs per arm, identical
+output) took 23.5 s each without `--reference`, against 27.8 s when the
+reference was parsed before planning (−15.6%); the first work unit started after
+1.76 s instead of 6.15 s, and peak RSS fell from 5.1 GB to 2.0 GB. On an RTX
+4090 (one pass per arm) the same runs took 16.0 s with `--reference` checked in the background and
+15.8 s without it, against 20.8 s (−22.9% and −23.8%).
 Keep the index on local storage: a bin load above 10 s warns, and on a slow
 network file system loading can cost more than rebuilding. `-B 0` is rejected by
 both commands, and a plan the device budget would shrink to a different bin count

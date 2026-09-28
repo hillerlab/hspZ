@@ -41,7 +41,8 @@ All notable changes to `hspZ` are documented here, newest first.
 Exact speed-ups for the GPU pass, a work-unit scheduler for multi-GPU runs, and a
 new way to run one reference against many queries. Every arm of every measurement
 below produced byte-identical output to 0.0.3 at the same plan and cap, on every
-device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
+device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA); the score-gate diet and
+`run --index` without `-r` ran on the L4, RTX 4090 and ZLUDA, not yet on a T4.
 
 - **One reference, many queries: `--query-list`.** `hspZ run --reference ref.fa --query-list queries.txt
   --output OUT` runs every listed query FASTA in one process: each reference bin is built and uploaded
@@ -63,16 +64,26 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
 - **On-disk reference index: `hspZ index` and `run --index DIR`.** `hspZ index --reference hg38.fa --index DIR`
   builds every reference bin's seed tables and encoded bases once and writes them as raw arrays with a text
   manifest, published atomically. A later `hspZ run … --index DIR` loads them instead of rebuilding, inside the
-  same prefetch, and the output is byte-identical. Before any upload the run proves the index matches: the parsed
-  reference records must hash to the recorded value (a same-size edit is caught), the resolved plan must have
-  exactly the index's bins, and every array must match its recorded length and checksum. Measured on an L4 with
+  same prefetch, and the output is byte-identical. The run proves the index matches: before any upload the
+  resolved plan must have exactly the index's bins and every array must match its recorded length and checksum,
+  and a reference given with `-r` must hash to the recorded value (a same-size edit is caught) before any output
+  is written (see the next entry). Measured on an L4 with
   hg38 and 5 Mbp queries run as separate processes: three queries 333 → 87 s (**−74%**) and 100 queries
   10,883/10,789 → 2,683/2,678 s (**−75%**), after a one-off index build of 119–123 s producing 8.93 GB.
   Measured with bucketing pinned on, the device seeder and the index on local NVMe with a warm page cache.
   Loading the seven hg38 bins costs ~12.6 s per run; on an L4 all but the first load (~1.7 s) hide behind the
-  GPU, each run still re-reads and re-hashes the reference (~4.7 s), and on faster GPUs a small query's loads
-  set the pace. `-B 0` is rejected on both
+  GPU, each of those runs also re-read and re-hashed the reference before planning (~4.7 s), and on faster GPUs
+  a small query's loads set the pace. `-B 0` is rejected on both
   commands; put the index on local storage (a load above 10 s warns).
+- **`run --index` without `-r`.** With `--index`, `-r` is optional: the run plans from the record names and
+  lengths in the index `MANIFEST` instead of parsing the reference first. With `-r` the FASTA is verified against
+  the index in the background and no output is written until it matches (a mismatch exits non-zero with no output
+  files); without `-r` the index is trusted (its arrays are still checksum-verified as bins load). Measured on an
+  L4 with separate 5 Mbp runs against an hg38 index at production defaults, 20 runs per arm: wall per run
+  27.8 → 23.5 s (**−15.6%**), time to first work unit 6.15 → 1.77 s (1.76 s without `-r`), peak RSS 5.1 → 2.0 GB without `-r`, outputs
+  identical. On an RTX 4090 (5 runs per arm, one pass): 20.8 → 16.0 s with `-r` (**−22.9%**) and 15.8 s without it, first
+  work unit 7.12 → 2.21 s. The saving is a fixed ~4.3 s per run on the L4, so it matters for short queries; a `-r`
+  that does not match the index is reported when the first work unit finishes, before any output is written.
 - **Unit-level static partition across GPUs (default on for matching devices).** With two or more GPUs the frozen
   plan's work units are split by count quotas (whole bins first, then contiguous query slices of as few bins as
   possible, one extra reference build per split bin) instead of whole-bin ownership, when every device the run
@@ -97,6 +108,18 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
   smallest window (T4) stay off. `--time` prints the per-block measurements and the decision per engine. The
   window budget is three quarters of the L2: on an L4 that selects the 32 MiB window, measured 2.8–3.0% less GPU
   time than 16 MiB on two whole-genome work units and 2.75% less wall on the full run (9,877 vs 10,156 s).
+- **Score-gate instruction diet (`gate-int-keep`, `gate-payload-ballot`, default features).** The gate's SIMD
+  prelude finds each side's first X-drop with one ballot of the lanes with any drop and reads the value from the
+  first dropping lane (the maximum before its first drop), instead of four ballots, first-of decodes and min
+  cascades. Lane 0 keeps a hit with one integer comparison against a threshold the host precomputes once per
+  engine so that it equals KegAlign's f32-rounded comparison, instead of rounding the total through f32 before
+  the threshold; output is byte-identical. Measured on an L4 (hg38 × mm39 unit 0 at W=1, four reversed arms per
+  variant, output identical to the frozen digest): score gate **−30.1%**, GPU busy −26.1%, wall **−25.3%** with
+  the default reference-bucketed kernel; −25.9% gate / −23.4% wall with the plain kernel (two arms per variant,
+  one reversed pair). On an RTX 4090 (same unit, plain kernel, four reversed arms per variant, output identical):
+  score gate **−24.1%**, GPU busy −21.9%, wall **−18.4%**. Measured on one work unit (hg38 × mm39 unit 0, one of
+  the 42 in the default whole-genome plan) with the device seeder on and the gate kernel forced per pass; not yet
+  measured on a whole genome or on a Tesla T4.
 - **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits` used to copy its whole cumulative hit
   array to the host (~6.8 MB, pageable) to locate two or three chunk boundaries. The walk now fetches only the
   ≤1 KB block holding each boundary, producing the same chunks. On two RTX 4090s at whole genome this is **−9.6%**

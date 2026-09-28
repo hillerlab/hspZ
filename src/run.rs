@@ -117,7 +117,11 @@ pub(crate) fn prepare(args: &RunArgs, phases: &mut Phases) -> Fallible<Prepared>
     let query = Genome::load(query_path, &args.query_prefix, seq_block_size)?;
     phases.add("input.query", t.elapsed());
     let t = Instant::now();
-    let reference = Genome::load(&args.reference, &args.target_prefix, seq_block_size)?;
+    let reference_path = args
+        .reference
+        .as_ref()
+        .ok_or("--reference is required without --index")?;
+    let reference = Genome::load(reference_path, &args.target_prefix, seq_block_size)?;
     phases.add("input.reference", t.elapsed());
     if reference.block_len <= shape.size || query.block_len <= shape.size {
         return Err("reference and query blocks must be longer than the seed".into());
@@ -611,6 +615,143 @@ fn tarball_path(args: &RunArgs) -> Option<PathBuf> {
     })
 }
 
+/// Background reference verifier for `run --index`.
+///
+/// With `--index` the MANIFEST supplies the reference records for planning, and
+/// a `--reference` FASTA given alongside is verified in the background: one
+/// thread runs `read_records` + `records_hash` + the per-bin names/lengths
+/// check and returns the same error texts `index::check_run` gave. Nothing is
+/// published before verification passes: every gated [`Emitter`] joins before
+/// its first sink write, pre-GPU dumps join before creating files, and the run
+/// joins before returning success. Without `--reference` the gate is already
+/// open (no FASTA is read). Cheap to clone: the handle and the cached result
+/// are shared.
+#[derive(Clone)]
+pub(crate) struct VerifyGate {
+    shared: std::sync::Arc<std::sync::Mutex<VerifyState>>,
+    /// Total time gated emitters spent blocked in [`VerifyGate::wait`] on their
+    /// first emit. That wait runs inside the worker scope, while workers keep
+    /// computing, so it is the overlapped `index.verify wait (emitter)` row.
+    waited: std::sync::Arc<std::sync::Mutex<Duration>>,
+    /// Total time joins outside the worker scope spent blocked in
+    /// [`VerifyGate::wait_exposed`] (pre-GPU dumps, `--dump-raw`, a zero-unit
+    /// emitter's `finish`, the final success gate). Nothing else runs then, so
+    /// this is the accounted `index.verify wait` phase.
+    exposed_waited: std::sync::Arc<std::sync::Mutex<Duration>>,
+    /// Whether a background verifier was spawned (a `--reference` was given).
+    /// The ledger adds `input.reference (background)` and the two
+    /// `index.verify wait` rows only then; an open gate adds none.
+    background: bool,
+}
+
+struct VerifyState {
+    handle: Option<std::thread::JoinHandle<Result<Duration, String>>>,
+    result: Option<Result<Duration, String>>,
+}
+
+impl VerifyGate {
+    /// An already-open gate: no FASTA to verify.
+    pub(crate) fn open() -> Self {
+        Self {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(VerifyState {
+                handle: None,
+                result: Some(Ok(Duration::ZERO)),
+            })),
+            waited: std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            exposed_waited: std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            background: false,
+        }
+    }
+
+    /// Spawns the one background verifier: `read_records(reference)` (timed
+    /// for the `input.reference (background)` phase) plus the FASTA half of
+    /// the index check. The returned `Duration` on success is the FASTA parse
+    /// time only, matching what the foreground `input.reference` phase timed.
+    pub(crate) fn spawn(
+        reference: PathBuf,
+        dir: PathBuf,
+        manifest: crate::index::IndexManifest,
+    ) -> Self {
+        let handle = std::thread::spawn(move || -> Result<Duration, String> {
+            let t = Instant::now();
+            let (_, records, _) = sequence::read_records(&reference).map_err(|e| e.to_string())?;
+            let parse = t.elapsed();
+            crate::index::check_run_fasta(&dir, &manifest, &records)?;
+            Ok(parse)
+        });
+        Self {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(VerifyState {
+                handle: Some(handle),
+                result: None,
+            })),
+            waited: std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            exposed_waited: std::sync::Arc::new(std::sync::Mutex::new(Duration::ZERO)),
+            background: true,
+        }
+    }
+
+    pub(crate) fn is_background(&self) -> bool {
+        self.background
+    }
+
+    /// Total time gated emitters spent blocked in [`VerifyGate::wait`].
+    pub(crate) fn waited(&self) -> Duration {
+        *self.waited.lock().expect("verify gate waited lock")
+    }
+
+    /// Total time joins outside the worker scope spent blocked in
+    /// [`VerifyGate::wait_exposed`].
+    pub(crate) fn exposed_waited(&self) -> Duration {
+        *self
+            .exposed_waited
+            .lock()
+            .expect("verify gate exposed lock")
+    }
+
+    fn join(&self) -> Result<Duration, String> {
+        // The guard is held across the join: a second concurrent waiter blocks
+        // on the lock and then sees the cached result, so the handle is never
+        // taken twice and the `expect` below cannot fire on a race.
+        let mut st = self.shared.lock().expect("verify gate lock");
+        if let Some(r) = &st.result {
+            return r.clone();
+        }
+        let h = st
+            .handle
+            .take()
+            .expect("verify gate has neither handle nor result");
+        let r: Result<Duration, String> = h
+            .join()
+            .unwrap_or_else(|_| Err("reference verifier panicked".to_string()));
+        st.result = Some(r.clone());
+        r
+    }
+
+    /// Joins the verifier from an emitter's first emit, inside the worker
+    /// scope, charging the blocked time to the overlapped
+    /// `index.verify wait (emitter)` row (workers keep computing meanwhile).
+    pub(crate) fn wait(&self) -> Result<Duration, String> {
+        let t = Instant::now();
+        let r = self.join();
+        *self.waited.lock().expect("verify gate waited lock") += t.elapsed();
+        r
+    }
+
+    /// Joins the verifier outside the worker scope, charging the blocked time
+    /// to the accounted `index.verify wait` phase: pre-GPU dumps, `--dump-raw`,
+    /// a zero-unit emitter's `finish` and the final success gate use this.
+    /// They must not publish early, and nothing else runs while they block.
+    pub(crate) fn wait_exposed(&self) -> Result<Duration, String> {
+        let t = Instant::now();
+        let r = self.join();
+        *self
+            .exposed_waited
+            .lock()
+            .expect("verify gate exposed lock") += t.elapsed();
+        r
+    }
+}
+
 /// Formats and emits every logical output file.
 ///
 /// What a `write_outputs` call produced, for the benchmark's per-iteration
@@ -629,7 +770,7 @@ pub(crate) struct OutputReport {
 /// `write_outputs` so the multi-bin executor emits every work unit into the
 /// same archive (`-Z`) and shares one `-D` history.
 pub(crate) struct Emitter {
-    sink: Box<dyn OutputSink>,
+    sink: Option<Box<dyn OutputSink>>,
     part: Partitioner,
     diagonal: bool,
     partition_ms: f64,
@@ -638,6 +779,14 @@ pub(crate) struct Emitter {
     files: usize,
     bytes_in: u64,
     audit: Option<BufWriter<std::fs::File>>,
+    /// Output gate for `run --index`: `Some` only on the indexed path, where
+    /// the sink (and the audit file) are created lazily on the first emit,
+    /// after the background reference verification passes. `None` is the
+    /// unchanged eager path.
+    gate: Option<VerifyGate>,
+    pending_output: Option<PathBuf>,
+    pending_tarball: Option<PathBuf>,
+    pending_audit: Option<PathBuf>,
 }
 
 impl Emitter {
@@ -673,7 +822,7 @@ impl Emitter {
             )?;
         }
         Ok(Emitter {
-            sink,
+            sink: Some(sink),
             part: Partitioner::default(),
             diagonal,
             partition_ms: 0.0,
@@ -682,7 +831,78 @@ impl Emitter {
             files: 0,
             bytes_in: 0,
             audit,
+            gate: None,
+            pending_output: None,
+            pending_tarball: None,
+            pending_audit: None,
         })
+    }
+
+    /// Gated counterpart of [`Emitter::new_at`] for `run --index`: no file or
+    /// directory is created here. The sink (and the audit file) are created on
+    /// the first [`Emitter::emit_unit`], after the gate opens, so a failed
+    /// background verification leaves no `.segments` file, archive or dump.
+    pub(crate) fn new_gated(
+        output: &std::path::Path,
+        tarball: Option<&std::path::Path>,
+        diagonal: bool,
+        audit_path: Option<&std::path::Path>,
+        gate: VerifyGate,
+    ) -> Self {
+        Emitter {
+            sink: None,
+            part: Partitioner::default(),
+            diagonal,
+            partition_ms: 0.0,
+            format_ms: 0.0,
+            archive_ms: 0.0,
+            files: 0,
+            bytes_in: 0,
+            audit: None,
+            gate: Some(gate),
+            pending_output: Some(output.to_path_buf()),
+            pending_tarball: tarball.map(|p| p.to_path_buf()),
+            pending_audit: audit_path.map(|p| p.to_path_buf()),
+        }
+    }
+
+    /// Joins the output gate and creates the deferred sink on the gated path.
+    /// A failed verification propagates the verifier's error before any sink
+    /// write (or file creation). The eager path already holds its sink.
+    fn ensure_sink(&mut self) -> Fallible<()> {
+        if self.sink.is_some() {
+            return Ok(());
+        }
+        let gate = self
+            .gate
+            .clone()
+            .expect("deferred emitter sink without a gate");
+        gate.wait()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let output = self
+            .pending_output
+            .take()
+            .expect("deferred emitter sink without an output");
+        let tarball = self.pending_tarball.take();
+        let sink: Box<dyn OutputSink> = match tarball.as_deref() {
+            Some(path) => Box::new(TarGzSink::new(path)?),
+            None => Box::new(DirectorySink::new(&output)?),
+        };
+        self.sink = Some(sink);
+        let mut audit = self
+            .pending_audit
+            .take()
+            .as_deref()
+            .map(|path| std::fs::File::create(path).map(BufWriter::new))
+            .transpose()?;
+        if let Some(out) = audit.as_mut() {
+            writeln!(
+                out,
+                "class\treference\tquery\tstrand\tref_start\tquery_start\tspan\tscore\tframe"
+            )?;
+        }
+        self.audit = audit;
+        Ok(())
     }
 
     /// Emits every logical file for one reference-bin × query-bin work unit.
@@ -698,6 +918,9 @@ impl Emitter {
         rc_chrs: &[Chr],
         pass: &Pass,
     ) -> Fallible<()> {
+        // Output gate: nothing is written before the background reference
+        // verification passes (no-op on the eager path).
+        self.ensure_sink()?;
         if let Some(out) = self.audit.as_mut() {
             for &(strand, accepted) in &pass.audit {
                 let q_chrs = if strand == '-' { rc_chrs } else { query_chrs };
@@ -778,20 +1001,36 @@ impl Emitter {
         let text = hsp::render_records(recs, ref_chrs, q_chrs, strand);
         self.format_ms += t.elapsed().as_secs_f64() * 1000.0;
         let t = Instant::now();
-        self.sink.write_entry(name, text.as_bytes())?;
+        self.sink
+            .as_mut()
+            .expect("emitter sink created before its first write")
+            .write_entry(name, text.as_bytes())?;
         self.archive_ms += t.elapsed().as_secs_f64() * 1000.0;
         Ok(())
     }
 
     pub(crate) fn finish(mut self, phases: &mut Phases) -> Fallible<OutputReport> {
+        // A gated emitter with zero units still creates its empty output dir /
+        // `-Z` archive / audit file here: the gate joins first, so nothing is
+        // created when verification failed (the error propagates instead).
+        // `finish` runs after the worker scope, so that join is exposed.
+        if let (None, Some(gate)) = (&self.sink, &self.gate) {
+            gate.wait_exposed()
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+        self.ensure_sink()?;
         if let Some(out) = self.audit.as_mut() {
             out.flush()?;
         }
-        self.bytes_in = self.sink.bytes_in();
+        let sink = self
+            .sink
+            .take()
+            .expect("emitter sink exists after ensure_sink");
+        self.bytes_in = sink.bytes_in();
         let t = Instant::now();
         // Only a finished sink knows its size on disk: `-Z` still holds its last
         // gzip block and both trailers in buffers until `finish`.
-        let bytes_out = self.sink.finish()?;
+        let bytes_out = sink.finish()?;
         self.archive_ms += t.elapsed().as_secs_f64() * 1000.0;
         phases.add_ms("partition", self.partition_ms);
         phases.add_ms("format", self.format_ms);
@@ -810,22 +1049,26 @@ impl Emitter {
 /// Writes a `--dump-plan` membership table: one `side<TAB>bin<TAB>record<TAB>bp`
 /// line per record, reference side first. Shared by the single-query path and
 /// the batch executor, which calls it once per job at a per-job sibling path.
+/// The reference side takes planner metadata (name/len), which on the
+/// `--index` path comes from the MANIFEST instead of the FASTA; the query
+/// side always comes from the parsed query records.
 fn write_plan_dump(
     path: &std::path::Path,
     plan: &plan::Plan,
-    ref_records: &[(String, Vec<u8>)],
+    ref_meta: &[RecordMeta],
     qry_records: &[(String, Vec<u8>)],
 ) -> Fallible<()> {
     let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
-    for (side, bins, recs) in [
-        ("reference", &plan.reference_bins, ref_records),
-        ("query", &plan.query_bins, qry_records),
-    ] {
-        for b in bins {
-            for &id in &b.record_ids {
-                let (name, seq) = &recs[id as usize];
-                writeln!(f, "{side}\t{}\t{name}\t{}", b.id, seq.len())?;
-            }
+    for b in &plan.reference_bins {
+        for &id in &b.record_ids {
+            let m = &ref_meta[id as usize];
+            writeln!(f, "reference\t{}\t{}\t{}", b.id, m.name, m.len)?;
+        }
+    }
+    for b in &plan.query_bins {
+        for &id in &b.record_ids {
+            let (name, seq) = &qry_records[id as usize];
+            writeln!(f, "query\t{}\t{name}\t{}", b.id, seq.len())?;
         }
     }
     f.flush()?;
@@ -835,7 +1078,9 @@ fn write_plan_dump(
 /// Builds the manifest `--dump-manifest` writes for a fresh (non-replay) run.
 /// `executable_hash` is passed in because the batch computes it once for every
 /// job, while the single-query path calls [`plan::executable_hash`] only here
-/// so an ordinary run pays no hashing overhead.
+/// so an ordinary run pays no hashing overhead. `ref_hash` is
+/// `plan::records_hash` of the reference records, or the index MANIFEST's
+/// `ref_records_hash` on the `--index` path (same value, no FASTA).
 #[allow(clippy::too_many_arguments)]
 fn plan_manifest(
     args: &RunArgs,
@@ -843,7 +1088,7 @@ fn plan_manifest(
     sub_mat: &[i32],
     res_seq: u64,
     res_qry: u64,
-    ref_records: &[(String, Vec<u8>)],
+    ref_hash: u64,
     qry_records: &[(String, Vec<u8>)],
     plan: &plan::Plan,
     executable_hash: u64,
@@ -865,7 +1110,7 @@ fn plan_manifest(
         kegalign_bins: args.kegalign_bins,
         seq_block_size: res_seq,
         query_block_size: res_qry,
-        ref_hash: plan::records_hash(ref_records),
+        ref_hash,
         qry_hash: plan::records_hash(qry_records),
         executable_hash,
         sub_mat: sub_mat.to_vec(),
@@ -1437,7 +1682,10 @@ fn run_bins(
     reference_bins: &[plan::Bin],
     jobs: &[BatchJob<'_>],
     slots: &[Vec<SlotEntry>],
-    ref_records: &[(String, Vec<u8>)],
+    // The parsed reference records. `None` on the `--index` path, where every
+    // visit loads its bin from the index and the bytes are unreachable (the
+    // background verifier checked the FASTA instead); `Some` otherwise.
+    ref_records: Option<&[(String, Vec<u8>)]>,
     shape: &Shape,
     sub_mat: &[i32],
     transitions: bool,
@@ -1494,7 +1742,7 @@ fn run_bins(
                 } else {
                     build_ref_bin(
                         rbin,
-                        ref_records,
+                        ref_records.expect("reference records are present without --index"),
                         &args.target_prefix,
                         shape,
                         args.step,
@@ -1564,7 +1812,7 @@ fn run_bins(
                         Ok((
                             build_ref_bin(
                                 nb,
-                                ref_records,
+                                ref_records.expect("reference records are present without --index"),
                                 &args.target_prefix,
                                 shape,
                                 args.step,
@@ -1833,7 +2081,10 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let sub_mat = scoring::build_sub_mat(&args.ambiguous, args.xdrop, args.scoring.as_deref())?;
     let transitions = !args.notransition;
 
-    // Load both sides as raw records — no block-size guard.
+    // Load the query as raw records — no block-size guard. With `--index`
+    // the MANIFEST supplies the reference records for planning, so the FASTA
+    // is never read on the foreground path: it is verified against the index
+    // in the background instead (or not read at all).
     let query_path = args
         .query
         .as_ref()
@@ -1841,11 +2092,36 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let t = Instant::now();
     let (_, qry_records, _) = sequence::read_records(query_path)?;
     phases.add("input.query", t.elapsed());
-    let t = Instant::now();
-    let (_, ref_records, _) = sequence::read_records(&args.reference)?;
-    phases.add("input.reference", t.elapsed());
+    // The owned reference records without `--index`; empty with it (the
+    // executor's `None` says the bytes are unreachable there).
+    let mut ref_records_owned: Vec<(String, Vec<u8>)> = Vec::new();
+    // The preloaded index MANIFEST with `--index`, plus the background
+    // verifier gate (`Some` whenever `--index` is given).
+    let mut index_manifest_owned: Option<crate::index::IndexManifest> = None;
+    let mut verify_gate: Option<VerifyGate> = None;
+    if let Some(dir) = &args.index {
+        let manifest = crate::index::load_manifest(dir)?;
+        verify_gate = Some(match &args.reference {
+            Some(reference) => VerifyGate::spawn(reference.clone(), dir.clone(), manifest.clone()),
+            None => VerifyGate::open(),
+        });
+        index_manifest_owned = Some(manifest);
+    } else {
+        let t = Instant::now();
+        let reference = args
+            .reference
+            .as_ref()
+            .ok_or("--reference is required without --index")?;
+        let (_, ref_records, _) = sequence::read_records(reference)?;
+        phases.add("input.reference", t.elapsed());
+        ref_records_owned = ref_records;
+    }
+    let ref_records: &[(String, Vec<u8>)] = &ref_records_owned;
 
-    let ref_meta = record_meta(&ref_records);
+    let ref_meta = match &index_manifest_owned {
+        Some(manifest) => manifest.ref_record_meta(),
+        None => record_meta(ref_records),
+    };
     let qry_meta = record_meta(&qry_records);
 
     // Manifest replay: every check that does not need the GPU — format,
@@ -1864,7 +2140,32 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             let text = std::fs::read_to_string(path)?;
             let m = plan::PlanManifest::read(&text)?;
             m.check_software()?;
-            m.check_inputs(&ref_records, &qry_records)?;
+            match &index_manifest_owned {
+                // With `--index` the reference identity comes from the index
+                // MANIFEST (`ref_records_hash`), never the FASTA: same
+                // `check_inputs` error texts, on the manifest's hashes.
+                Some(index_manifest) => {
+                    let rh = index_manifest.ref_records_hash();
+                    if rh != m.ref_hash {
+                        return Err(format!(
+                            "manifest ref_hash {:016x} != this node's {:016x}",
+                            m.ref_hash, rh
+                        )
+                        .into());
+                    }
+                    let qh = plan::records_hash(&qry_records);
+                    if qh != m.qry_hash {
+                        return Err(format!(
+                            "manifest qry_hash {:016x} != this node's {:016x}",
+                            m.qry_hash, qh
+                        )
+                        .into());
+                    }
+                }
+                None => {
+                    m.check_inputs(ref_records, &qry_records)?;
+                }
+            }
             check_manifest_params(&m, args, &sub_mat)?;
             m.validate_records(&ref_meta, &qry_meta)?;
             Ok(m)
@@ -1996,24 +2297,60 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     }
     phases.add("plan", t.elapsed());
 
+    // Round 95: `--index` does not change the planner. The plan above is
+    // authoritative; its reference bins must equal the index's, or the run
+    // errors here naming the mismatch, before any CUDA upload. `res_seq` is
+    // the resolved target (the frozen manifest's on replay, where the CLI
+    // default is meaningless). The MANIFEST was loaded before planning; only
+    // the FASTA-free half runs here, while the FASTA half runs in the
+    // background verifier. This check runs before the dumps below so an
+    // incompatible index fails fast and leaves no dump behind (as in batch).
+    let index_ctx: Option<(PathBuf, crate::index::IndexManifest)> = match &args.index {
+        Some(dir) => {
+            let manifest = index_manifest_owned
+                .take()
+                .expect("index manifest preloaded");
+            crate::index::check_run_fasta_free(dir, &manifest, args, res_seq, &plan)?;
+            Some((dir.clone(), manifest))
+        }
+        None => None,
+    };
+
+    // Output gate: every file below is created only after the background
+    // reference verification passes (no-op without `--index`).
+    let dump_gate = |gate: &Option<VerifyGate>| -> Fallible<()> {
+        if let Some(g) = gate {
+            g.wait_exposed()
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+        Ok(())
+    };
     if let Some(path) = &args.dump_plan {
-        write_plan_dump(path, &plan, &ref_records, &qry_records)?;
+        dump_gate(&verify_gate)?;
+        write_plan_dump(path, &plan, &ref_meta, &qry_records)?;
     }
     if let Some(path) = &args.dump_manifest {
+        dump_gate(&verify_gate)?;
         match &loaded_manifest {
             // Replay + dump: re-emit exactly what was loaded and validated,
             // never a reconstruction from this run's B/Q CLI defaults.
             Some(m) => write_manifest_dump(path, m)?,
             None => {
                 // Fresh dump only: this is the one place `plan::executable_hash`
-                // runs, so an ordinary run pays no hashing overhead.
+                // runs, so an ordinary run pays no hashing overhead. The
+                // reference identity is the FASTA's hash, or the index
+                // MANIFEST's `ref_records_hash` on the `--index` path.
+                let ref_hash = match &index_ctx {
+                    Some((_, manifest)) => manifest.ref_records_hash(),
+                    None => plan::records_hash(ref_records),
+                };
                 let m = plan_manifest(
                     args,
                     &contract,
                     &sub_mat,
                     res_seq,
                     res_qry,
-                    &ref_records,
+                    ref_hash,
                     &qry_records,
                     &plan,
                     plan::executable_hash()?,
@@ -2023,19 +2360,6 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         }
     }
 
-    // Round 95: `--index` does not change the planner. The plan above is
-    // authoritative; its reference bins must equal the index's, or the run
-    // errors here naming the mismatch, before any CUDA upload. `res_seq` is
-    // the resolved target (the frozen manifest's on replay, where the CLI
-    // default is meaningless).
-    let index_ctx: Option<(PathBuf, crate::index::IndexManifest)> = match &args.index {
-        Some(dir) => {
-            let manifest = crate::index::load_manifest(dir)?;
-            crate::index::check_run(dir, &manifest, args, res_seq, &ref_records, &plan)?;
-            Some((dir.clone(), manifest))
-        }
-        None => None,
-    };
     let index_ref = index_ctx.as_ref().map(|(d, m)| (d.as_path(), m));
     if let Some((dir, manifest)) = &index_ctx {
         let (n_bins, seq, seed, step) = manifest.run_summary();
@@ -2167,7 +2491,18 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // against its own measured RSS without re-deriving the model.
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
 
-    let mut emitter = Emitter::new(args)?;
+    // The gated emitter creates no file or directory until the background
+    // verification passes (first emit); the eager path is unchanged.
+    let mut emitter = match &verify_gate {
+        Some(gate) => Emitter::new_gated(
+            &args.output,
+            tarball_path(args).as_deref(),
+            args.diagonal_partition,
+            crate::census::SurvivorAudit::dump_path().as_deref(),
+            gate.clone(),
+        ),
+        None => Emitter::new(args)?,
+    };
     let mut raw_all: Vec<(char, Vec<SegmentPair>)> = Vec::new();
     // The emitter consumes units strictly in `WorkUnit.ordinal` order, so
     // `-D` history, file names and tar entry order never depend on which GPU
@@ -2200,6 +2535,14 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         qry_records: &qry_records,
     }];
     let single_slots = build_slot_lists(&plan.reference_bins, &single_jobs);
+    // With `--index` every visit loads its bin; the FASTA bytes are
+    // unreachable, so the workers get `None` (the background verifier checked
+    // the file instead).
+    let ref_records_opt: Option<&[(String, Vec<u8>)]> = if index_ref.is_some() {
+        None
+    } else {
+        Some(ref_records)
+    };
     let reports = std::thread::scope(|scope| -> Fallible<Vec<WorkerReport>> {
         let mut handles = Vec::new();
         for (w, visits) in part.iter().enumerate() {
@@ -2208,7 +2551,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                 &plan.reference_bins,
                 &single_jobs[..],
                 &single_slots,
-                &ref_records,
+                ref_records_opt,
                 &shape,
                 &sub_mat,
             );
@@ -2489,9 +2832,19 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     }
     lifecycle.check(total_visits as u32, plan.units.len() as u32)?;
     if let Some((dir, _)) = &index_ctx {
+        // Without `-r` nothing checked the stored hash or the record
+        // lengths, so the line must not claim they were validated.
+        let validated = if verify_gate
+            .as_ref()
+            .map(|g| g.is_background())
+            .unwrap_or(false)
+        {
+            "validated: records_hash, lengths, checksums, monotone ends"
+        } else {
+            "validated: checksums, monotone ends; reference: not given, index trusted"
+        };
         eprintln!(
-            "index: loaded {} bins from {} in {:.0} ms (validated: records_hash, lengths, \
-             checksums, monotone ends)",
+            "index: loaded {} bins from {} in {:.0} ms ({validated})",
             lifecycle.index_loads,
             dir.display(),
             index_standalone_ms.as_secs_f64() * 1000.0,
@@ -2499,6 +2852,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     }
 
     if let Some(path) = &args.dump_raw {
+        // Output gate: the dump file is created only after verification.
+        dump_gate(&verify_gate)?;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         for (strand, raw) in &raw_all {
             for h in raw {
@@ -2514,6 +2869,23 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     }
 
     let out = emitter.finish(&mut phases)?;
+    // Output gate: the run joins the verifier before returning success even
+    // if nothing was emitted (a failed verification returns its error here,
+    // and no `.segments` file, archive or dump has been created).
+    if let Some(gate) = &verify_gate {
+        let parse = gate
+            .wait_exposed()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if gate.is_background() {
+            // The verifier ran concurrently with the foreground: its parse is
+            // overlapped. Joins outside the worker scope stalled the whole run
+            // and are accounted; an emitter's first-emit wait ran alongside
+            // worker phases, so it is reported overlapped (never counted twice).
+            phases.add_overlapped("input.reference (background)", parse);
+            phases.add("index.verify wait", gate.exposed_waited());
+            phases.add_overlapped("index.verify wait (emitter)", gate.waited());
+        }
+    }
     report_counts(&stats);
     if args.time {
         let wall = pre_main_ms + started.elapsed().as_secs_f64() * 1000.0;
@@ -2943,10 +3315,35 @@ fn run_batch(
     let sub_mat = scoring::build_sub_mat(&args.ambiguous, args.xdrop, args.scoring.as_deref())?;
     let transitions = !args.notransition;
 
-    let t = Instant::now();
-    let (_, ref_records, ref_bytes) = sequence::read_records(&args.reference)?;
-    phases.add("input.reference", t.elapsed());
-    let ref_meta = record_meta(&ref_records);
+    // With `--index` the MANIFEST supplies the reference records for planning;
+    // the FASTA is verified in the background instead (or not read at all).
+    let mut ref_records_owned: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut ref_bytes: u64 = 0;
+    let mut index_manifest_owned: Option<crate::index::IndexManifest> = None;
+    let mut verify_gate: Option<VerifyGate> = None;
+    if let Some(dir) = &args.index {
+        let manifest = crate::index::load_manifest(dir)?;
+        verify_gate = Some(match &args.reference {
+            Some(reference) => VerifyGate::spawn(reference.clone(), dir.clone(), manifest.clone()),
+            None => VerifyGate::open(),
+        });
+        index_manifest_owned = Some(manifest);
+    } else {
+        let t = Instant::now();
+        let reference = args
+            .reference
+            .as_ref()
+            .ok_or("--reference is required without --index")?;
+        let (_, ref_records, bytes) = sequence::read_records(reference)?;
+        phases.add("input.reference", t.elapsed());
+        ref_records_owned = ref_records;
+        ref_bytes = bytes;
+    }
+    let ref_records: &[(String, Vec<u8>)] = &ref_records_owned;
+    let ref_meta = match &index_manifest_owned {
+        Some(manifest) => manifest.ref_record_meta(),
+        None => record_meta(ref_records),
+    };
     let ref_bp_total: u64 = ref_meta.iter().map(|r| r.len).sum();
 
     // Round 90b gate, read once here as in `run` (a bad value is a startup
@@ -3024,11 +3421,15 @@ fn run_batch(
     }
 
     // Round 95: like the single-query path, `--index` leaves planning alone
-    // and requires the shared reference bins to equal the index's.
+    // and requires the shared reference bins to equal the index's. The
+    // MANIFEST was loaded before planning; only the FASTA-free half runs
+    // here, while the FASTA half runs in the background verifier.
     let index_ctx: Option<(PathBuf, crate::index::IndexManifest)> = match &args.index {
         Some(dir) => {
-            let manifest = crate::index::load_manifest(dir)?;
-            crate::index::check_run(dir, &manifest, args, res_seq, &ref_records, &plans[0])?;
+            let manifest = index_manifest_owned
+                .take()
+                .expect("index manifest preloaded");
+            crate::index::check_run_fasta_free(dir, &manifest, args, res_seq, &plans[0])?;
             Some((dir.clone(), manifest))
         }
         None => None,
@@ -3109,23 +3510,46 @@ fn run_batch(
     plan_ms += tp.elapsed();
     phases.add("plan", plan_ms);
 
+    // Output gate: every file below is created only after the background
+    // reference verification passes (no-op without `--index`).
+    let dump_gate = |gate: &Option<VerifyGate>| -> Fallible<()> {
+        if let Some(g) = gate {
+            g.wait_exposed()
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
+        Ok(())
+    };
     if let Some(path) = &args.dump_plan {
+        dump_gate(&verify_gate)?;
         for (j, p) in plans.iter().enumerate() {
-            write_plan_dump(&job_sibling(path, j), p, &ref_records, &qry_records_list[j])?;
+            write_plan_dump(&job_sibling(path, j), p, &ref_meta, &qry_records_list[j])?;
         }
     }
     if let Some(path) = &args.dump_manifest {
+        dump_gate(&verify_gate)?;
         // One executable hash for every job's manifest. Batch rejects
-        // `--from-manifest`, so every manifest here is a fresh dump.
+        // `--from-manifest`, so every manifest here is a fresh dump. The
+        // reference identity is the FASTA's hash, or the index MANIFEST's
+        // `ref_records_hash` on the `--index` path.
         let executable_hash = plan::executable_hash()?;
+        let batch_ref_hash: Option<u64> = index_ctx
+            .as_ref()
+            .map(|(_, manifest)| manifest.ref_records_hash());
         for (j, p) in plans.iter().enumerate() {
+            // Without `--index` this hashes the reference records per job, as
+            // `plan_manifest` always did; with `--index` it is the MANIFEST's
+            // hash (same value, no FASTA).
+            let ref_hash = match batch_ref_hash {
+                Some(h) => h,
+                None => plan::records_hash(ref_records),
+            };
             let m = plan_manifest(
                 args,
                 &contract,
                 &sub_mat,
                 res_seq,
                 q_target,
-                &ref_records,
+                ref_hash,
                 &qry_records_list[j],
                 p,
                 executable_hash,
@@ -3284,8 +3708,15 @@ fn run_batch(
     }
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
 
-    // One emitter (+ `-D` history) per job, each starting empty.
-    std::fs::create_dir_all(&args.output)?;
+    // One emitter (+ `-D` history) per job, each starting empty. With
+    // `--index` the emitters are gated (no file or directory is created until
+    // the background verification passes on the first emit), so the top-level
+    // output directory is not created here either; the per-job lazy sinks
+    // create their own parents, and `queries.tsv` creates it after the final
+    // join when nothing was emitted.
+    if verify_gate.is_none() {
+        std::fs::create_dir_all(&args.output)?;
+    }
     let batch_tarball = args.tarball.is_some();
     if let Some(p) = &args.tarball {
         // Bare `-Z` (clap's `-` sentinel) and an empty value mean the default
@@ -3311,12 +3742,21 @@ fn run_batch(
             (args.output.join(&tag), None)
         };
         let audit_path = audit_base.as_ref().map(|p| job_sibling(p, j));
-        emitters.push(Emitter::new_at(
-            &dir,
-            tar.as_deref(),
-            args.diagonal_partition,
-            audit_path.as_deref(),
-        )?);
+        emitters.push(match &verify_gate {
+            Some(gate) => Emitter::new_gated(
+                &dir,
+                tar.as_deref(),
+                args.diagonal_partition,
+                audit_path.as_deref(),
+                gate.clone(),
+            ),
+            None => Emitter::new_at(
+                &dir,
+                tar.as_deref(),
+                args.diagonal_partition,
+                audit_path.as_deref(),
+            )?,
+        });
     }
     let mut router = JobRouter::new(plans.iter().map(|p| p.units.len() as u32).collect());
     // Per-unit completion times and raw dumps are receiver-side (emission
@@ -3365,6 +3805,13 @@ fn run_batch(
     let mut receiver_emit = Duration::ZERO;
     let reports = std::thread::scope(|scope| -> Fallible<Vec<WorkerReport>> {
         let mut handles = Vec::new();
+        // With `--index` the FASTA bytes are unreachable (the background
+        // verifier checked the file instead); every visit loads its bin.
+        let batch_ref_records: Option<&[(String, Vec<u8>)]> = if index_ref.is_some() {
+            None
+        } else {
+            Some(ref_records)
+        };
         for (w, visits) in part.iter().enumerate() {
             let tx = tx.clone();
             // Fresh shared borrows per iteration (as in `run`): the `move`
@@ -3374,7 +3821,7 @@ fn run_batch(
                 &plans[0].reference_bins,
                 &batch_jobs[..],
                 &slot_lists[..],
-                &ref_records,
+                batch_ref_records,
                 &shape,
                 &sub_mat,
             );
@@ -3607,8 +4054,18 @@ fn run_batch(
     lifecycle.check(total_visits as u32, total_units as u32)?;
 
     phases.add("seed table build", seed_table_ms);
-    if receiver_emit > Duration::ZERO {
-        phases.add("receiver emit", receiver_emit);
+    // The receiver's `emit_unit` blocks in the output gate on each job's
+    // first emit; that blocked time is the overlapped `index.verify wait
+    // (emitter)` row below, not emit work, so it is excluded here.
+    let gate_wait = verify_gate
+        .as_ref()
+        .map(|g| g.waited())
+        .unwrap_or(Duration::ZERO);
+    let pure_emit = receiver_emit
+        .checked_sub(gate_wait)
+        .unwrap_or(Duration::ZERO);
+    if pure_emit > Duration::ZERO {
+        phases.add("receiver emit", pure_emit);
     }
     if prefetched_ms > Duration::ZERO {
         phases.add_overlapped("reference bin prep (standalone)", prefetched_ms);
@@ -3617,9 +4074,19 @@ fn run_batch(
         phases.add_overlapped("index load", index_standalone_ms);
     }
     if let Some((dir, _)) = &index_ctx {
+        // Without `-r` nothing checked the stored hash or the record
+        // lengths, so the line must not claim they were validated.
+        let validated = if verify_gate
+            .as_ref()
+            .map(|g| g.is_background())
+            .unwrap_or(false)
+        {
+            "validated: records_hash, lengths, checksums, monotone ends"
+        } else {
+            "validated: checksums, monotone ends; reference: not given, index trusted"
+        };
         eprintln!(
-            "index: loaded {} bins from {} in {:.0} ms (validated: records_hash, lengths, \
-             checksums, monotone ends)",
+            "index: loaded {} bins from {} in {:.0} ms ({validated})",
             lifecycle.index_loads,
             dir.display(),
             index_standalone_ms.as_secs_f64() * 1000.0,
@@ -3627,6 +4094,11 @@ fn run_batch(
     }
 
     if let Some(path) = &args.dump_raw {
+        // Output gate: each dump file is created only after verification.
+        if let Some(gate) = &verify_gate {
+            gate.wait_exposed()
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        }
         for (j, raw) in job_raw.iter().enumerate() {
             let mut f = std::io::BufWriter::new(std::fs::File::create(job_sibling(path, j))?);
             for (strand, hsps) in raw {
@@ -3652,7 +4124,26 @@ fn run_batch(
         total_bytes_out += out.bytes_out;
     }
 
-    // OUT/queries.tsv: per-job identity and completion.
+    // OUT/queries.tsv: per-job identity and completion. Output gate: written
+    // only after the background verification passes (a failed verification
+    // returns its error here, with no per-job output created).
+    if let Some(gate) = &verify_gate {
+        let parse = gate
+            .wait_exposed()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        if gate.is_background() {
+            // The verifier ran concurrently with the foreground: its parse is
+            // overlapped. Joins outside the worker scope stalled the whole run
+            // and are accounted; an emitter's first-emit wait ran alongside
+            // worker phases, so it is reported overlapped (never counted twice).
+            phases.add_overlapped("input.reference (background)", parse);
+            phases.add("index.verify wait", gate.exposed_waited());
+            phases.add_overlapped("index.verify wait (emitter)", gate.waited());
+        }
+        // The top-level output directory was not created up front on the
+        // gated path; nothing was emitted, so create it for the tsv.
+        std::fs::create_dir_all(&args.output)?;
+    }
     {
         let mut f =
             std::io::BufWriter::new(std::fs::File::create(args.output.join("queries.tsv"))?);
@@ -4178,7 +4669,7 @@ mod tests {
     fn prepare_rejects_kegalign_with_auto_layout() {
         let mut phases = Phases::new();
         let mut auto = base_args();
-        auto.reference = PathBuf::from("/nonexistent/ref.fa");
+        auto.reference = Some(PathBuf::from("/nonexistent/ref.fa"));
         auto.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         auto.seq_block_size = 0;
         auto.kegalign_bins = true;
@@ -4812,14 +5303,14 @@ mod tests {
         let mut phases = Phases::new();
 
         let mut from_manifest = base_args();
-        from_manifest.reference = PathBuf::from("/nonexistent/ref.fa");
+        from_manifest.reference = Some(PathBuf::from("/nonexistent/ref.fa"));
         from_manifest.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         from_manifest.from_manifest = Some(PathBuf::from("/nonexistent/plan.manifest"));
         let err = prepare(&from_manifest, &mut phases).err().unwrap();
         assert!(err.to_string().contains("--from-manifest"), "{err}");
 
         let mut dump_manifest = base_args();
-        dump_manifest.reference = PathBuf::from("/nonexistent/ref.fa");
+        dump_manifest.reference = Some(PathBuf::from("/nonexistent/ref.fa"));
         dump_manifest.query = Some(PathBuf::from("/nonexistent/qry.fa"));
         dump_manifest.dump_manifest = Some(PathBuf::from("/nonexistent/out.manifest"));
         let err = prepare(&dump_manifest, &mut phases).err().unwrap();
@@ -4993,7 +5484,7 @@ mod tests {
             std::fs::create_dir(&dir).unwrap();
 
             let mut emitter = Emitter {
-                sink: Box::new(DirectorySink::new(&dir).unwrap()),
+                sink: Some(Box::new(DirectorySink::new(&dir).unwrap())),
                 part: Partitioner::default(),
                 diagonal: false,
                 partition_ms: 0.0,
@@ -5002,6 +5493,10 @@ mod tests {
                 files: 0,
                 bytes_in: 0,
                 audit: None,
+                gate: None,
+                pending_output: None,
+                pending_tarball: None,
+                pending_audit: None,
             };
 
             for &i in order {
@@ -5183,6 +5678,7 @@ mod tests {
 #[cfg(test)]
 mod partition_policy_tests {
     use super::partition_policy;
+    use super::{VerifyGate, VerifyState};
     use crate::gpu::DeviceProfile;
 
     fn p(sms: i32, mhz: i32, mib: u64) -> DeviceProfile {
@@ -5265,5 +5761,30 @@ mod partition_policy_tests {
             partition_policy(Some("2"), 2, &[]).unwrap_err(),
             "HSPZ_UNIT_PARTITION must be unset, 0 or 1, got \"2\""
         );
+    }
+
+    /// Two threads racing `wait()` on one spawned gate both get the same
+    /// result: the join holds the lock, so the handle is taken exactly once
+    /// and the second waiter sees the cached result instead of panicking.
+    #[test]
+    fn verify_gate_concurrent_wait_shares_one_result() {
+        let gate = VerifyGate {
+            shared: std::sync::Arc::new(std::sync::Mutex::new(VerifyState {
+                handle: Some(std::thread::spawn(|| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    Ok(std::time::Duration::from_millis(1))
+                })),
+                result: None,
+            })),
+            waited: std::sync::Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
+            exposed_waited: std::sync::Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
+            background: true,
+        };
+        let other = gate.clone();
+        let h = std::thread::spawn(move || other.wait());
+        let a = gate.wait();
+        let b = h.join().expect("waiter panicked");
+        assert_eq!(a, b);
+        assert!(a.is_ok());
     }
 }
