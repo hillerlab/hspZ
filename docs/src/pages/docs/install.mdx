@@ -6,15 +6,15 @@ import DocsLayout from "../../layouts/DocsLayout.astro"
 
 ## NVIDIA container
 
-Version `0.0.3` embeds sm_75 PTX for Turing and newer NVIDIA GPUs and was built
+Version `0.0.4` embeds sm_75 PTX for Turing and newer NVIDIA GPUs and was built
 against CUDA 12.4 headers. The host needs an NVIDIA driver from the 550 series
 or newer and the NVIDIA Container Toolkit.
 
 ```bash
-docker pull ghcr.io/hillerlab/hspz:0.0.3
+docker pull ghcr.io/hillerlab/hspz:0.0.4
 docker run --rm --gpus all \
   -v "$PWD:/data" \
-  ghcr.io/hillerlab/hspz:0.0.3 \
+  ghcr.io/hillerlab/hspz:0.0.4 \
   hspZ --version
 ```
 
@@ -27,12 +27,12 @@ The ZLUDA image is a validated correctness backend, not a claim that AMD and
 native NVIDIA have the same performance.
 
 ```bash
-docker pull ghcr.io/hillerlab/hspz:0.0.3-zluda
+docker pull ghcr.io/hillerlab/hspz:0.0.4-zluda
 docker run --rm \
   --device=/dev/kfd --device=/dev/dri \
   --group-add video --group-add render \
   -v "$PWD:/data" \
-  ghcr.io/hillerlab/hspz:0.0.3-zluda \
+  ghcr.io/hillerlab/hspz:0.0.4-zluda \
   hspZ --version
 ```
 
@@ -41,7 +41,7 @@ docker run --rm \
 ## Floating tags
 
 `:latest` and `:zluda` move only after the release passes the Kaggle T4 gate.
-Use `:0.0.3` and `:0.0.3-zluda` when reproducibility matters.
+Use `:0.0.4` and `:0.0.4-zluda` when reproducibility matters.
 
 ## Build from source
 

@@ -170,7 +170,7 @@ impl Prepared {
         (&self.shape, self.transitions)
     }
 
-    /// This input as the single query bin of a 1x1 plan (AM-B2).
+    /// This input as the single query bin of a 1x1 plan.
     pub(crate) fn query_pass(&self) -> QueryPass<'_> {
         QueryPass {
             fwd: self.enc_query_source(),
@@ -180,7 +180,7 @@ impl Prepared {
         }
     }
 
-    /// The encoded query strands `Engine::swap_query` consumes (AM-B1).
+    /// The encoded query strands `Engine::swap_query` consumes.
     ///
     /// A single-block run is a 1x1 plan, so this is that plan's only query bin.
     pub(crate) fn encoded_query(&self) -> (&[u8], &[u8]) {
@@ -328,7 +328,7 @@ impl SeedSlot {
 ///
 /// `intervals` and `q_block_len` are per query bin. A multi-bin executor derives
 /// them from that bin's own `block_len`; reusing whole-genome intervals here would
-/// silently seed the wrong ranges, which is the trap AM-B2 names.
+/// silently seed the wrong ranges.
 pub(crate) struct QueryPass<'a> {
     pub fwd: &'a [u8],
     pub rc: &'a [u8],
@@ -463,7 +463,7 @@ pub(crate) fn seed_and_filter_all(
         // Two things turn the overlap off, both because it cannot work without them:
         // pageable staging (an async copy from unpinned memory blocks until staged, so
         // ZLUDA never overlaps), and reallocated seed buffers (an upload in flight into
-        // a freed buffer is AM-B's use-after-free).
+        // a freed buffer is a use-after-free).
         let first = new_slot(engine);
         let overlap = !args.no_async_seed_copy
             && !args.no_persistent_seed_buffers
@@ -789,8 +789,9 @@ impl Emitter {
         }
         self.bytes_in = self.sink.bytes_in();
         let t = Instant::now();
-        let bytes_out = self.sink.bytes_out().unwrap_or(0);
-        Box::new(self.sink).finish()?;
+        // Only a finished sink knows its size on disk: `-Z` still holds its last
+        // gzip block and both trailers in buffers until `finish`.
+        let bytes_out = self.sink.finish()?;
         self.archive_ms += t.elapsed().as_secs_f64() * 1000.0;
         phases.add_ms("partition", self.partition_ms);
         phases.add_ms("format", self.format_ms);
@@ -944,7 +945,7 @@ impl TimeFooter<'_> {
             self.phases.report(self.wall_ms)
         );
         eprintln!("  kernel launches: {}", self.launches);
-        // Phase 1 §12: the mechanism gate. `stage` waits are the ones stream
+        // The mechanism gate. `stage` waits are the ones stream
         // ordering makes unnecessary and are 0 with --async-stages.
         eprintln!(
             "  host syncs: {} stage, {} pipeline ({} per launch)",
@@ -988,8 +989,8 @@ impl TimeFooter<'_> {
             if self.diagonal { " (-D)" } else { "" }
         );
         eprintln!("  peak RSS: {:>10} KiB", timing::peak_rss_kib());
-        // Phase 1 §9: the host-budget decision, in the same units as the line
-        // above so §11's validation is a subtraction.
+        // The host-budget decision, in the same units as the line above so
+        // validating it against measured RSS is a subtraction.
         let mib = |b: u64| b as f64 / 1048576.0;
         eprintln!(
             "  host budget: estimated peak {:.0} MiB (shared {:.0} + {} worker(s), \
@@ -1041,7 +1042,7 @@ pub(crate) fn write_outputs(
 // ---------------------------------------------------------------------------
 // Multi-GPU execution (Phase 5)
 
-/// One finished work unit on its way to the emitter (§19).
+/// One finished work unit on its way to the emitter.
 ///
 /// Workers complete units in whatever order their GPU gets to them; the emitter
 /// replays them by ordinal, so `-D` history, file names and tar entry order never
@@ -1419,7 +1420,7 @@ pub(crate) fn build_slot_lists(
 ///
 /// This is the serial executor, parameterised by which visits it owns: with one
 /// worker (or the whole-bin policy) every visit is a whole bin, which is what
-/// makes `serial == multi-GPU` (§20) a property of the assignment rather than
+/// makes `serial == multi-GPU` a property of the assignment rather than
 /// of two code paths. One engine per visit, reused across the slice.
 ///
 /// Round 96: consumes tagged work — `visits` index `slots` (per-bin
@@ -1597,7 +1598,7 @@ fn run_bins(
                 );
                 let pack_dur = t.elapsed();
                 rep.phases.add("query pack", pack_dur);
-                // Per-bin intervals + q_block_len (AM-B2). `intervals` is empty for a
+                // Per-bin intervals + q_block_len. `intervals` is empty for a
                 // block <= seed, and `q_block_len` is then never read; saturating
                 // avoids the underflow the single-block path guards with an error.
                 let intervals =
@@ -1830,7 +1831,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let sub_mat = scoring::build_sub_mat(&args.ambiguous, args.xdrop, args.scoring.as_deref())?;
     let transitions = !args.notransition;
 
-    // Load both sides as raw records — no block-size guard (§10).
+    // Load both sides as raw records — no block-size guard.
     let query_path = args
         .query
         .as_ref()
@@ -2042,7 +2043,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         );
     }
 
-    // §18: reference bins to workers, deterministic LPT (whole-bin), or the
+    // Reference bins to workers, deterministic LPT (whole-bin), or the
     // round-90 unit partition. `cost(R) = reference_bp x total_query_bp` is
     // monotone in the bin's own bp — LPT on `total_bp` is the same schedule with
     // less arithmetic (plan::assign_bins). W = 1 always takes today's path.
@@ -2121,7 +2122,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     if workers > devices {
         eprintln!(
             "note: {workers} workers over {devices} device(s) — they time-slice one GPU. \
-             That is a correctness configuration (§20), not a performance one."
+             That is a correctness configuration, not a performance one."
         );
     }
 
@@ -2129,7 +2130,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // side; here we size host RAM for `workers` each building their own
     // (prefetched) reference state, falling back to no-prefetch before failing.
     // Runs after plan_within_budget so it sees the accepted (possibly shrunk)
-    // bin set (AM-B of the review).
+    // bin set.
     let ref_bp_total: u64 = ref_meta.iter().map(|r| r.len).sum();
     let qry_bp_total: u64 = qry_meta.iter().map(|r| r.len).sum();
     let est = plan::host_estimate(
@@ -2141,7 +2142,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         resolve_threads(args.threads),
         seed::max_seeds(args.wga_chunk_size, &shape, transitions),
     );
-    // Phase 1 §6: never budget to 100% — reserve 10% for runtime/allocator/output
+    // Never budget to 100% — reserve 10% for runtime/allocator/output
     // overhead the model does not see.
     let prefetch_requested = !args.no_ref_prefetch;
     let mut prefetch = prefetch_requested;
@@ -2156,20 +2157,17 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             "fits without prefetch"
         };
         if prefetch && !fits {
-            eprintln!(
-                "note: host preflight disabled reference prefetch for {workers} worker(s) \
-                 (Phase 1 §7)"
-            );
+            eprintln!("note: host preflight disabled reference prefetch for {workers} worker(s)");
         }
         prefetch &= fits;
     }
-    // §9: the estimate that the decision was made on, so a run can be checked
-    // against its own measured RSS (§11) without re-deriving the model.
+    // The estimate that the decision was made on, so a run can be checked
+    // against its own measured RSS without re-deriving the model.
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
 
     let mut emitter = Emitter::new(args)?;
     let mut raw_all: Vec<(char, Vec<SegmentPair>)> = Vec::new();
-    // §19: the emitter consumes units strictly in `WorkUnit.ordinal` order, so
+    // The emitter consumes units strictly in `WorkUnit.ordinal` order, so
     // `-D` history, file names and tar entry order never depend on which GPU
     // finished first. Workers push completed units into a bounded channel; the
     // main thread replays them in order, buffering whatever arrives early.
@@ -2287,7 +2285,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         if !buffered.is_empty() {
             return Err(format!(
                 "emitter has {} unit(s) it can never reach: expected ordinal {next}, \
-                 hold {:?} — a worker died without sending (§19)",
+                 hold {:?} — a worker died without sending",
                 buffered.len(),
                 buffered.keys().collect::<Vec<_>>()
             )
@@ -2509,6 +2507,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                 )?;
             }
         }
+        // `BufWriter::drop` discards a failed final flush (a truncated dump).
+        f.flush()?;
     }
 
     let out = emitter.finish(&mut phases)?;
@@ -2529,11 +2529,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             copy_stalls,
             files: out.files,
             bytes_in: out.bytes_in,
-            bytes_out: if out.bytes_out > 0 {
-                out.bytes_out
-            } else {
-                out.bytes_in
-            },
+            bytes_out: out.bytes_out,
             diagonal: args.diagonal_partition,
             host_peak_est,
             est_shared: est.shared,
@@ -3217,7 +3213,7 @@ fn run_batch(
     if workers > devices {
         eprintln!(
             "note: {workers} workers over {devices} device(s) — they time-slice one GPU. \
-             That is a correctness configuration (§20), not a performance one."
+             That is a correctness configuration, not a performance one."
         );
     }
     // Borrowed per-job inputs for the shared executor (slots own their units).
@@ -3639,6 +3635,7 @@ fn run_batch(
                     )?;
                 }
             }
+            f.flush()?;
         }
     }
 
@@ -3649,7 +3646,7 @@ fn run_batch(
         let out = emitter.finish(&mut *phases)?;
         total_files += out.files;
         total_bytes_in += out.bytes_in;
-        total_bytes_out += out.bytes_out.max(out.bytes_in);
+        total_bytes_out += out.bytes_out;
     }
 
     // OUT/queries.tsv: per-job identity and completion.
@@ -4824,7 +4821,7 @@ mod tests {
         assert!(err.to_string().contains("--dump-manifest"), "{err}");
     }
 
-    /// §19's replay buffers units by ordinal so a worker's completion order
+    /// The emitter's replay buffers units by ordinal so a worker's completion order
     /// never changes what lands on disk: drives a hand-built `Emitter` (not
     /// `Emitter::new`, which would resolve `HSPZ_ANCHOR_CENSUS` from the
     /// inherited environment) through all `3! = 6` orderings of three

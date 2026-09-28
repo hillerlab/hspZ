@@ -5,6 +5,6 @@ import journey from "../../../journeys/entropy.md?raw"
 ---
 
 <DocsLayout title="F. Entropy correction" description="Recount composition only in the score band where low-complexity correction can change acceptance." wide>
-  <p>Entropy is deferred until exact endpoints are known and only for scores in `[K, 3K]`. This preserves KegAlign's result while removing composition bookkeeping from the common path.</p>
+  <p>Entropy is deferred until exact endpoints are known and only for scores in `[K, 3K]`. This keeps KegAlign's result on every tested input (the logarithm is an independent implementation, within 3.4e-14 relative error) while removing composition bookkeeping from the common path.</p>
   <AlgorithmJourney markdown={journey} />
 </DocsLayout>

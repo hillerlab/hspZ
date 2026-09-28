@@ -5,8 +5,14 @@ import DocsLayout from "../../layouts/DocsLayout.astro"
 ## The rule
 
 hspZ is byte-identical to the C++ oracle when the plan, seed stream, scoring
-parameters, and `MAX_HITS` match. A changed layout gets a new frozen digest; it
-is not compared against a digest from another layout.
+parameters, and `MAX_HITS` match — on every tested fixture and on whole hg38 ×
+mm39. The oracle is KegAlign with the uninitialised-read fix in
+`assets/tests/kegalign-uninit-rchr.patch`; unpatched, KegAlign is not
+deterministic. Two limits remain: the entropy logarithm is an independent
+implementation (relative error ≤ 3.4e-14), so a last-digit score difference is
+possible, though none has been observed; and a seed batch whose hits exceed 2^32
+is refused, because both tools index hits with 32 bits. A changed layout gets a
+new frozen digest; it is not compared against a digest from another layout.
 
 | knob | default | why the HSP set can move |
 | --- | --- | --- |

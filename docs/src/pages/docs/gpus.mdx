@@ -4,11 +4,17 @@ import DocsLayout from "../../layouts/DocsLayout.astro"
 
 ## Worker model
 
-`--gpus W` creates up to W workers and assigns complete reference bins by
-deterministic longest-processing-time scheduling. Every worker runs all query
-bins against the reference bins it owns. More workers than reference bins
-leave workers idle; more workers than devices time-slice a device and are a
-correctness configuration, not a speed configuration.
+`--gpus W` creates up to W workers. When each worker has its own device and
+every device the run uses is the same class (equal SM count and L2, nominal
+clocks within 10%), the frozen plan's work units are split across the workers
+by count quotas: whole reference bins first, then contiguous query slices of as
+few bins as possible, at the price of one extra reference build per split bin.
+Otherwise each worker owns complete reference bins, assigned by deterministic
+longest-processing-time scheduling, and runs every query bin against them.
+`HSPZ_UNIT_PARTITION=0|1` forces either policy (see the knobs below). Workers
+beyond the number of reference bins stay idle; more workers than devices
+time-slice a device and are a correctness configuration, not a speed
+configuration.
 
 GPU completion order never controls output order. Each result carries its
 `WorkUnit.ordinal`, and the emitter replays those ordinals in the planned order.
@@ -33,10 +39,10 @@ Every knob is exact: every mode produces the same HSP set and the same bytes.
 
 | variable | default | what it does |
 | --- | --- | --- |
-| `HSPZ_REF_BUCKETS=auto\|1\|0` | `auto` | Reference-locality bucketing before the score gate. It wins where lower DRAM traffic lets a power-capped GPU raise its clock (L4: −6.5% whole-genome wall) and loses where the card already runs near its boost clock (RTX 4090: +3.7%). `auto` measures both paths per engine in blocks of ≥3 s, discards each block's first second, and keeps the faster one; `--time` prints the blocks and the decision. Cards whose L2 cannot hold the smallest window (T4) stay off. |
+| `HSPZ_REF_BUCKETS=auto\|1\|0` | `auto` | Reference-locality bucketing before the score gate. It wins where lower DRAM traffic lets a power-capped GPU raise its clock (L4: −6.5% whole-genome wall) and loses where the card already runs near its boost clock (RTX 4090: +3.7%). `auto` measures both paths per engine in blocks of ≥3 s, discards each block's first second, and commits to the faster one after six blocks — about 20 s of gate time per engine. Shorter engines, for example 5 Mbp queries run as separate processes, stay on the off path, so set `HSPZ_REF_BUCKETS=1` on L4-class cards for those. `--time` prints the blocks and the decision. Cards whose L2 cannot hold the smallest window (T4) stay off. |
 | `HSPZ_REF_BUCKET_SHIFT=<16..31>` | derived from L2 | Pins the bucket window size (implies on). |
 | `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array per seed batch (rollback only). |
-| `HSPZ_UNIT_PARTITION=auto\|0\|1` | `auto` | Splits the frozen plan's work units across workers by count quotas when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. |
+| `HSPZ_UNIT_PARTITION=auto\|0\|1` | `auto` | Splits the frozen plan's work units across workers by count quotas when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. Other worker counts and device classes are unmeasured; compare with `HSPZ_UNIT_PARTITION=0`. |
 
 ## Many queries against one reference
 
@@ -63,10 +69,14 @@ workers by the same count partition a single query uses (`HSPZ_UNIT_PARTITION`
 still decides the policy), and the receiver reorders each job's results, so the
 per-job output is unchanged. On two RTX 4090s, 100 queries of 5 Mbp against hg38
 finish in 255 s at `--gpus 2` against 497 s at `--gpus 1`; on one L4 the same
-list takes 1,890–1,900 s batched against 10,400–11,600 s as separate runs.
-Whole-chromosome queries gain about 3%, and whole-genome queries under 1%: the
-saving is the reference preparation, which only dominates below roughly 130 Mbp
-of query per run on a 4090 (30 Mbp on an L4).
+list takes 1,890–1,900 s batched against 10,400–11,600 s as separate runs. Both
+arms of each comparison ran the same pinned settings (device seeder; bucketing on
+for the L4, off for the RTX 4090s; the partition forced at `--gpus 2`), not the
+`--gpus 1` defaults. Whole-chromosome queries gained about 3%; whole-genome
+queries are expected to gain under 1% (reference setup is 0.27% of a whole-genome
+run; not measured in batch mode). The saving is the reference preparation, which
+by the cost model dominates only below roughly 130 Mbp of query per run on a 4090
+(30 Mbp on an L4).
 
 All jobs must plan to identical reference bins; `-B 0`, `--kegalign-bins` and
 `--from-manifest` are rejected in batch mode. Bin-major order delays the first
@@ -91,8 +101,14 @@ is caught), the resolved plan must have exactly the index's bins, and every arra
 must match its recorded length and checksum.
 
 hg38 at the default layout takes about 120 s to index and 8.9 GB on disk, and
-each run then loads its seven bins in roughly 12 s, hidden behind the GPU. On an
-L4, 100 queries of 5 Mbp run as separate processes fall from 10,800 s to 2,680 s.
+each run then loads its seven bins in roughly 12 s. On an L4 all but the first
+load (about 1.7 s) hide behind the GPU; on faster cards a small query's GPU time
+per bin (about 0.6 s for 5 Mbp on an RTX 4090) is shorter than a bin load (about
+1.8 s), so the loads set the pace. Each run also re-reads the reference and
+re-hashes it to prove the index matches (about 4–5 s for hg38). On an L4, with
+bucketing pinned on, the device seeder and the index on local NVMe with a warm
+page cache, 100 queries of 5 Mbp run as separate processes fall from 10,800 s to
+2,680 s.
 Keep the index on local storage: a bin load above 10 s warns, and on a slow
 network file system loading can cost more than rebuilding. `-B 0` is rejected by
 both commands, and a plan the device budget would shrink to a different bin count
@@ -100,22 +116,17 @@ is rejected rather than silently rebuilt.
 
 ## Choosing `-B`
 
-The default 500 Mbp preserves the KegAlign-matched one-GPU digest; hspZ never
-changes it merely because `--gpus` changed.
+The default 500 Mbp preserves the KegAlign-matched digest; hspZ never changes it
+merely because `--gpus` changed. It is also the measured multi-GPU default: the
+unit partition balances the default layout's work units across the workers
+(−11.9% on 2× RTX 4090, −5.1% on 4×), while coarser layouts, down to one
+reference bin per worker, measured 17–22% slower than the default on a 2× T4
+screen.
 
-When a new digest is acceptable, start near the coarsest target that yields at
-least one reference bin per worker:
-
-```text
---seq-block-size ≈ total reference bp / W
-```
-
-On one measured 4× RTX 4090 host, two bins per worker (`≈ total / 2W`) was 3.2%
-faster than one bin per worker. Treat that as a per-machine refinement, not a
-new default. Finer bins multiply work units and can be much slower.
-
-Use `--query-block-size` to avoid splitting the query merely because the
-reference needs more bins. Any changed block geometry gets its own frozen
-digest.
+Any other `-B` or `--query-block-size` is a different frozen plan with its own
+digest. To look for a faster layout on a specific machine, `-B 0` prints and
+runs an automatic count-balanced layout; measure it against the default on that
+machine before adopting it. Use `--query-block-size` to avoid splitting the
+query merely because the reference needs more bins.
 
 </DocsLayout>

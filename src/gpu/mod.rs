@@ -297,7 +297,7 @@ pub struct HspStats {
     pub max_right: u64,
     pub max_left: u64,
     /// First X-drop lane in the first tile of each direction, 0..=32 (63 = the
-    /// direction never ran a tile). PLAN §4.
+    /// direction never ran a tile).
     pub drop_r: [u64; 64],
     pub drop_l: [u64; 64],
 }
@@ -973,18 +973,18 @@ pub struct Engine {
     /// async H->D already hides (r39/r51), and on two T4s it is worth -20.3% of
     /// wall because that tail is 397 s and exposed.
     pub device_seeds: bool,
-    /// Device uploads of the reference index (§9.7 / AM-A1). One per `Engine`
+    /// Device uploads of the reference index. One per `Engine`
     /// construction; the executor checks it against the reference-bin count.
     reference_uploads: u32,
     /// Query bins run against the resident reference bin.
     query_swaps: u32,
-    /// Stages whose CUDA events are recorded but not yet read (Phase 1 §4/§5).
+    /// Stages whose CUDA events are recorded but not yet read.
     ///
     /// Measuring a stage must not force it to complete, so `end_stage` records
     /// the end event and moves on; the durations are read at the next genuine
     /// host dependency, when the events are known to have completed.
     pending: Vec<PendingStage>,
-    /// Phase 1 §12 mechanism gate. `stage_syncs` are the host waits that exist
+    /// The synchronization mechanism gate. `stage_syncs` are the host waits that exist
     /// only to measure or to serialise stages that stream order already
     /// serialises — the ones this phase removes. `pipeline_syncs` are the real
     /// dependencies: a host read of a device result, or a free that must not race
@@ -1003,7 +1003,7 @@ pub struct Engine {
     /// `compute_done[s]` is recorded on the compute stream when the batch that read
     /// slot *s* is finished; the copy stream waits on it before overwriting. The
     /// pair carries the ordering that today's per-call boundary drain also happens
-    /// to give, so relaxing that drain (AM-D) cannot introduce a race here.
+    /// to give, so relaxing that drain cannot introduce a race here.
     copy_stream: Arc<CudaStream>,
     copy_ready: [CudaEvent; 2],
     compute_done: [CudaEvent; 2],
@@ -1039,7 +1039,7 @@ unsafe fn reserve<T>(
     syncs: &mut u64,
 ) -> Result<(), DriverError> {
     if buf.len() < len {
-        // AM-B hazard 1: freeing memory a queued kernel still references is UB,
+        // Freeing memory a queued kernel still references is UB,
         // and with the per-stage syncs gone the stream is no longer conveniently
         // drained by the time we get here. Wait once, on the grow path only — it
         // fires when the batch high-water mark rises, in practice once per pass,
@@ -1773,7 +1773,12 @@ impl Engine {
                         if l2 > 0 { "device attr" } else { "unavailable" },
                     );
                 } else {
-                    let reason = if l2 == 0 {
+                    // A forced OFF says so; the geometry text is only the reason when
+                    // the policy itself turned the pass off (it used to be printed
+                    // under HSPZ_REF_BUCKETS=0 even when the window fit).
+                    let reason = if std::env::var("HSPZ_REF_BUCKETS").as_deref() == Ok("0") {
+                        "forced by HSPZ_REF_BUCKETS=0".to_string()
+                    } else if l2 == 0 {
                         "L2 attribute unavailable".to_string()
                     } else {
                         format!(
@@ -1782,12 +1787,7 @@ impl Engine {
                             l2 >> 20,
                         )
                     };
-                    let cause = if std::env::var("HSPZ_REF_BUCKETS").as_deref() == Ok("0") {
-                        " (HSPZ_REF_BUCKETS=0)"
-                    } else {
-                        ""
-                    };
-                    eprintln!("  ref buckets: off — {reason}{cause}");
+                    eprintln!("  ref buckets: off — {reason}");
                 }
             }
             (shift, n, auto)
@@ -1798,7 +1798,7 @@ impl Engine {
             index_table: DeviceBuffer::from_host(&stream, cfg.index_table)?,
             pos_table: DeviceBuffer::from_host(&stream, cfg.pos_table)?,
             ref_seq: DeviceBuffer::from_host(&stream, cfg.ref_seq)?,
-            // AM-B1: reference-only. Every query bin — including the first —
+            // Reference-only. Every query bin — including the first —
             // enters through `swap_query`, so `query_swaps == work_units` holds
             // and no query is ever uploaded twice.
             query_seq: DeviceBuffer::from_host(&stream, &[] as &[u8])?,
@@ -1930,7 +1930,7 @@ impl Engine {
         Ok(())
     }
 
-    /// How many times this engine uploaded a reference index (§9.7 / AM-A1).
+    /// How many times this engine uploaded a reference index.
     ///
     /// The executor asserts this equals the *visit* count, not the
     /// work-unit count. Counting host `SeedTable::build` calls alone would miss a
@@ -2097,7 +2097,7 @@ impl Engine {
         Ok(())
     }
 
-    /// PLAN #2: generate one batch's exact compact seed stream on the device.
+    /// Generate one batch's exact compact seed stream on the device.
     pub fn generate_seeds(
         &mut self,
         slot: usize,
@@ -2251,7 +2251,7 @@ impl Engine {
         Ok(num_seeds)
     }
 
-    /// Byte-for-byte seed oracle used only by the correctness build of PLAN #2.
+    /// Byte-for-byte seed oracle used only by the correctness build of the device seeder.
     #[cfg(feature = "device-seeds-check")]
     pub fn check_seed_bytes(
         &mut self,
@@ -2302,20 +2302,20 @@ impl Engine {
         slot: usize,
         rev: bool,
     ) -> Result<FilterOutput, Box<dyn std::error::Error>> {
-        // AM-C: refuse to run against a query that was never swapped in.
+        // Refuse to run against a query that was never swapped in.
         //
-        // `Engine::new` is reference-only (AM-B1), so a fresh engine starts with
+        // `Engine::new` is reference-only, so a fresh engine starts with
         // no query. Forgetting `swap_query` compiles cleanly — the fields were
         // removed from `EngineConfig`, not renamed, so nothing type-checks their
         // presence — and the whole pipeline would then run against an empty query
         // and emit zero HSPs with no error. That already happened once during the
-        // AM-B1 refactor and only the oracle caught it.
+        // reference-only refactor and only the oracle caught it.
         //
         // An `Err`, not a `debug_assert`: this is an internal invariant that must
         // hold in release builds, which is where a whole-genome run happens.
         if self.query_len == 0 {
             return Err("Engine has no query: swap_query() must be called before \
-                 seed_and_filter() (AM-C)"
+                 seed_and_filter()"
                 .into());
         }
         let num_seeds = self.seed_len[slot];
@@ -2352,7 +2352,7 @@ impl Engine {
         } else {
             // N3's rejected arm. The seed slots stay persistent regardless: an
             // upload may be in flight into one of them, and reallocating under a
-            // queued copy is the use-after-free AM-B is about.
+            // queued copy is a use-after-free.
             #[cfg(feature = "nvidia-uninit-seed-buffers")]
             // SAFETY: as above.
             {
@@ -2366,7 +2366,7 @@ impl Engine {
         }
         // The allocation's memset is stream-ordered ahead of every kernel that
         // reads these buffers, so waiting here only priced the memset — that is a
-        // stage sync, not a dependency (Phase 1 §3).
+        // stage sync, not a dependency.
         if !self.async_stages {
             self.stream.synchronize()?;
             self.stage_syncs += 1;
@@ -2377,7 +2377,7 @@ impl Engine {
         // that is left is the ordering edge. `query()` never blocks and tells us
         // whether the overlap actually happened — a stall is the copy still in
         // flight when its compute wanted it, which is the honest measure of
-        // "overlap > 0" that AM-D asks for.
+        // "overlap > 0".
         if self.async_seed_copy && num_seeds > 0 {
             if !self.copy_ready[slot].query()? {
                 self.seed_copy_stalls += 1;
@@ -2439,19 +2439,13 @@ impl Engine {
         self.end_stage(stage, "scan_blocks")?;
 
         let t = Instant::now();
-        // REQUIRED (Phase 1 §2/§8): the host computes the exclusive scan of the
+        // REQUIRED: the host computes the exclusive scan of the
         // block sums and the total decides the chunk walk, so this round trip is a
-        // real dependency. §9 revisits moving the reduction onto the device; the
-        // first patch does not redesign it.
+        // real dependency. Moving the reduction onto the device is a separate
+        // change; this path does not redesign it.
         let mut sums = d_block_sums.to_host_vec(&self.stream)?;
         self.absorb_sync()?;
-        let mut acc = 0u32;
-        for s in sums.iter_mut() {
-            let total = *s;
-            *s = acc;
-            acc += total;
-        }
-        let num_hits = acc;
+        let num_hits = exclusive_scan_hit_totals(&mut sums)?;
         let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
         self.pipeline_syncs += 1;
         self.phases.add("block-sum round trip", t.elapsed());
@@ -2488,7 +2482,7 @@ impl Engine {
                 self.phases.add("hit-distribution stats", t.elapsed());
             }
             // `d_block_sums`/`d_offsets` are freed on the way out and
-            // `add_block_offsets` may still be queued reading them (AM-B hazard 2).
+            // `add_block_offsets` may still be queued reading them.
             self.sync_pipeline()?;
             return Ok(out);
         }
@@ -3070,7 +3064,7 @@ impl Engine {
                         }
                     }
                     // Retained until the pass drains the stream: `add_block_offsets`
-                    // may still be queued reading it (AM-B hazard 2).
+                    // may still be queued reading it.
                     d_bucket_sums
                 })
             };
@@ -3662,7 +3656,7 @@ impl Engine {
 
         // The copy stream may not overwrite this slot until every kernel that read
         // it has finished. Recorded even though today's boundary drain already
-        // guarantees it, so the invariant survives relaxing that drain (AM-D).
+        // guarantees it, so the invariant survives relaxing that drain.
         self.compute_done[slot].record(&self.stream)?;
 
         // Boundary invariant: `seed_and_filter` returns with the stream drained.
@@ -3688,7 +3682,7 @@ impl Engine {
     }
 
     /// Ends a GPU stage: records its end event, counts the launch, and — only
-    /// under `--sync-stages` — waits for it (Phase 1 §4).
+    /// under `--sync-stages` — waits for it.
     ///
     /// The default path enqueues and returns. Stream order already guarantees
     /// that the next kernel sees this one's writes, so the host has nothing to
@@ -3812,7 +3806,7 @@ impl Engine {
         }
     }
 
-    /// A genuine host dependency (Phase 1 §2): the host is about to read a device
+    /// A genuine host dependency: the host is about to read a device
     /// result, free a buffer a queued kernel touches, or return to the caller.
     fn sync_pipeline(&mut self) -> Result<(), DriverError> {
         self.stream.synchronize()?;
@@ -3829,7 +3823,7 @@ impl Engine {
     }
 
     /// Host waits that existed only to measure or to serialise already-ordered
-    /// stages. Phase 1's mechanism gate (§12): this must fall to zero.
+    /// stages. The mechanism gate: this must fall to zero.
     pub fn stage_syncs(&self) -> u64 {
         self.stage_syncs
     }
@@ -3869,7 +3863,7 @@ pub struct Lifecycle {
 }
 
 impl Lifecycle {
-    /// Checks the §2 invariants against a plan's shape.
+    /// Checks the lifecycle invariants against a plan's shape.
     ///
     /// Returns the first violation as a message rather than panicking, so a
     /// caller can report it alongside the rest of a profile.
@@ -3940,6 +3934,37 @@ fn elementwise() -> LaunchConfig {
         block_dim: (MAX_THREADS, 1, 1),
         shared_mem_bytes: 0,
     }
+}
+
+/// Exclusive scan of one seed batch's per-block hit totals, in place, returning
+/// the batch total.
+///
+/// The device scan, the chunk walk and every hit index are `u32`, as in
+/// KegAlign. A batch that expands to more than `u32::MAX` hits (reachable with
+/// unmasked, close-species inputs and bins of about 1 Gbp) used to wrap here in
+/// release builds: a wrapped total above the cap aborted with a misleading
+/// "not monotonic" error, and one below it took the single-chunk path, which
+/// has no monotonicity check, and let `find_hits` write out of bounds. The sum
+/// is taken in `u64` first, so such a batch is refused by name; every batch
+/// that fits scans exactly as before.
+fn exclusive_scan_hit_totals(sums: &mut [u32]) -> Result<u32, String> {
+    let total: u64 = sums.iter().map(|&s| u64::from(s)).sum();
+    let Ok(total) = u32::try_from(total) else {
+        return Err(format!(
+            "seed batch expands to {total} seed hits, more than the u32 hit index can \
+             address ({}; KegAlign's scan wraps here too): soft-mask repeats, or use a \
+             smaller -B/-C/-I (a new layout digest)",
+            u32::MAX
+        ));
+    };
+    let mut acc = 0u32;
+    for s in sums.iter_mut() {
+        let block = *s;
+        *s = acc;
+        // Cannot overflow: the total fits u32.
+        acc += block;
+    }
+    Ok(total)
 }
 
 /// Splits the scanned hit counts into `(start_seed_index, limit_pos,
@@ -4392,7 +4417,7 @@ pub fn min_free_bytes(n: usize) -> Result<u64, Box<dyn std::error::Error>> {
     Ok(min_free)
 }
 
-/// Visible CUDA devices (§18/§21).
+/// Visible CUDA devices.
 ///
 /// Requires the driver to be initialised, which `CudaContext::new` does, so this is
 /// only meaningful once a context exists. Returns 0 rather than an error if the
@@ -4442,7 +4467,7 @@ impl Stage {
         }
     }
 
-    /// Records the end event and hands the stage over *unresolved* (Phase 1 §5).
+    /// Records the end event and hands the stage over *unresolved*.
     ///
     /// No host wait: measuring a stage must not force it to complete. `host` is
     /// therefore the enqueue time, not the work time — the work time is the event
@@ -4465,7 +4490,9 @@ mod tests {
     use super::ref_bucket_policy;
     #[cfg(feature = "find-hits-warp")]
     use super::use_warp_find_hits;
-    use super::{HitStats, Lifecycle, chunk_limits, chunk_limits_sparse};
+    use super::{
+        HitStats, Lifecycle, chunk_limits, chunk_limits_sparse, exclusive_scan_hit_totals,
+    };
 
     #[cfg(feature = "find-hits-warp")]
     #[test]
@@ -4662,7 +4689,7 @@ mod tests {
         for expect_k in 1..BUCKET_BLOCKS {
             let expect_on = expect_k % 2 == 1;
             let span = if expect_on { 9.0 } else { 10.0 };
-            let (closed, decided, inconclusive) = loop {
+            let (closed, decided, _) = loop {
                 let (closed, decided, inconclusive) =
                     mode.commit_block_span(span, MAX, MAX, T_BLOCK, T_SETTLE);
                 assert!(
@@ -4958,7 +4985,7 @@ mod tests {
         };
         assert!(both.check(2, 6).is_err(), "a visit is never both");
 
-        // The exact regression AM-A1 warns about: an Engine per work unit.
+        // The exact regression this guards against: an Engine per work unit.
         let per_unit = Lifecycle {
             engine_creations: 6,
             reference_uploads: 6,
@@ -4969,7 +4996,7 @@ mod tests {
             .expect_err("must reject 6 uploads for 2 bins");
         assert!(err.contains("engine_creations"), "{err}");
 
-        // A query bin that never swapped: the AM-C silent-zero-HSP shape.
+        // A query bin that never swapped: the silent-zero-HSP shape.
         let missed_swap = Lifecycle {
             query_swaps: 5,
             ..good
@@ -4987,6 +5014,25 @@ mod tests {
         let c = super::ExecutionContract::from_resolved(99_165_440, 16384);
         assert_eq!(c.max_hits, 99_165_440);
         assert_eq!(c.hit_capacity, 99_165_440, "capacity defaults to H");
+    }
+
+    /// A batch whose hits exceed `u32::MAX` must be refused, never wrapped: the
+    /// wrapped value of this one (16,399,513) sits below a 16.7 M cap and would
+    /// take the unchecked single-chunk path. Batches that fit scan as before.
+    #[test]
+    fn batch_hit_total_beyond_u32_is_an_error_not_a_wrap() {
+        let mut sums = vec![3u32, 0, 5, 7];
+        assert_eq!(exclusive_scan_hit_totals(&mut sums), Ok(15));
+        assert_eq!(sums, vec![0, 3, 3, 8]);
+
+        let mut sums = vec![u32::MAX - 1, 1];
+        assert_eq!(exclusive_scan_hit_totals(&mut sums), Ok(u32::MAX));
+        assert_eq!(sums, vec![0, u32::MAX - 1]);
+
+        let mut sums = vec![u32::MAX, 16_399_514];
+        let err = exclusive_scan_hit_totals(&mut sums).unwrap_err();
+        assert!(err.contains("4311366809"), "{err}");
+        assert!(err.contains("u32 hit index"), "{err}");
     }
 
     #[test]

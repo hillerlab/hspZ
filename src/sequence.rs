@@ -101,7 +101,7 @@ pub struct Genome {
     /// Bytes of `buf` that make up block 0 — i.e. `buf.len()` minus the
     /// trailing separator.
     pub block_len: usize,
-    /// Which reader produced this, for the §1 input report.
+    /// Which reader produced this, for the input report.
     pub format: Format,
     /// On-disk size of the source file, so input throughput is reportable.
     pub bytes_read: u64,
@@ -154,7 +154,7 @@ impl Format {
 /// mandatory — without it every base comes back uppercase and the seeding
 /// alphabet silently changes (lowercase kills a seed, uppercase does not).
 /// Record order is the file's own index order, which `chrom_names()` preserves;
-/// §1 makes that order load-bearing because the `&` separator, the chr table and
+/// That order is load-bearing because the `&` separator, the chr table and
 /// interval chunking all depend on it.
 fn read_2bit(path: &Path) -> Result<Vec<(String, Vec<u8>)>, String> {
     let mut tb = twobit::TwoBitFile::open(path)
@@ -312,11 +312,14 @@ pub fn intervals(block_len: usize, seed_size: usize, interval_size: u32) -> Vec<
     if block_len <= seed_size {
         return out;
     }
-    let end_pos = (block_len - seed_size) as u32;
-    let mut curr = 0u32;
+    // u64 so a block within `interval_size` of 2^32 cannot wrap `curr` (an
+    // inverted interval, then an endless loop); every value pushed fits u32.
+    let end_pos = (block_len - seed_size) as u64;
+    let step = u64::from(interval_size.max(1));
+    let mut curr = 0u64;
     while curr < end_pos {
-        out.push((curr, end_pos.min(curr + interval_size)));
-        curr += interval_size;
+        out.push((curr as u32, end_pos.min(curr + step) as u32));
+        curr += step;
     }
     out
 }

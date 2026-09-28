@@ -194,7 +194,7 @@ impl SeedTable {
     ///    worker a disjoint write cursor per k-mer, and each worker rescans its
     ///    own range and scatters positions directly.
     ///
-    /// Why the bucket order comes out identical (AM-B requires byte-identity,
+    /// Why the bucket order comes out identical (byte-identity is required,
     /// not just the same multiset — hit order feeds `MAX_HITS` chunk boundaries,
     /// so a reordering would move HSPs without changing any count): worker
     /// ranges are contiguous and ascending in `i`, and for every k-mer worker
@@ -778,11 +778,16 @@ pub fn unit_hits(
 /// The `[i, e)` chunk bounds `seeder.cpp` walks for one interval. `end` is
 /// inclusive there, hence the `+ 1`.
 pub fn chunks(start: u32, end: u32, wga_chunk: u32) -> Vec<(u32, u32)> {
+    // u64 so `i + wga_chunk` and `end + 1` cannot wrap near 2^32; the bounds
+    // pushed are exactly the u32 values the seeder loop walks.
     let mut out = Vec::new();
-    let mut i = start;
+    let step = u64::from(wga_chunk.max(1));
+    let end = u64::from(end);
+    let mut i = u64::from(start);
     while i < end {
-        out.push((i, (i + wga_chunk).min(end + 1)));
-        i += wga_chunk;
+        let hi = (i + step).min(end + 1).min(u64::from(u32::MAX));
+        out.push((i as u32, hi as u32));
+        i += step;
     }
     out
 }

@@ -12,8 +12,7 @@
 //! without a GPU. Planning reuses `plan::plan_with` with the same flags and
 //! defaults as `run`, so bins/blocks are identical to what `run` would freeze
 //! whenever `run` does not shrink the plan against a device budget (all PR1
-//! tests and the default whole-genome layout on a fitting GPU; see report.md
-//! for the documented deviations).
+//! tests and the default whole-genome layout on a fitting GPU).
 
 use crate::Fallible;
 use crate::cli::HitsEstimateArgs;
@@ -576,7 +575,7 @@ mod tests {
 
     /// chr20 pair, default flags: the single predicted unit equals `#seed
     /// hits` = 192,899,566 (round-90 ledger; re-derived with
-    /// `hspz run --time --gpus 1` — see report.md). Needs the input files;
+    /// `hspZ run --time --gpus 1`). Needs the input files;
     /// the GPU re-derivation itself is manual.
     #[test]
     #[ignore]
@@ -632,8 +631,8 @@ mod tests {
 
     /// The 5x3 synthetic plan (`-B 10000000 --query-block-size 1000000`):
     /// all 15 predictions equal the ledger's 15 `hits` values (from
-    /// `hspz run --time --gpus 2 --max-hits 300000` on ZLUDA — see
-    /// report.md). Row-major `r*3+q`.
+    /// `hspZ run --time --gpus 2 --max-hits 300000` on ZLUDA). Row-major
+    /// `r*3+q`.
     #[test]
     #[ignore]
     fn synthetic_5x3_plan_matches_ledger_hits() {

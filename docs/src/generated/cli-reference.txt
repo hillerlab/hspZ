@@ -56,11 +56,11 @@ Options:
   -Q, --query-prefix <QUERY_PREFIX>
           [default: ""]
   -C, --wga-chunk-size <WGA_CHUNK_SIZE>
-          [default: 250000]
+          Query positions per seed batch; must be positive [default: 250000]
   -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
-          [default: 10000000]
+          LASTZ interval size on the query; must be positive [default: 10000000]
   -B, --seq-block-size <SEQ_BLOCK_SIZE>
-          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall, about `total_reference_bp / W` (one ref bin per worker) is faster and a *different* HSP set. Never overwritten from `--gpus`. See `assets/guidance/guidance.md` [default: 500000000]
+          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest, and it stays the multi-GPU default: with `--gpus W` the unit partition spreads its work units over the workers, while coarser layouts (down to one bin per worker) measured 17-22% slower on a 2-GPU test host. Any other target is a *different* HSP set. Never overwritten from `--gpus`; `-B 0` runs a printed automatic layout (opt-in, for per-machine measurement). See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
       --query-block-size <QUERY_BLOCK_SIZE>
           Bin target for the *query* side; defaults to `--seq-block-size`. Splitting the reference is what balances workers — splitting the query only multiplies work units (`R × Q`), and each unit costs a query swap and its own `MAX_HITS` chunk boundary on every worker. Raise this above `-B` to pick a reference layout without paying for a query one. Changes the plan, so it changes the HSP set: keep a digest per layout
   -m, --max-hits <MAX_HITS>
@@ -82,7 +82,7 @@ Options:
       --from-manifest <FROM_MANIFEST>
           Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same workers over unit-partitioned `(job, unit)` slots [default: 1]
+          GPUs to run on. With one worker per device and every device the same class (SM count, L2, clocks within 10%), the plan's work units are split across workers by count quotas; otherwise each worker owns whole reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces either). Output follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same policy over `(job, unit)` slots [default: 1]
       --no-async-stages
           Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy
@@ -174,11 +174,11 @@ Options:
   -Q, --query-prefix <QUERY_PREFIX>
           [default: ""]
   -C, --wga-chunk-size <WGA_CHUNK_SIZE>
-          [default: 250000]
+          Query positions per seed batch; must be positive [default: 250000]
   -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
-          [default: 10000000]
+          LASTZ interval size on the query; must be positive [default: 10000000]
   -B, --seq-block-size <SEQ_BLOCK_SIZE>
-          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall, about `total_reference_bp / W` (one ref bin per worker) is faster and a *different* HSP set. Never overwritten from `--gpus`. See `assets/guidance/guidance.md` [default: 500000000]
+          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest, and it stays the multi-GPU default: with `--gpus W` the unit partition spreads its work units over the workers, while coarser layouts (down to one bin per worker) measured 17-22% slower on a 2-GPU test host. Any other target is a *different* HSP set. Never overwritten from `--gpus`; `-B 0` runs a printed automatic layout (opt-in, for per-machine measurement). See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
       --query-block-size <QUERY_BLOCK_SIZE>
           Bin target for the *query* side; defaults to `--seq-block-size`. Splitting the reference is what balances workers — splitting the query only multiplies work units (`R × Q`), and each unit costs a query swap and its own `MAX_HITS` chunk boundary on every worker. Raise this above `-B` to pick a reference layout without paying for a query one. Changes the plan, so it changes the HSP set: keep a digest per layout
   -m, --max-hits <MAX_HITS>
@@ -200,7 +200,7 @@ Options:
       --from-manifest <FROM_MANIFEST>
           Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same workers over unit-partitioned `(job, unit)` slots [default: 1]
+          GPUs to run on. With one worker per device and every device the same class (SM count, L2, clocks within 10%), the plan's work units are split across workers by count quotas; otherwise each worker owns whole reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces either). Output follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same policy over `(job, unit)` slots [default: 1]
       --no-async-stages
           Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy

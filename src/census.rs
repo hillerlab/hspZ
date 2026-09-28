@@ -23,14 +23,12 @@
 //! Everything here folds into fixed-size scalars. Per seed batch S0 copies the
 //! raw per-seed counts once; per launch it copies three active survivor-array
 //! prefixes, folds them, and drops them. Peak resident is one batch plus one
-//! launch and is reported so the bound can be checked rather than asserted
-//! (review 10 §AH2).
+//! launch and is reported so the bound can be checked rather than asserted.
 //!
 //! The accepted bit comes from `buf_done` in the window between `find_hsps` and
 //! the done-scan, not from the `counters` feature: `counters` changes register
 //! pressure and is banned from timed builds, and depending on it would mean S0
-//! could not be verified byte-identical against its own env-off build
-//! (review 10 §AH1).
+//! could not be verified byte-identical against its own env-off build.
 
 use crate::hsp::SegmentPair;
 
@@ -52,7 +50,7 @@ fn bucket(r: u32) -> usize {
 }
 
 /// Accepted-HSP score band, so a bucket that survives with only weak HSPs can
-/// be told from one carrying strong anchors (review 10 §AI1). The frozen budget
+/// be told from one carrying strong anchors. The frozen budget
 /// protects a top LASTZ-score band, which S0 cannot compute; HSP score is the
 /// available proxy and 10,000 is roughly 4x the campaign's K=2400.
 const STRONG_HSP_SCORE: i32 = 10_000;

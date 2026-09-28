@@ -89,7 +89,7 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     // Single-worker driver, so this is the env override or false — but it must go
     // through the same function the executor uses, or the two disagree silently.
     engine.device_seeds = device_seeds_for(1);
-    // AM-B1: reference-only construction, so the query enters via swap_query
+    // Reference-only construction, so the query enters via swap_query
     // exactly as it will for every bin in a multi-bin plan.
     let (fwd, rc) = p.encoded_query();
     engine.swap_query(fwd, rc)?;
@@ -281,7 +281,7 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     let (_, total_mem) = gpu::device_memory();
     println!("\nGPU");
     println!(
-        "  host syncs        {:9} stage, {} pipeline (Phase 1 §12)",
+        "  host syncs        {:9} stage, {} pipeline",
         engine.stage_syncs(),
         engine.pipeline_syncs()
     );

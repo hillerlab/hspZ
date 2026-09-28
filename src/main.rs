@@ -53,7 +53,7 @@
 //! across workers when `--gpus > 1`. `HSPZ_DEVICE_SEEDS` forces the seeder so
 //! 1-GPU vs N-GPU wall is a matched scaling number.
 //!
-//! # Quick benchmark data (benchmarks/baseline.md, assets/guidance/guidance.md)
+//! # Quick benchmark data
 //!
 //! * **Parity** — byte-identical to the C++ oracle wherever plan and
 //!   `MAX_HITS` match: apple/orange 1,226 HSPs, A 4,248, B 8,908, chr1

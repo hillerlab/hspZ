@@ -30,7 +30,7 @@
 //! scope: a different layout produces a legitimately different HSP set, so
 //! each layout carries its own frozen digest (rounds 74–76).
 
-/// One record's metadata, as the planner needs it (§5).
+/// One record's metadata, as the planner needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordMeta {
     pub id: u32,
@@ -45,7 +45,7 @@ pub struct RecordMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bin {
     pub id: u32,
-    /// Record ids, always in original input order (§7).
+    /// Record ids, always in original input order.
     pub record_ids: Vec<u32>,
     pub total_bp: u64,
 }
@@ -55,7 +55,7 @@ pub struct Bin {
 pub struct WorkUnit {
     /// Stable logical position, independent of execution order. Output ordering,
     /// `-D` threshold history and `-Z` entry order all follow this so results do
-    /// not depend on GPU completion order (§12).
+    /// not depend on GPU completion order.
     pub ordinal: u32,
     pub reference_bin: u32,
     pub query_bin: u32,
@@ -69,9 +69,9 @@ pub struct Plan {
     pub units: Vec<WorkUnit>,
 }
 
-/// Assigns reference bins to workers, deterministically (§18).
+/// Assigns reference bins to workers, deterministically.
 ///
-/// Every query bin runs against every reference bin, so §18's
+/// Every query bin runs against every reference bin, so the scheduling cost
 /// `cost(R) = reference_bp x total_query_bp` orders bins exactly as `total_bp`
 /// does — LPT on `total_bp` is the same schedule with less arithmetic. Longest bin
 /// first into the currently lightest worker, ties on bin id, and each worker's list
@@ -308,7 +308,7 @@ pub fn unit_partition_dims(
 }
 
 /// KegAlign's block rule, reproduced exactly, for matched-granularity runs
-/// (benchmark plan §5 Mode A).
+/// (matched-granularity mode).
 ///
 /// `main.cpp` fills blocks in *input order* and closes one as soon as the
 /// accumulated length exceeds `seq_block_size` — so a block overshoots the target
@@ -348,9 +348,9 @@ pub fn bin_records_sequential(records: &[RecordMeta], target_bp: u64) -> Vec<Bin
 
 /// Groups records into bins of roughly `target_bp`, keeping records atomic.
 ///
-/// `--seq-block-size` is the *target* (§6), not a ceiling: a 249 Mbp chr1 stays
+/// `--seq-block-size` is the *target*, not a ceiling: a 249 Mbp chr1 stays
 /// one 249 Mbp bin against a 200 Mbp target rather than being split. Longest
-/// record first into the currently smallest bin (§7), which is the standard LPT
+/// record first into the currently smallest bin, which is the standard LPT
 /// heuristic and is deterministic given the ordinal tie-break.
 pub fn bin_records(records: &[RecordMeta], target_bp: u64) -> Vec<Bin> {
     if records.is_empty() {
@@ -369,23 +369,6 @@ pub fn layout_n_bins(total_bp: u64, target_bp: u64, n_records: usize) -> usize {
         return 0;
     }
     (total_bp.div_ceil(target_bp.max(1)) as usize).clamp(1, n_records)
-}
-
-/// Distinct bin counts to try for an automatic layout: `{W, 2W, default}`,
-/// each clamped to `[1, n_records]`. Divisibility is a scheduling property;
-/// this does not claim a performance ranking.
-pub fn candidate_bin_counts(n_records: usize, workers: usize, default_n: usize) -> Vec<usize> {
-    if n_records == 0 {
-        return Vec::new();
-    }
-    let w = workers.max(1);
-    let mut v = vec![w, w.saturating_mul(2), default_n.max(1)];
-    for n in &mut v {
-        *n = (*n).clamp(1, n_records);
-    }
-    v.sort_unstable();
-    v.dedup();
-    v
 }
 
 /// LPT-packs records into exactly `n_bins` bins (or fewer if some stay empty,
@@ -415,7 +398,7 @@ pub fn bin_records_n(records: &[RecordMeta], n_bins: usize) -> Vec<Bin> {
     }
 
     // Normalise: drop empties, restore input order inside each bin, then order
-    // bins by their first record so bin ids follow the genome (§7).
+    // bins by their first record so bin ids follow the genome.
     let by_ordinal: std::collections::HashMap<u32, u32> =
         records.iter().map(|r| (r.id, r.ordinal)).collect();
     let mut bins: Vec<(u64, Vec<u32>)> = loads.into_iter().filter(|(_, v)| !v.is_empty()).collect();
@@ -437,7 +420,7 @@ pub fn bin_records_n(records: &[RecordMeta], n_bins: usize) -> Vec<Bin> {
 /// query bin.
 ///
 /// Reference bin outermost in the ordinal sequence, because the executor builds
-/// one `SeedTable` per reference bin and reuses it across all query bins (§9).
+/// one `SeedTable` per reference bin and reuses it across all query bins.
 /// Ordinals therefore run R0×Q0, R0×Q1, …, R1×Q0, … which is exactly the order
 /// serial execution wants and the order MPS must commit results in.
 pub fn plan(reference: &[RecordMeta], query: &[RecordMeta], target_bp: u64) -> Plan {
@@ -466,38 +449,6 @@ pub fn plan_with(
     let reference_bins = bin(reference, target_bp);
     let query_bins = bin(query, query_target_bp);
     from_bins(reference_bins, query_bins)
-}
-
-/// Pure candidate layouts for a later chooser: distinct `{W, 2W, default}`
-/// reference counts, query side frozen, full reference-outer Cartesian units.
-///
-/// `base` is a valid frozen full-Cartesian plan. `workers <= 1` returns exactly
-/// `vec![base.clone()]`. Otherwise each count comes from [`candidate_bin_counts`]
-/// over `reference.len()`; the count matching `base.reference_bins.len()` keeps
-/// `base.clone()` exactly (including any alternate legal ordinal order), other
-/// counts re-bin with [`bin_records_n`] and keep `base.query_bins` unchanged.
-/// Full plans are deduped (at most 3). Never shrinks, changes Q, touches the hit
-/// cap, or picks a winner — the caller validates each with [`worst_unit_bytes`].
-pub fn candidate_plans(reference: &[RecordMeta], base: &Plan, workers: usize) -> Vec<Plan> {
-    if workers <= 1 {
-        return vec![base.clone()];
-    }
-    let counts = candidate_bin_counts(reference.len(), workers, base.reference_bins.len());
-    if counts.is_empty() {
-        return vec![base.clone()];
-    }
-    let mut out: Vec<Plan> = Vec::with_capacity(counts.len());
-    for n in counts {
-        let p = if n == base.reference_bins.len() {
-            base.clone()
-        } else {
-            from_bins(bin_records_n(reference, n), base.query_bins.clone())
-        };
-        if !out.contains(&p) {
-            out.push(p);
-        }
-    }
-    out
 }
 
 /// Default block target both sides fall back to: the KegAlign-matched digest
@@ -762,7 +713,7 @@ fn packed_len(total_bp: u64, nrecords: usize) -> Result<u64, String> {
     Ok(packed)
 }
 
-fn packed_bin_len(side: &str, b: &Bin) -> Result<u64, String> {
+pub(crate) fn packed_bin_len(side: &str, b: &Bin) -> Result<u64, String> {
     packed_len(b.total_bp, b.record_ids.len()).map_err(|e| format!("{side} bin {}: {e}", b.id))
 }
 
@@ -987,7 +938,7 @@ pub fn worker_device_budget(free_bytes: u64, workers: usize, devices: usize) -> 
 }
 
 /// Raises the bin count until the largest planned unit fits, or reports the
-/// record that cannot fit at all (§8).
+/// record that cannot fit at all.
 ///
 /// Returns the accepted plan and the largest unit estimate. A single record that
 /// exceeds capacity is a hard error: v1 does not split records, and discovering
@@ -1067,7 +1018,7 @@ fn can_split(p: &Plan) -> bool {
         || p.query_bins.iter().any(|b| b.record_ids.len() > 1)
 }
 
-/// Host-memory estimate for a multi-worker run (Phase 1 §2/§3).
+/// Host-memory estimate for a multi-worker run.
 ///
 /// Conservative: sums the dominant host-resident allocations rather than
 /// modelling their exact overlap. Exact formulas only (capacity × size_of), no
@@ -1147,7 +1098,7 @@ pub(crate) fn host_estimate_sizes(
 }
 
 /// Chooses whether reference prefetch is safe for `workers` workers against
-/// `available` host bytes (Phase 1 §7). Pure, so it is unit-testable without a
+/// `available` host bytes. Pure, so it is unit-testable without a
 /// GPU. `Ok(true)` keeps prefetch, `Ok(false)` disables it, `Err` means even the
 /// no-prefetch shape cannot fit.
 pub fn host_preflight(
@@ -1173,11 +1124,11 @@ pub fn host_preflight(
     ))
 }
 
-/// Estimated host peak for a concrete assignment (Phase 1 §3).
+/// Estimated host peak for a concrete assignment.
 ///
 /// A worker that owns a single reference bin has nothing to prefetch, so it costs
 /// the no-prefetch shape whatever the flag says. Charging every worker the prefetch
-/// shape overestimated a 4-worker multi5 run by 52% against measured RSS (§11);
+/// shape overestimated a 4-worker multi5 run by 52% against measured RSS;
 /// assignment-aware it is +19%, still conservative but usefully so.
 pub fn host_peak(est: &HostEstimate, assignment: &[Vec<u32>], prefetch: bool) -> u64 {
     est.shared
@@ -1252,6 +1203,7 @@ pub fn compiled_features() -> String {
         ("warp-score-gate", cfg!(feature = "warp-score-gate")),
         ("dense-anchors", cfg!(feature = "dense-anchors")),
         ("find-hits-warp", cfg!(feature = "find-hits-warp")),
+        ("ref-loc-buckets", cfg!(feature = "ref-loc-buckets")),
         ("left-pair-tile", cfg!(feature = "left-pair-tile")),
         ("simd-prelude", cfg!(feature = "simd-prelude")),
     ]
@@ -1898,11 +1850,11 @@ pub struct PackedBin {
     /// Packed bases, records joined by `SEP` with a trailing separator.
     pub buf: Vec<u8>,
     /// Bin-local chromosome table; names are the original record names, so every
-    /// emitted coordinate stays chromosome-relative (§9.5, §11).
+    /// emitted coordinate stays chromosome-relative.
     pub chrs: Vec<crate::sequence::Chr>,
     /// Bases excluding the trailing separator.
     pub block_len: usize,
-    /// Reverse complement of `buf`, built from the *bin* (§9.4) — never sliced
+    /// Reverse complement of `buf`, built from the *bin* — never sliced
     /// out of a whole-genome reverse complement.
     pub rc: Vec<u8>,
     pub rc_chrs: Vec<crate::sequence::Chr>,
@@ -1952,6 +1904,29 @@ mod tests {
     /// tools dedup in different scopes and their outputs differ before any kernel
     /// runs. The rule is sequential fill in input order, closing a block once it is
     /// *over* target — so blocks overshoot and the last one may be short.
+    /// Bases are addressed with u32, so a bin whose packed length does not fit
+    /// is an error (`hspz index` calls this before building).
+    #[test]
+    fn packed_bin_length_beyond_u32_is_an_error() {
+        use super::{Bin, packed_bin_len};
+        let fits = Bin {
+            id: 0,
+            record_ids: vec![0, 1],
+            total_bp: u64::from(u32::MAX) - 1,
+        };
+        assert_eq!(packed_bin_len("reference", &fits), Ok(u64::from(u32::MAX)));
+        let over = Bin {
+            id: 3,
+            record_ids: vec![0],
+            total_bp: u64::from(u32::MAX) + 1,
+        };
+        let err = packed_bin_len("reference", &over).unwrap_err();
+        assert!(
+            err.contains("reference bin 3") && err.contains("does not fit u32"),
+            "{err}"
+        );
+    }
+
     #[test]
     fn sequential_bins_match_kegalign_block_fill() {
         use super::{RecordMeta, bin_records_sequential};
@@ -1980,7 +1955,7 @@ mod tests {
         assert_eq!(bin_records_sequential(&[rec(0, 500)], 120).len(), 1);
     }
 
-    /// §18: the assignment must be balanced, deterministic, and a partition — no
+    /// The assignment must be balanced, deterministic, and a partition — no
     /// bin run twice (duplicate output) and none dropped (missing alignments).
     /// Round 80: `--query-block-size` is a *query-only* lever. The reference layout and
     /// therefore `assign_bins` must not move when it changes, and an unset flag (which the
@@ -2104,7 +2079,7 @@ mod tests {
 
     use super::*;
 
-    /// Phase 1 §7/§10: the prefetch fallback — keep prefetch when it fits,
+    /// The prefetch fallback — keep prefetch when it fits,
     /// disable it when only the no-prefetch shape fits, hard-error when neither
     /// does. Shared bytes are counted once, per-worker bytes times the worker
     /// count.
@@ -2125,7 +2100,7 @@ mod tests {
         // 4 workers: even 700 fails → hard error.
         assert!(host_preflight(&est, &multi(4), 500).is_err());
 
-        // §11: a worker owning ONE bin has nothing to prefetch, so it costs the
+        // A worker owning ONE bin has nothing to prefetch, so it costs the
         // no-prefetch shape even when prefetch is on. Four such workers are
         // 100 + 4*150 = 700, not 1300 — the difference between a spurious fallback
         // (or a spurious hard error) and running.
@@ -2143,8 +2118,8 @@ mod tests {
         );
     }
 
-    /// §9.3's invariant: packing a bin must equal packing those same records as
-    /// an entire input, byte for byte. With AM-A2's shared packer this is a
+    /// The packing invariant: packing a bin must equal packing those same records as
+    /// an entire input, byte for byte. With the shared packer this is a
     /// regression test rather than a two-implementation equivalence proof.
     #[test]
     fn packing_a_bin_equals_packing_those_records_as_a_whole_input() {
@@ -2177,7 +2152,7 @@ mod tests {
             for (a, b) in bin.chrs.iter().zip(&want_chrs) {
                 assert_eq!((a.start, a.len, &a.name), (b.start, b.len, &b.name));
             }
-            // §9.4: the reverse complement must come from the bin and agree with
+            // The reverse complement must come from the bin and agree with
             // the shared helper on the same packed block.
             let (want_rc, want_rc_chrs) =
                 crate::sequence::reverse_complement(&want_buf, &want_chrs, want_len);
@@ -2219,7 +2194,7 @@ mod tests {
     #[test]
     fn a_record_larger_than_the_target_stays_atomic() {
         // chr1 is 249 Mbp against a 200 Mbp target: it must remain one bin, not
-        // be split to satisfy the target (§6).
+        // be split to satisfy the target.
         let r = recs(&[249_000_000]);
         let bins = bin_records(&r, 200_000_000);
         assert_eq!(bins.len(), 1);
@@ -2273,7 +2248,7 @@ mod tests {
     #[test]
     fn ordinals_run_reference_outermost() {
         // The executor builds one SeedTable per reference bin and reuses it over
-        // every query bin, so ordinals must group by reference bin (§9).
+        // every query bin, so ordinals must group by reference bin.
         let p = plan(&recs(&[100, 100]), &recs(&[100, 100]), 100);
         assert_eq!(p.reference_bins.len(), 2);
         assert_eq!(p.query_bins.len(), 2);
@@ -2534,22 +2509,6 @@ mod tests {
             (back.seq_block_size, back.query_block_size),
             (auto.seq_target, auto.query_target)
         );
-    }
-
-    #[test]
-    fn candidate_bin_counts_dedup_and_clamp() {
-        assert_eq!(candidate_bin_counts(24, 4, 7), vec![4, 7, 8]);
-        assert_eq!(
-            candidate_bin_counts(7, 8, 7),
-            vec![7],
-            "cannot exceed n_records"
-        );
-        assert_eq!(
-            candidate_bin_counts(24, 4, 4),
-            vec![4, 8],
-            "default==W drops the dup"
-        );
-        assert!(candidate_bin_counts(0, 4, 7).is_empty());
     }
 
     fn manifest_fixture(plan: Plan) -> PlanManifest {
@@ -2817,6 +2776,7 @@ mod tests {
             "warp-score-gate",
             "dense-anchors",
             "find-hits-warp",
+            "ref-loc-buckets",
             "left-pair-tile",
             "simd-prelude",
         ];
@@ -2825,6 +2785,9 @@ mod tests {
         }
         #[cfg(feature = "simd-prelude")]
         assert!(feat.split(',').any(|f| f == "simd-prelude"));
+        // A default feature is part of the identity a manifest records.
+        #[cfg(feature = "ref-loc-buckets")]
+        assert!(feat.split(',').any(|f| f == "ref-loc-buckets"));
         #[cfg(not(feature = "counters"))]
         assert!(!feat.split(',').any(|f| f == "counters"));
     }
@@ -3101,94 +3064,6 @@ mod tests {
         assert_eq!(worker_device_budget(1000, 8, 4), 500);
         assert_eq!(worker_device_budget(900, 3, 1), 300);
         assert_eq!(worker_device_budget(1000, 0, 0), 1000);
-    }
-
-    #[test]
-    fn candidate_plans_w1_is_base_identity() {
-        let r = recs(&[100, 90, 80, 70]);
-        let q = recs(&[50, 50]);
-        let base = plan(&r, &q, 200);
-        assert_eq!(candidate_plans(&r, &base, 1), vec![base.clone()]);
-        assert_eq!(candidate_plans(&r, &base, 0), vec![base.clone()]);
-        // Alternate legal ordinal order is preserved byte-for-byte.
-        let mut alt = base.clone();
-        alt.units.swap(0, 1);
-        alt.units[0].ordinal = 0;
-        alt.units[1].ordinal = 1;
-        assert_ne!(alt, base);
-        assert_eq!(candidate_plans(&r, &alt, 1), vec![alt.clone()]);
-        assert_eq!(
-            candidate_plans(&r, &alt, 4)
-                .iter()
-                .filter(|p| **p == alt)
-                .count(),
-            1
-        );
-    }
-
-    #[test]
-    fn candidate_plans_w4_counts_q_identity_and_cartesian() {
-        let r = recs(&[100, 90, 80, 70, 60, 50, 40, 30, 20, 10, 5, 5]);
-        let q = recs(&[50, 50]);
-        let base = plan(&r, &q, 200);
-        assert_eq!(base.reference_bins.len(), 3);
-        let counts = candidate_bin_counts(r.len(), 4, base.reference_bins.len());
-        assert_eq!(counts, vec![3, 4, 8]);
-        let cands = candidate_plans(&r, &base, 4);
-        assert_eq!(cands.len(), 3);
-        assert!(cands.contains(&base), "default base preserved exactly");
-        let mut seen: Vec<usize> = cands.iter().map(|p| p.reference_bins.len()).collect();
-        seen.sort_unstable();
-        assert_eq!(seen, vec![3, 4, 8]);
-        for p in &cands {
-            assert_eq!(p.query_bins, base.query_bins, "Q frozen");
-            let (nr, nq) = (p.reference_bins.len(), p.query_bins.len());
-            assert_eq!(p.units.len(), nr * nq);
-            for (i, u) in p.units.iter().enumerate() {
-                assert_eq!(u.ordinal, i as u32);
-                assert_eq!(u.reference_bin, (i / nq) as u32);
-                assert_eq!(u.query_bin, (i % nq) as u32);
-            }
-        }
-        // Clamp: more workers than records still yields complete Cartesian plans.
-        let r2 = recs(&[100, 90]);
-        let q2 = recs(&[50]);
-        let b2 = plan(&r2, &q2, 10_000);
-        assert_eq!(b2.reference_bins.len(), 1);
-        assert_eq!(candidate_bin_counts(2, 8, 1), vec![1, 2]);
-        let c2 = candidate_plans(&r2, &b2, 8);
-        assert_eq!(c2.len(), 2);
-        assert!(c2.contains(&b2));
-        for p in &c2 {
-            assert_eq!(p.units.len(), p.reference_bins.len() * p.query_bins.len());
-        }
-    }
-
-    #[test]
-    fn candidate_plans_overflow_safe_and_fit_validated() {
-        assert_eq!(candidate_bin_counts(4, usize::MAX, 2), vec![2, 4]);
-        let r = recs(&[100, 90, 80, 70]);
-        let q = recs(&[50, 50]);
-        let base = plan(&r, &q, 200);
-        let cands = candidate_plans(&r, &base, usize::MAX);
-        assert!(cands.len() <= 3 && !cands.is_empty(), "no panic, deduped");
-        for p in &cands {
-            assert_eq!(p.units.len(), p.reference_bins.len() * p.query_bins.len());
-        }
-        // Fit validation via worst_unit_bytes: cap contributes, tight budget
-        // rejects, membership untouched.
-        let cap = 16_711_680u32;
-        let cand = &cands[0];
-        let before = cand.clone();
-        let worst = worst_unit_bytes(cand, 12, 1, cap, TEST_C, true).unwrap();
-        let zero = worst_unit_bytes(cand, 12, 1, 0, TEST_C, true).unwrap();
-        assert!(worst > zero, "max_hits preserved in fit check");
-        assert!(worst > 1 && zero + 1 <= worst, "tight budget rejects");
-        assert_eq!(*cand, before, "validation must not mutate membership");
-        // Empty reference stays compatible: base identity, no panic.
-        let empty: Vec<RecordMeta> = vec![];
-        let eb = plan(&empty, &q, 100);
-        assert_eq!(candidate_plans(&empty, &eb, 4), vec![eb.clone()]);
     }
 
     /// rank5b CPU-only ownership contract (preparation, no shard runtime):

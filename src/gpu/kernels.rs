@@ -17,8 +17,7 @@
 //! the warp-coalesced score gate and dense-anchor compaction (rounds 44–47),
 //! device seed generation (`seed_kmers`/`scatter_seeds`, round 68), and
 //! `find_hits`' thread-per-seed mapping (round 1). Every change stays
-//! byte-identical to the oracle at matched plan and `MAX_HITS`; the full ledger
-//! is benchmarks/baseline.md.
+//! byte-identical to the oracle at matched plan and `MAX_HITS`.
 
 use crate::hsp::SegmentPair;
 
@@ -509,7 +508,7 @@ pub mod device {
         }
     }
 
-    /// PLAN #2: validate each query window and materialize its k-mer plus the
+    /// Device seeder: validate each query window and materialize its k-mer plus the
     /// number of stable output slots it owns. The encoded query uses 0..3 for
     /// uppercase ACGT and >=4 for every byte CPU seeding rejects.
     #[kernel]
@@ -555,7 +554,7 @@ pub mod device {
         }
     }
 
-    /// Stable scatter for PLAN #2. The scanned count is an inclusive prefix, so
+    /// Stable scatter for the device seeder. The scanned count is an inclusive prefix, so
     /// each valid query position writes the exact CPU order: base k-mer first,
     /// then transition variants in ascending care-position index.
     #[kernel]
@@ -608,8 +607,7 @@ pub mod device {
     /// all idle launch. Block- and warp-per-seed were both implemented and
     /// benchmarked, on apple/orange and on an hg38xmm39 block, then deleted:
     /// thread-per-seed wins by 4.9x on the sparse workload and loses by only
-    /// 0.9% end-to-end on the dense one, which is inside noise
-    /// (benchmarks/baseline.md).
+    /// 0.9% end-to-end on the dense one, which is inside noise.
     #[cfg(not(feature = "dense-anchors"))]
     #[kernel]
     #[allow(clippy::too_many_arguments)]
@@ -1606,7 +1604,7 @@ pub mod device {
         while hid0 < num_hits {
             #[cfg(feature = "counters")]
             let (mut right_tiles, mut left_tiles, mut term) = (0u64, 0u64, 0u64);
-            // PLAN §4: where the first X-drop lands, in the first tile of each
+            // Where the first X-drop lands, in the first tile of each
             // direction — the class that owns ~91% of right terminations.
             #[cfg(feature = "counters")]
             let (mut first_drop_r, mut first_drop_l) = (63u64, 63u64);
@@ -1639,14 +1637,15 @@ pub mod device {
             }
             warp::sync_mask(FULL_MASK);
             // Invariant for the whole hit, yet re-loaded from shared by every
-            // lane on every tile. M13's census: shared-state loads are ~13% of
+            // lane on every tile. The instruction census: shared-state loads are ~13% of
             // per-tile instructions and the kernel runs at ~73% of issue peak,
-            // so these are the cheapest instructions to remove. Unlike M8 this
+            // so these are the cheapest instructions to remove. Unlike the loop-carrier
+            // registerization this
             // needs no commit restructuring — the value never changes.
             let hit_ref_loc = unsafe { REF_LOC[w] };
             let hit_query_loc = unsafe { QUERY_LOC[w] };
 
-            // PLAN #1: score both extensions with the production warp mapping,
+            // Score both extensions with the production warp mapping,
             // but keep only the state needed for X-drop and the maximum score.
             // The overwhelmingly common failing hit avoids position recovery,
             // extent tracking, entropy, and output construction below. A rare
@@ -2094,7 +2093,7 @@ pub mod device {
                 // 4/1, and 53 more 32-bit registers, because `c[r]` with a
                 // runtime index spills. Packed wins on native CUDA on its own
                 // merits, not just as the ZLUDA workaround it originally was
-                // (benchmarks/baseline.md, round 15).
+                // (round 15).
                 //
                 // each field holds at most 65535. Overflow would
                 // carry into the neighbouring base's count, so the ceiling is
@@ -2368,10 +2367,14 @@ pub mod device {
 
     /// Natural log for `x` in `(0, 1]`.
     ///
-    /// libdevice's `__nv_log` is not reachable from cuda-oxide, so
-    /// this is an atanh series over the reduced mantissa — relative error under
-    /// 1e-15, which moves a truncated HSP score by ~1e-11 at most. Swap it for
-    /// the real intrinsic if cuda-oxide ever exposes libdevice.
+    /// libdevice's `__nv_log` is not reachable from cuda-oxide, so this is an
+    /// atanh series over the reduced mantissa, truncated after the `z^7/15` term.
+    /// Measured on p = c/d, 1 <= c < d <= 4096 (2026-09-28): relative error up to
+    /// 3.4e-14 (212 ulp, near m = sqrt 2), and the bits differ from `__nv_log` in
+    /// about half of all arguments. A score or the threshold test flips only when
+    /// `total * entropy` lies within ~1e-10 of an integer — estimated at ~2e-4
+    /// expected differences per whole-genome run; none has been observed. A port
+    /// of `__nv_log` would make this bit-identical to the oracle by construction.
     #[inline(always)]
     fn ln(x: f64) -> f64 {
         const LN2: f64 = core::f64::consts::LN_2;

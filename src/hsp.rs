@@ -28,8 +28,7 @@ use std::cmp::Ordering;
 /// Measured on an NVIDIA L4: `find_hsps` -4.25% (A) / -2.49% (B), whole run
 /// -3.3% / -3.2% drift-corrected, non-overlapping in 4/4 paired rounds and
 /// winning in both run orders. Under ZLUDA the same change was flat, so this is
-/// free there and a real win on native NVIDIA
-/// (benchmarks/baseline.md, round 13).
+/// free there and a real win on native NVIDIA (round 13).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, cuda_core::DeviceCopy)]
 pub struct SegmentPair {
@@ -197,7 +196,7 @@ impl Record {
 
     /// Diagonal sort key. Plus strand sorts by the *sum*, minus by the
     /// *difference* — verified against `diagonal_partition.py`, whose own
-    /// comments have the two branches labelled the wrong way round (AM-1).
+    /// comments have the two branches labelled the wrong way round.
     pub fn diagonal_key(&self, strand: char) -> (i64, i64) {
         let (r_mid, q_mid) = self.mids();
         if strand == '-' { (q_mid - r_mid, r_mid) } else { (q_mid + r_mid, r_mid) }

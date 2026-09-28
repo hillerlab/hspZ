@@ -53,8 +53,10 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
   each job's results, so the per-job output is unchanged. Measured against hg38 with 100 queries of 5 Mbp:
   on one L4, 10,400–11,600 s as separate runs versus 1,890–1,900 s batched (**−82%**); on two RTX 4090s,
   497/482 s at `--gpus 1` versus 255/255 s at `--gpus 2` (**−48%**, workers balanced to 1.2%, all 100 jobs
-  identical), and −49% on two T4s. Three 5 Mbp queries are −62%; whole-chromosome queries (61–121 Mbp)
-  −2.6%; whole-genome queries gain under 1%. All jobs must plan to identical reference bins; `-B 0`,
+  identical), and −49% on two T4s. Both arms of each comparison ran the same pinned settings (device
+  seeder; bucketing on for the L4, off for the RTX 4090s; partition forced at `--gpus 2`), not the
+  `--gpus 1` defaults. Three 5 Mbp queries are −62%; whole-chromosome queries (61–121 Mbp) −2.6%;
+  whole-genome queries are expected to gain under 1% (not measured in batch mode). All jobs must plan to identical reference bins; `-B 0`,
   `--kegalign-bins` and `--from-manifest` are rejected in batch mode; a failing job aborts the batch
   (partial outputs may remain); dumps become per-job siblings (`out.manifest.000001`). Bin-major order
   delays the first result, so amortized time per query is not request latency.
@@ -66,14 +68,18 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
   exactly the index's bins, and every array must match its recorded length and checksum. Measured on an L4 with
   hg38 and 5 Mbp queries run as separate processes: three queries 333 → 87 s (**−74%**) and 100 queries
   10,883/10,789 → 2,683/2,678 s (**−75%**), after a one-off index build of 119–123 s producing 8.93 GB.
-  Loading the seven hg38 bins costs ~12.6 s per run and hides behind the GPU. `-B 0` is rejected on both
+  Measured with bucketing pinned on, the device seeder and the index on local NVMe with a warm page cache.
+  Loading the seven hg38 bins costs ~12.6 s per run; on an L4 all but the first load (~1.7 s) hide behind the
+  GPU, each run still re-reads and re-hashes the reference (~4.7 s), and on faster GPUs a small query's loads
+  set the pace. `-B 0` is rejected on both
   commands; put the index on local storage (a load above 10 s warns).
 - **Unit-level static partition across GPUs (default on for matching devices).** With two or more GPUs the frozen
   plan's work units are split by count quotas (whole bins first, then contiguous query slices of as few bins as
   possible, one extra reference build per split bin) instead of whole-bin ownership, when every device the run
   uses is the same class (equal SM count and L2, nominal clocks within 10%) and each worker has its own device.
   Output is unchanged. On canonical hg38 × mm39 at `MAX_HITS=16,711,680`: seed-and-filter wall **−11.9%** on
-  2× RTX 4090 (1,400 → 1,233 s) and **−5.1%** on 4× RTX 4090 (718 → 681 s). `HSPZ_UNIT_PARTITION=0` restores
+  2× RTX 4090 (1,400 → 1,233 s) and **−5.1%** on 4× RTX 4090 (718 → 681 s); other worker counts and device
+  classes are unmeasured. `HSPZ_UNIT_PARTITION=0` restores
   whole-bin ownership, `1` forces the partition; W=1, time-sliced workers and mixed device classes keep whole-bin
   ownership. The static-attribute guard cannot detect same-model cards with different sustained clocks, and on
   such a pair the balance depends on device order.
@@ -85,6 +91,8 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
   their boost clock pay the bucketing pass instead (RTX 4090: +3.7%), so the choice is made at runtime:
   `HSPZ_REF_BUCKETS` unset means `auto` — each engine alternates both paths in blocks of ≥3 s of gate time,
   discards each block's first second, and commits to the faster settled path (L4 → on, 4090 → off, measured).
+  An engine needs about 20 s of gate time to decide, so short engines (e.g. 5 Mbp queries run as separate
+  processes) stay on the off path; pin `HSPZ_REF_BUCKETS=1` on L4-class cards for those.
   `1`/`0` force a path; `HSPZ_REF_BUCKET_SHIFT=<16..31>` pins the window size; cards whose L2 cannot hold the
   smallest window (T4) stay off. `--time` prints the per-block measurements and the decision per engine. The
   window budget is three quarters of the L2: on an L4 that selects the 32 MiB window, measured 2.8–3.0% less GPU
@@ -92,7 +100,7 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
 - **Sparse chunk walk (default).** Every seed batch that exceeds `--max-hits` used to copy its whole cumulative hit
   array to the host (~6.8 MB, pageable) to locate two or three chunk boundaries. The walk now fetches only the
   ≤1 KB block holding each boundary, producing the same chunks. On two RTX 4090s at whole genome this is **−9.6%**
-  wall (1,634 → 1,480 s, disjoint reversed pairs); on an L4 the copy was hidden under the gate, so nothing changes.
+  wall (1,634 → 1,480 s, disjoint reversed pairs); on an L4 no regression was detected (one overlapping unit-0 pair).
   `HSPZ_CHUNK_WALK=full` restores the old path.
 - **`hspZ hits-estimate` (CPU only).** Prints, before any GPU work, the exact number of seed hits each work unit
   (reference bin × query block) will produce, from dense k-mer histograms with the transition variants folded in;
@@ -119,6 +127,16 @@ device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA).
   over-cap tail that aborted whole-genome runs is admitted without changing any chunk. `--dump-plan`,
   `--dump-manifest` and `--from-manifest` freeze and replay a plan, and a second node validates fit and fails rather
   than replanning. Multi-GPU output is byte-identical to one-GPU output at the same plan and cap.
+- **Fixes.** A seed batch whose hits exceed 2^32 is refused by name: its 32-bit hit total used to wrap,
+  either aborting with a misleading "not monotonic" error or, when the wrapped value fell under the cap,
+  writing past the anchor buffer (reachable with unmasked, closely related inputs and ~1 Gbp bins; KegAlign's
+  scan wraps too). `hspZ index` refuses record names its manifest cannot store and bins over 4,294,967,295 bp
+  before building. `-I 0` and `-C 0` are argument errors (`-I 0` used to loop forever). With `-Z`, the `--time`
+  footer reports the archive's size on disk (it read the size before the gzip trailer was written and fell back
+  to the formatted byte count); `--dump-raw` files are flushed explicitly, so a failed final write is an error
+  instead of a silently truncated dump; frozen and index manifests list the `ref-loc-buckets` feature; the
+  `--time` line for `HSPZ_REF_BUCKETS=0` names the override; `--help` for `-B` and `--gpus` describes the
+  shipped multi-GPU policy instead of recommending one reference bin per worker.
 - **Measured but not shipped** (recorded so nobody repeats them): certified query-context rejection (0.19% of hits),
   nibble-packed reference at genome scale (+0.1%), a 64 M hit cap (+1%), per-chunk and paired-chunk autotuning of the
   bucketing pass (both misread the clock-mediated L4 win), overlapping the next chunk's `find_hits` with the current

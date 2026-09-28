@@ -7,8 +7,8 @@
 
 //! Command-line surface: `Cli`, the per-subcommand argument structs, and the
 //! `Tuning` group that `CompareArgs` flattens. Every argument carries a short
-//! flag where a letter survives clap's reserved `-h`/`-V`, so all three
-//! subcommands keep a terse form.
+//! flag where a letter survives clap's reserved `-h`/`-V`, so every
+//! subcommand keeps a terse form.
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -95,15 +95,20 @@ pub(crate) struct RunArgs {
     #[arg(short = 'Q', long, default_value = "")]
     pub(crate) query_prefix: String,
 
-    #[arg(short = 'C', long, default_value_t = 250_000)]
+    /// Query positions per seed batch; must be positive.
+    #[arg(short = 'C', long, default_value_t = 250_000, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) wga_chunk_size: u32,
-    #[arg(short = 'I', long, default_value_t = 10_000_000)]
+    /// LASTZ interval size on the query; must be positive.
+    #[arg(short = 'I', long, default_value_t = 10_000_000, value_parser = clap::value_parser!(u32).range(1..))]
     pub(crate) lastz_interval_size: u32,
     /// Target bin size in bases (not a hard cut; chromosomes stay atomic).
-    /// Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall,
-    /// about `total_reference_bp / W` (one ref bin per worker) is faster and
-    /// a *different* HSP set. Never overwritten from `--gpus`. See
-    /// `assets/guidance/guidance.md`.
+    /// Default 500 Mbp is the KegAlign-matched digest, and it stays the
+    /// multi-GPU default: with `--gpus W` the unit partition spreads its work
+    /// units over the workers, while coarser layouts (down to one bin per
+    /// worker) measured 17-22% slower on a 2-GPU test host. Any other target is
+    /// a *different* HSP set. Never overwritten from `--gpus`; `-B 0` runs a
+    /// printed automatic layout (opt-in, for per-machine measurement). See
+    /// <https://hillerlab.github.io/hspZ/docs/gpus/>.
     #[arg(short = 'B', long, default_value_t = 500_000_000)]
     pub(crate) seq_block_size: u32,
     /// Bin target for the *query* side; defaults to `--seq-block-size`.
@@ -155,12 +160,14 @@ pub(crate) struct RunArgs {
     /// The planner will not shrink bins or the hit cap.
     #[arg(long)]
     pub(crate) from_manifest: Option<PathBuf>,
-    /// GPUs to run on. Reference bins are split across that many
-    /// workers by deterministic LPT, each owning its bins end to end; output still
-    /// follows `WorkUnit.ordinal`, so it does not depend on which GPU finished
-    /// first. More workers than devices time-slices one GPU: a correctness
-    /// configuration, not a performance one. Batch mode (`--query-list`) uses
-    /// the same workers over unit-partitioned `(job, unit)` slots.
+    /// GPUs to run on. With one worker per device and every device the same
+    /// class (SM count, L2, clocks within 10%), the plan's work units are split
+    /// across workers by count quotas; otherwise each worker owns whole
+    /// reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces
+    /// either). Output follows `WorkUnit.ordinal`, so it does not depend on which
+    /// GPU finished first. More workers than devices time-slices one GPU: a
+    /// correctness configuration, not a performance one. Batch mode
+    /// (`--query-list`) uses the same policy over `(job, unit)` slots.
     #[arg(short = 'G', long, default_value_t = 1)]
     pub(crate) gpus: usize,
     /// Wait for the GPU after every stage instead of enqueueing the whole
@@ -454,5 +461,14 @@ mod tests {
             .is_err(),
             "-q and --query-list must conflict"
         );
+        // A zero interval or chunk size never reaches the seeder: `-I 0` used to
+        // loop forever in `sequence::intervals`.
+        for flag in ["-I", "-C"] {
+            assert!(
+                Cli::try_parse_from(["hspz", "run", "-r", "r.fa", "-q", "q.fa", flag, "0"])
+                    .is_err(),
+                "{flag} 0 must be rejected"
+            );
+        }
     }
 }

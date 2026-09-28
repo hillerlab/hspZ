@@ -239,6 +239,21 @@ pub(crate) fn run(args: &IndexArgs) -> Fallible<()> {
     }
 
     let (_, records, _) = sequence::read_records(&args.reference)?;
+    // The MANIFEST stores names as whitespace-separated tokens, so a name the
+    // FASTA reader accepts but the MANIFEST cannot round-trip (empty, or holding
+    // Unicode whitespace such as U+00A0) is refused here, before the build,
+    // instead of by `run --index` after it.
+    if let Some((name, _)) = records
+        .iter()
+        .find(|(n, _)| n.is_empty() || n.chars().any(char::is_whitespace))
+    {
+        return Err(format!(
+            "index {}: record name {name:?} is empty or contains whitespace, which the \
+             index MANIFEST cannot store; rename the record",
+            dir.display()
+        )
+        .into());
+    }
     let ref_meta = record_meta(&records);
     let target = args.seq_block_size as u64;
     let bins: Vec<Bin> = if args.kegalign_bins {
@@ -246,6 +261,17 @@ pub(crate) fn run(args: &IndexArgs) -> Fallible<()> {
     } else {
         plan::bin_records(&ref_meta, target)
     };
+    // Bases are addressed with u32 (`Chr::len`, `pos_table`): a bin that does not
+    // fit would publish wrapped positions that `run` can never use.
+    for b in &bins {
+        plan::packed_bin_len("reference", b).map_err(|e| {
+            format!(
+                "index {}: {e}; bases are addressed with u32, so a bin (and any single \
+                 record) must stay below 4,294,967,295 bp",
+                dir.display()
+            )
+        })?;
+    }
     if bins.len() > MAX_BINS {
         return Err(format!(
             "index {}: {} reference bins exceeds the v1 limit of {MAX_BINS}",
@@ -1404,7 +1430,7 @@ mod tests {
     #[test]
     fn write_load_bit_identity() {
         let f = build_default_fixture(8000);
-        let (base, rf, dir, man, records) = (f.base, f.rf, f.dir, f.man, f.records);
+        let (base, dir, man, records) = (f.base, f.dir, f.man, f.records);
         assert_eq!(
             man.bins.len(),
             2,
@@ -1512,7 +1538,7 @@ mod tests {
     #[test]
     fn missing_ready_is_incomplete() {
         let f = build_default_fixture(8000);
-        let (base, rf, dir) = (f.base, f.rf, f.dir);
+        let (base, dir) = (f.base, f.dir);
         std::fs::remove_file(dir.join("READY")).unwrap();
         let err = load_manifest(&dir).err().expect("load must fail");
         assert!(
@@ -1861,6 +1887,29 @@ mod tests {
         let cli = Cli::try_parse_from(["hspz", "index", "-r", "r.fa", "--index", "d", "-T", "T_"])
             .unwrap();
         assert!(matches!(cli.command, Command::Index(_)));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Names the MANIFEST cannot round-trip are refused before the build; the
+    /// FASTA reader splits names only on ASCII whitespace, the MANIFEST parser
+    /// on Unicode whitespace.
+    #[test]
+    fn unstorable_record_names_are_rejected_before_the_build() {
+        let base = scratch();
+        let seq = "ACGT".repeat(2000);
+        for (i, name) in ["a\u{a0}b", ""].into_iter().enumerate() {
+            let rf = write_fasta(
+                &base,
+                &format!("ref{i}.fa"),
+                &[("ok", seq.as_str()), (name, seq.as_str())],
+            );
+            let dir = base.join(format!("idx{i}"));
+            let err = run(&index_args(rf, dir.clone(), 8000))
+                .err()
+                .expect("index must refuse the name");
+            assert!(err.to_string().contains("whitespace"), "{err}");
+            assert!(!dir.exists(), "nothing may be published");
+        }
         std::fs::remove_dir_all(&base).unwrap();
     }
 

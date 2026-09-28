@@ -237,7 +237,7 @@ impl Phases {
             "  {:<26} {:>9.2} {:>6.1}%\n",
             "total wall", wall_ms, 100.0
         ));
-        // Phase 1 §16: the metric that decides whether removing host barriers
+        // The metric that decides whether removing host barriers
         // helped. Summing the CUDA-event durations is exact per stage; stages that
         // genuinely overlap would double-count, but this pipeline is one stream.
         let gpu_ms: f64 = self.gpu_ms();
@@ -304,7 +304,7 @@ pub fn peak_rss_kib() -> u64 {
 }
 
 /// Available host memory in bytes, from the tightest cgroup v2 limit that governs
-/// this process, falling back to `/proc/meminfo` `MemAvailable` (Phase 1 §5).
+/// this process, falling back to `/proc/meminfo` `MemAvailable`.
 ///
 /// cgroup v2 exposes `memory.max` (hard OOM-kill limit) and `memory.high` (soft
 /// throttle); "available" is the tighter of the two minus `memory.current`, with
@@ -317,7 +317,7 @@ pub fn peak_rss_kib() -> u64 {
 /// into a no-op on exactly the machines it exists to protect (amendment C, one level
 /// deeper than stated).
 pub fn available_host_bytes() -> Option<u64> {
-    // Test/CI override: deterministic, no platform dependence (Phase 1 §5).
+    // Test/CI override: deterministic, no platform dependence.
     if let Ok(v) = std::env::var("HSPZ_HOST_MEMORY_BYTES") {
         if let Ok(bytes) = v.parse::<u64>() {
             return Some(bytes);
