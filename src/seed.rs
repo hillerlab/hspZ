@@ -205,6 +205,7 @@ impl SeedTable {
     /// Pass 2 recomputes `kmer_at` rather than storing the k-mer of every
     /// position, which also drops the serial builder's `idxs` temporary — 1 GB
     /// on chr1 at `--step 1`.
+    #[allow(clippy::needless_range_loop)]
     pub fn build_parallel(seq: &[u8], shape: &Shape, step: u32, threads: usize) -> Self {
         let step = step.max(1) as usize;
         // Same strided start sequence as the serial builder; at --step 1 this
@@ -219,8 +220,9 @@ impl SeedTable {
         }
 
         let per = num_steps.div_ceil(threads);
-        let ranges: Vec<(usize, usize)> =
-            (0..threads).map(|t| (t * per, ((t + 1) * per).min(num_steps))).collect();
+        let ranges: Vec<(usize, usize)> = (0..threads)
+            .map(|t| (t * per, ((t + 1) * per).min(num_steps)))
+            .collect();
 
         // Pass 1: private counts per worker, indexed by kmer (no +1 shift yet).
         let counts: Vec<Vec<u32>> = std::thread::scope(|scope| {
@@ -239,7 +241,10 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("seed count worker panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("seed count worker panicked"))
+                .collect()
         });
 
         // Prefix across workers, two-level so it does not become the new
@@ -252,8 +257,9 @@ impl SeedTable {
         // serially, then convert counts to absolute cursors in parallel.
         let nk = table_size - 1;
         let kper = nk.div_ceil(threads);
-        let kranges: Vec<(usize, usize)> =
-            (0..threads).map(|c| (c * kper, ((c + 1) * kper).min(nk))).collect();
+        let kranges: Vec<(usize, usize)> = (0..threads)
+            .map(|c| (c * kper, ((c + 1) * kper).min(nk)))
+            .collect();
 
         let chunk_totals: Vec<u64> = std::thread::scope(|scope| {
             let handles: Vec<_> = kranges
@@ -271,7 +277,10 @@ impl SeedTable {
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().expect("prefix worker panicked")).collect()
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("prefix worker panicked"))
+                .collect()
         });
 
         let mut chunk_base = Vec::with_capacity(kranges.len());
@@ -291,8 +300,10 @@ impl SeedTable {
             // pointers exist only because the disjointness is by k while the
             // owning containers are indexed by t first.
             let idx_ptr = index_table.as_mut_ptr() as usize;
-            let cur_ptrs: Vec<usize> =
-                cursors.iter_mut().map(|c| c.as_mut_ptr() as usize).collect();
+            let cur_ptrs: Vec<usize> = cursors
+                .iter_mut()
+                .map(|c| c.as_mut_ptr() as usize)
+                .collect();
             std::thread::scope(|scope| {
                 for (ci, &(lo, hi)) in kranges.iter().enumerate() {
                     let cur_ptrs = &cur_ptrs;
@@ -343,7 +354,10 @@ impl SeedTable {
             }
         });
 
-        SeedTable { index_table, pos_table }
+        SeedTable {
+            index_table,
+            pos_table,
+        }
     }
 
     /// Number of reference hits for a seed — what `find_num_hits` computes.
@@ -439,7 +453,10 @@ pub fn chunk_seeds_parts(
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("seed worker panicked")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("seed worker panicked"))
+            .collect()
     })
 }
 
@@ -623,6 +640,7 @@ pub fn count_ref_block_sharded(
 /// `(qbl - end, qbl - start)`, whose own chunk alignment decides the mirror's
 /// duplicate windows. Counting raw interval ends as inclusive, as the first
 /// version of this estimator did, double-counts every shared endpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn count_query_block(
     fwd: &[u8],
     rc: &[u8],
@@ -807,7 +825,10 @@ mod tests {
 
     #[test]
     fn kmer_packs_care_positions_only() {
-        assert!(Shape::parse("101").is_err(), "3 care positions is below the k-mer floor");
+        assert!(
+            Shape::parse("101").is_err(),
+            "3 care positions is below the k-mer floor"
+        );
         let s = Shape::parse("1111").unwrap();
         assert_eq!(s.kmer_at(b"ACGT", 0), 0b00_01_10_11);
         // A separator anywhere in the window invalidates it.
@@ -941,7 +962,10 @@ mod tests {
 
     #[test]
     fn chunking_matches_seeder_loop() {
-        assert_eq!(chunks(0, 376657, 250_000), vec![(0, 250_000), (250_000, 376_658)]);
+        assert_eq!(
+            chunks(0, 376657, 250_000),
+            vec![(0, 250_000), (250_000, 376_658)]
+        );
         assert_eq!(chunks(0, 10, 250_000), vec![(0, 11)]);
     }
 }

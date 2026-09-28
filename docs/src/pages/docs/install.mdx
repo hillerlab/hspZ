@@ -54,6 +54,13 @@ cargo oxide build -- --release --locked
 target/release/hspZ --version
 ```
 
+A bare build targets `sm_80`, the default in `.cargo/cuda-oxide.toml` and the
+architecture ZLUDA expects. The NVIDIA image builds `sm_75` instead, whose PTX
+also runs on newer cards; Turing cards such as the T4 need it:
+`cargo oxide build --arch sm_75 -- --release --locked`. The binary links
+`libcuda.so.1`, so even `--version` needs the NVIDIA driver (or ZLUDA's library)
+on the loader path.
+
 Plain `cargo build` does not run the cuda-oxide device build and is not a
 supported production build.
 

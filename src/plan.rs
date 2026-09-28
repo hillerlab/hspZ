@@ -143,6 +143,7 @@ pub fn unit_partition(plan: &Plan, workers: usize) -> Vec<Vec<Visit>> {
 /// quota-order DP are exactly [`unit_partition`]'s with `Q := M`. Returned
 /// ranges index the caller's per-bin scheduling lists, whose entries carry the
 /// original units (built by `run::build_slot_lists`).
+#[allow(clippy::needless_range_loop)]
 pub fn unit_partition_dims(
     reference_bins: &[Bin],
     slots_per_bin: usize,
@@ -919,7 +920,7 @@ pub fn max_hit_capacity(
     let mut lo = max_hits;
     let mut hi = u32::MAX;
     while lo < hi {
-        let mid = (lo as u64 + ((hi as u64 - lo as u64 + 1) / 2)) as u32;
+        let mid = (lo as u64 + (hi as u64 - lo as u64).div_ceil(2)) as u32;
         let cost = worst_unit_bytes(plan, kmer_size, step, mid, wga_chunk_size, transitions)?;
         if cost <= budget_bytes {
             lo = mid;
@@ -944,6 +945,7 @@ pub fn worker_device_budget(free_bytes: u64, workers: usize, devices: usize) -> 
 /// exceeds capacity is a hard error: v1 does not split records, and discovering
 /// it through a CUDA OOM mid-run is exactly what this avoids. Intermediate
 /// oversized packed bins shrink; matched-granularity and frozen layouts fail.
+#[allow(clippy::too_many_arguments)]
 pub fn plan_within_budget(
     reference: &[RecordMeta],
     query: &[RecordMeta],
@@ -1714,7 +1716,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 fn decode_hex_utf8(s: &str, what: &str) -> Result<String, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(format!("odd {what} hex length"));
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
@@ -2730,7 +2732,7 @@ mod tests {
     #[test]
     fn manifest_matrix_and_prefix_roundtrip() {
         let mut m = manifest_fixture(plan(&recs(&[10]), &recs(&[10]), 100));
-        m.sub_mat = (0..64).map(|i| i as i32 - 40).collect();
+        m.sub_mat = (0..64).map(|i| i - 40).collect();
         m.target_prefix = " \t\n\u{1b}héllo".into();
         m.query_prefix = "世界\0".into();
         let text = manifest_text(&m);
@@ -3092,7 +3094,7 @@ mod tests {
                     for n_nodes in 1..=4usize {
                         cases += 1;
                         let mut units = p.units.clone();
-                        if cases % 2 == 0 {
+                        if cases.is_multiple_of(2) {
                             units.reverse();
                             for (i, u) in units.iter_mut().enumerate() {
                                 u.ordinal = i as u32;
@@ -3135,7 +3137,7 @@ mod tests {
                             node_units.iter().flat_map(|v| v.iter().copied()).collect();
                         union.sort_unstable();
                         assert_eq!(union, (0..units.len() as u32).collect::<Vec<_>>());
-                        if cases % 2 == 0 && units.len() > 1 && !validated_alt {
+                        if cases.is_multiple_of(2) && units.len() > 1 && !validated_alt {
                             manifest_fixture(Plan {
                                 reference_bins: p.reference_bins.clone(),
                                 query_bins: p.query_bins.clone(),
@@ -3289,6 +3291,7 @@ mod unit_partition_tests {
     }
 
     /// Exact cover, quotas, contiguity and in-bin order for any partition.
+    #[allow(clippy::needless_range_loop)]
     fn check_invariants(plan: &Plan, workers: usize, part: &[Vec<Visit>]) {
         let r = plan.reference_bins.len();
         let q = plan.query_bins.len();
@@ -3478,6 +3481,7 @@ mod unit_partition_tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn minimal_visits_against_brute_force_oracle() {
         // Every R,Q,W <= 3: enumerate all quota-respecting assignments of the
         // N units to W workers and take the minimum (bin,worker) touch count.

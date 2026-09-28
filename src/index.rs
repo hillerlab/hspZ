@@ -1540,7 +1540,7 @@ mod tests {
         let f = build_default_fixture(8000);
         let (base, dir) = (f.base, f.dir);
         std::fs::remove_file(dir.join("READY")).unwrap();
-        let err = load_manifest(&dir).err().expect("load must fail");
+        let err = load_manifest(&dir).expect_err("load must fail");
         assert!(
             err.to_string().contains("missing READY"),
             "{}",
@@ -1556,7 +1556,7 @@ mod tests {
         let f = build_default_fixture(8000);
         let (base, dir) = (f.base, f.dir);
         std::fs::write(dir.join("READY"), "stale\n").unwrap();
-        let err = load_manifest(&dir).err().expect("load must fail");
+        let err = load_manifest(&dir).expect_err("load must fail");
         assert!(
             err.to_string().contains("missing READY"),
             "{}",
@@ -1576,9 +1576,7 @@ mod tests {
         let ref_meta = record_meta(&records);
         let plan = plan::plan_with(&ref_meta, &ref_meta, 8000, 8000, false);
         let args = run_args_for(rf);
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("check must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("check must fail");
         assert!(
             err.contains(&format!("bin {}", man.bins[0].bin.id)),
             "{err}"
@@ -1606,9 +1604,7 @@ mod tests {
         let ref_meta = record_meta(&records);
         let plan = plan::plan_with(&ref_meta, &ref_meta, 8000, 8000, false);
         let args = run_args_for(rf);
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("check must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("check must fail");
         assert!(err.contains(&format!("bin {bid}")), "{err}");
         // The per-visit loader rejects the same manifest before any upload.
         let rbin = man.bins[bi].bin.clone();
@@ -1633,9 +1629,7 @@ mod tests {
         let ref_meta = record_meta(&records);
         let plan = plan::plan_with(&ref_meta, &ref_meta, 8000, 8000, false);
         let args = run_args_for(rf);
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("check must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("check must fail");
         assert!(
             err.contains(&format!("bin {}", man.bins[0].bin.id)),
             "{err}"
@@ -1654,9 +1648,7 @@ mod tests {
         let ref_meta = record_meta(&records);
         let plan = plan::plan_with(&ref_meta, &ref_meta, 8000, 8000, false);
         let args = run_args_for(rf);
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("check must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("check must fail");
         assert!(
             err.contains(&format!("bin {}", man.bins[0].bin.id)),
             "{err}"
@@ -1685,9 +1677,8 @@ mod tests {
         let ref_meta = record_meta(&stale_records);
         let plan = plan::plan_with(&ref_meta, &ref_meta, 8000, 8000, false);
         let args = run_args_for(rf);
-        let err = check_run(&dir, &man, &args, 8000, &stale_records, &plan)
-            .err()
-            .expect("load must fail");
+        let err =
+            check_run(&dir, &man, &args, 8000, &stale_records, &plan).expect_err("load must fail");
         assert!(err.contains("records_hash"), "{err}");
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -1708,15 +1699,12 @@ mod tests {
         assert_eq!(plan.reference_bins.len(), 1);
         let mut args = run_args_for(rf);
         args.seq_block_size = 500_000_000;
-        let err = check_run(&dir, &man, &args, 500_000_000, &records, &plan)
-            .err()
-            .expect("load must fail");
+        let err =
+            check_run(&dir, &man, &args, 500_000_000, &records, &plan).expect_err("load must fail");
         assert!(err.contains("--seq-block-size"), "{err}");
         // Same collapsed plan against the indexed target exercises the R-count
         // branch instead.
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("load must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("load must fail");
         assert!(err.contains("R="), "{err}");
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -1731,16 +1719,12 @@ mod tests {
 
         let mut args = run_args_for(rf.clone());
         args.seed = "14of22".into();
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("load must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("load must fail");
         assert!(err.contains("seed"), "{err}");
 
         let mut args = run_args_for(rf);
         args.step = 2;
-        let err = check_run(&dir, &man, &args, 8000, &records, &plan)
-            .err()
-            .expect("load must fail");
+        let err = check_run(&dir, &man, &args, 8000, &records, &plan).expect_err("load must fail");
         assert!(err.contains("step"), "{err}");
         std::fs::remove_dir_all(&base).unwrap();
     }
@@ -1858,16 +1842,12 @@ mod tests {
         let base = scratch();
         let rf = write_fasta(&base, "ref.fa", &[("a", &"ACGT".repeat(2000))]);
         // -B 0.
-        let err = run(&index_args(rf.clone(), base.join("i0"), 0))
-            .err()
-            .expect("load must fail");
+        let err = run(&index_args(rf.clone(), base.join("i0"), 0)).expect_err("load must fail");
         assert!(err.to_string().contains("-B 0"), "{}", err.to_string());
         // Existing DIR.
         let dir = base.join("idx");
         std::fs::create_dir_all(&dir).unwrap();
-        let err = run(&index_args(rf.clone(), dir, 8000))
-            .err()
-            .expect("load must fail");
+        let err = run(&index_args(rf.clone(), dir, 8000)).expect_err("load must fail");
         assert!(
             err.to_string().contains("already exists"),
             "{}",
@@ -1877,7 +1857,7 @@ mod tests {
         // message.
         let mut args = index_args(rf, base.join("iT"), 8000);
         args.target_prefix = Some("T_".into());
-        let err = run(&args).err().expect("load must fail");
+        let err = run(&args).expect_err("load must fail");
         assert!(
             err.to_string().contains("unprefixed"),
             "{}",
@@ -1904,9 +1884,8 @@ mod tests {
                 &[("ok", seq.as_str()), (name, seq.as_str())],
             );
             let dir = base.join(format!("idx{i}"));
-            let err = run(&index_args(rf, dir.clone(), 8000))
-                .err()
-                .expect("index must refuse the name");
+            let err =
+                run(&index_args(rf, dir.clone(), 8000)).expect_err("index must refuse the name");
             assert!(err.to_string().contains("whitespace"), "{err}");
             assert!(!dir.exists(), "nothing may be published");
         }

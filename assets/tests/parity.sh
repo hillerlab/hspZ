@@ -13,22 +13,35 @@ set -uo pipefail
 cd "$(dirname "$0")/../.."
 ROOT=$PWD
 HSPZ=${HSPZ:-$ROOT/target/release/hspZ}
+# Machine paths are never committed: CUDA_HOME, ZLUDA, HIPFIX, KEGALIGN, TESTDATA
+# and HSPZ_GENOMES come from the per-user file
+#   ${HSPZ_TEST_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/hspz/test.env}
+# (plain KEY=value lines). Pre-exported values win over the file: save them,
+# source the file, then restore -- the file only fills what the caller left unset.
+for _v in CUDA_HOME ZLUDA HIPFIX KEGALIGN TESTDATA HSPZ_GENOMES; do
+  eval "[ \"\${$_v+x}\" ] && _s_$_v=\$$_v"
+done
+_f=${HSPZ_TEST_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/hspz/test.env}
+[ -f "$_f" ] && . "$_f"        # no error if absent
+for _v in CUDA_HOME ZLUDA HIPFIX KEGALIGN TESTDATA HSPZ_GENOMES; do
+  eval "[ \"\${_s_$_v+x}\" ] && $_v=\$_s_$_v"
+done
 KEGALIGN=${KEGALIGN:-/tmp/kegalign/build/kegalign}
 TESTDATA=${TESTDATA:-/tmp/kegalign/test-data}
 WORK=${WORK:-$(mktemp -d /tmp/hspz-parity-XXXXXX)}
 
-CUDACONDA=${CUDACONDA:-/home/alejandro/opt/cudaconda}
-export LD_LIBRARY_PATH=${ZLUDA:-/home/alejandro/opt/zluda}:$CUDACONDA/lib
-# The Thrust/CUB oracle aborts (rc=134) under ZLUDA without a legacy-stream shim.
-# `hspZ compare` no longer defaults this -- a developer path must not ship in the
-# published container's --help -- so the harness supplies it, and skips it when absent
-# so a native-CUDA host needs no shim at all.
-HIPFIX=${HIPFIX:-/home/alejandro/opt/zluda-guide/hipfix.so}
-preload=()
-[ -f "$HIPFIX" ] && preload=(--ld-preload "$HIPFIX")
 # cuda-bindings' build script needs cuda.h; without CUDA_HOME it probes
 # /usr/local/cuda, fails, and the unit suite silently does not run.
-export CUDA_HOME=${CUDA_HOME:-$CUDACONDA}
+# CUDACONDA is the legacy name for the CUDA toolkit root; still honoured.
+export CUDA_HOME=${CUDA_HOME:-${CUDACONDA:-/usr/local/cuda}}
+cudalib=$CUDA_HOME/lib; [ -d "$cudalib" ] || cudalib=$CUDA_HOME/lib64
+export LD_LIBRARY_PATH=${ZLUDA:+$ZLUDA:}$cudalib
+# The Thrust/CUB oracle aborts (rc=134) under ZLUDA without a legacy-stream shim.
+# `hspZ compare` no longer defaults this -- a developer path must not ship in the
+# published container's --help -- so the harness supplies it, and only when HIPFIX
+# is set and exists, so a native-CUDA host needs no shim at all.
+preload=()
+[ -n "${HIPFIX:-}" ] && [ -f "$HIPFIX" ] && preload=(--ld-preload "$HIPFIX")
 
 [ -x "$HSPZ" ]     || { echo "no hspZ binary at $HSPZ - run: cargo oxide build -- --release"; exit 1; }
 [ -x "$KEGALIGN" ] || { echo "no oracle at $KEGALIGN"; exit 1; }

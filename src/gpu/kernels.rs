@@ -512,6 +512,7 @@ pub mod device {
     /// number of stable output slots it owns. The encoded query uses 0..3 for
     /// uppercase ACGT and >=4 for every byte CPU seeding rejects.
     #[kernel]
+    #[allow(clippy::too_many_arguments)]
     pub fn seed_kmers(
         query: &[u8],
         shape_pos: &[u32],
@@ -971,6 +972,7 @@ pub mod device {
     #[cfg(feature = "dense-anchors")]
     #[inline(always)]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::manual_range_contains)]
     fn score_gate(
         thread_id: u32,
         ref_seq: &[u8],
@@ -1550,6 +1552,7 @@ pub mod device {
     /// `-entropy/log(4.0f)` where the divisor is computed in single precision.
     #[kernel]
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::needless_range_loop)]
     pub fn find_hsps(
         ref_seq: &[u8],
         query_seq: &[u8],
@@ -2900,6 +2903,7 @@ mod tests {
     /// The tie rule itself, pinned: `shuffle_up` reads the *earlier* lane, so
     /// `>=` keeps the earliest position among equal maxima.
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn ties_resolve_to_the_earliest_lane() {
         let mut v = [(0i32, 0i32); W];
         for l in 0..W {
@@ -2971,6 +2975,7 @@ mod tests {
 
     /// 4-base grouped prelude used by the SIMD score gate.
     /// `n_lanes` is 8 (right, 32 bases) or 16 (left, 64 bases).
+    #[allow(clippy::needless_range_loop)]
     fn simd4_prelude(
         scores: &[i32],
         valid: usize,

@@ -83,8 +83,8 @@ sequenceDiagram
 ## A.5 — Preflight the work-unit grid
 <!-- @id: a-preflight -->
 WHAT GOES IN: Reference bins, query bins, device budget, MAX_HITS, and worker count.
-WHAT HAPPENS: The planner forms the Cartesian grid, estimates the largest unit, and halves unsafe targets until it fits.
-WHAT COMES OUT: Ordered WorkUnits and a deterministic reference-bin assignment.
+WHAT HAPPENS: The planner forms the Cartesian grid, estimates the largest unit, and halves both targets until it fits; `--kegalign-bins` fails instead of shrinking.
+WHAT COMES OUT: Ordered WorkUnits and a deterministic worker assignment: count-quota unit slices on matching devices, otherwise whole reference bins.
 INVARIANT: Shrinking changes the frozen layout before allocation; it never splits a chromosome inside a WorkUnit.
 
 ```mermaid
@@ -98,5 +98,5 @@ sequenceDiagram
     Q->>P: candidate layout
     P->>P: fit or halve targets
     P-->>W: ordered R × Q grid
-    W-->>G: LPT by reference bin
+    W-->>G: unit slices or whole bins
 ```

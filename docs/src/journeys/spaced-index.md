@@ -4,6 +4,7 @@
 <!-- @source: src/seed.rs::SeedTable::build_parallel -->
 <!-- @source: src/gpu/kernels.rs::seed_kmers -->
 <!-- @source: src/gpu/kernels.rs::scatter_seeds -->
+<!-- @source: src/index.rs::load_bin -->
 
 ## B.1 — Resolve the seed shape
 <!-- @id: b-shape -->
@@ -62,7 +63,7 @@ sequenceDiagram
 WHAT GOES IN: Per-worker k-mer counts and the same reference ranges.
 WHAT HAPPENS: Two-level prefixes assign disjoint bucket cursors; workers rescan and scatter genomic positions.
 WHAT COMES OUT: Cumulative `index_table` boundaries and bucketed `pos_table` positions.
-INVARIANT: Positions remain ascending inside every bucket, byte-identical to the serial builder.
+INVARIANT: Positions remain ascending inside every bucket, byte-identical to the serial builder and to the arrays `hspZ index` stores for `run --index`.
 
 ```mermaid
 sequenceDiagram

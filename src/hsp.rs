@@ -104,9 +104,12 @@ pub fn dedup_and_order(hsps: &mut Vec<SegmentPair>, mut groups: Option<&mut Grou
         } else if let Some(g) = groups.as_deref_mut() {
             // Removed: attributed to the run head that survives it. The
             // production predicate decides this, not a geometric look-alike.
-            *g.sizes.last_mut().expect("a survivor precedes every removal") += 1;
+            *g.sizes
+                .last_mut()
+                .expect("a survivor precedes every removal") += 1;
             let prev = &hsps[i - 1];
-            if prev.ref_start == h.ref_start && prev.query_start == h.query_start
+            if prev.ref_start == h.ref_start
+                && prev.query_start == h.query_start
                 && prev.len == h.len
             {
                 g.duplicate += 1;
@@ -199,17 +202,16 @@ impl Record {
     /// comments have the two branches labelled the wrong way round.
     pub fn diagonal_key(&self, strand: char) -> (i64, i64) {
         let (r_mid, q_mid) = self.mids();
-        if strand == '-' { (q_mid - r_mid, r_mid) } else { (q_mid + r_mid, r_mid) }
+        if strand == '-' {
+            (q_mid - r_mid, r_mid)
+        } else {
+            (q_mid + r_mid, r_mid)
+        }
     }
 }
 
 /// The records [`render_segments`] would print, in printed order.
-pub fn records(
-    hsps: &[SegmentPair],
-    r_chrs: &[Chr],
-    q_chrs: &[Chr],
-    strand: char,
-) -> Vec<Record> {
+pub fn records(hsps: &[SegmentPair], r_chrs: &[Chr], q_chrs: &[Chr], strand: char) -> Vec<Record> {
     let ordered: Box<dyn Iterator<Item = &SegmentPair>> = if strand == '-' {
         Box::new(hsps.iter().rev())
     } else {
@@ -236,12 +238,7 @@ pub fn record(e: &SegmentPair, r_chrs: &[Chr], q_chrs: &[Chr]) -> Record {
 }
 
 /// Renders records back to `.segments` text.
-pub fn render_records(
-    recs: &[Record],
-    r_chrs: &[Chr],
-    q_chrs: &[Chr],
-    strand: char,
-) -> String {
+pub fn render_records(recs: &[Record], r_chrs: &[Chr], q_chrs: &[Chr], strand: char) -> String {
     let mut out = String::with_capacity(recs.len() * 64);
     for r in recs {
         out.push_str(&format!(
@@ -303,7 +300,12 @@ mod tests {
     use super::*;
 
     fn sp(r: u32, q: u32, len: u32, score: i32) -> SegmentPair {
-        SegmentPair { ref_start: r, query_start: q, len, score }
+        SegmentPair {
+            ref_start: r,
+            query_start: q,
+            len,
+            score,
+        }
     }
 
     #[test]
@@ -315,20 +317,41 @@ mod tests {
 
     #[test]
     fn sort_key_is_diag_start_len_then_score_descending() {
-        let mut v = vec![sp(5, 0, 3, 100), sp(5, 0, 3, 900), sp(5, 0, 1, 10), sp(4, 0, 9, 1)];
+        let mut v = vec![
+            sp(5, 0, 3, 100),
+            sp(5, 0, 3, 900),
+            sp(5, 0, 1, 10),
+            sp(4, 0, 9, 1),
+        ];
         v.sort_by(by_diagonal);
-        assert_eq!(v, vec![sp(4, 0, 9, 1), sp(5, 0, 1, 10), sp(5, 0, 3, 900), sp(5, 0, 3, 100)]);
+        assert_eq!(
+            v,
+            vec![
+                sp(4, 0, 9, 1),
+                sp(5, 0, 1, 10),
+                sp(5, 0, 3, 900),
+                sp(5, 0, 3, 100)
+            ]
+        );
     }
 
     #[test]
     fn dedup_drops_contained_segments_on_the_same_diagonal() {
         // Same diagonal: [0,10) swallows [0,5) and [6,8); a different diagonal
         // is never merged even when the intervals nest.
-        let mut v = vec![sp(0, 0, 10, 50), sp(0, 0, 5, 40), sp(6, 6, 2, 30), sp(0, 1, 4, 20)];
+        let mut v = vec![
+            sp(0, 0, 10, 50),
+            sp(0, 0, 5, 40),
+            sp(6, 6, 2, 30),
+            sp(0, 1, 4, 20),
+        ];
         dedup_and_order(&mut v, None);
         assert_eq!(v.len(), 2, "one survivor per diagonal, got {v:?}");
         assert!(v.contains(&sp(0, 1, 4, 20)));
-        assert!(v.contains(&sp(0, 0, 5, 40)), "shortest sorts first and is the one kept");
+        assert!(
+            v.contains(&sp(0, 0, 5, 40)),
+            "shortest sorts first and is the one kept"
+        );
     }
 
     #[test]

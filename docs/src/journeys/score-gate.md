@@ -4,6 +4,9 @@
 <!-- @source: src/gpu/kernels.rs::count_survivors -->
 <!-- @source: src/gpu/kernels.rs::emit_survivors -->
 <!-- @source: src/gpu/mod.rs::seed_and_filter -->
+<!-- @source: src/gpu/kernels.rs::bucket_scatter -->
+<!-- @source: src/gpu/kernels.rs::mark_score_survivors_reordered -->
+<!-- @source: src/gpu/kernels.rs::sort_survivors -->
 
 ## D.1 — Feed coalesced anchor chunks to a warp
 <!-- @id: d-coalesced-anchors -->
@@ -80,4 +83,23 @@ sequenceDiagram
     C-->>H: one count per block
     H-->>E: exclusive block offsets
     E-->>S: original IDs in order
+```
+
+## D.5 — Optionally gate anchors by reference window
+<!-- @id: d-ref-buckets -->
+WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`, default `auto`).
+WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, each a window that fits three quarters of the L2, so consecutive warps gather from one cached window; the gate then writes one keep bit per anchor.
+WHAT COMES OUT: Survivor IDs mapped back through each anchor's raw index and sorted into ascending raw hit order.
+INVARIANT: The materializer sees the same survivors in the same order as without bucketing, so the HSP set and file bytes are unchanged.
+
+```mermaid
+sequenceDiagram
+    participant A as Packed anchors
+    participant B as Bucket sort
+    participant G as Score gate
+    participant S as Survivor IDs
+    A->>B: reference address bucket
+    B->>G: bucket-major anchors + raw index
+    G-->>S: keep bits mapped to raw IDs
+    S->>S: sort back to raw hit order
 ```

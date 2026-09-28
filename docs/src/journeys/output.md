@@ -80,7 +80,7 @@ sequenceDiagram
 ## G.5 — Emit deterministic files or one archive
 <!-- @id: g-emit -->
 WHAT GOES IN: Completed WorkUnits arriving in any GPU completion order.
-WHAT HAPPENS: Ordinals are replayed; optional diagonal partitioning runs before a directory or reproducible tar sink writes non-empty entries.
+WHAT HAPPENS: Ordinals are replayed; optional diagonal partitioning runs before a directory or reproducible tar sink writes non-empty entries. With `--query-list`, every job has its own ordinal cursor, `-D` history and sink.
 WHAT COMES OUT: `tmp<n>.block<q>.r<r>.{plus,minus}[.splitN].segments` files.
 INVARIANT: Worker completion order never changes filenames, partition history, archive entry order, or bytes.
 

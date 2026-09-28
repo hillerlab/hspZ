@@ -3,6 +3,8 @@
 <!-- @source: src/gpu/kernels.rs::find_num_hits -->
 <!-- @source: src/gpu/kernels.rs::scan_blocks -->
 <!-- @source: src/gpu/mod.rs::chunk_limits -->
+<!-- @source: src/gpu/mod.rs::chunk_limits_sparse -->
+<!-- @source: src/gpu/mod.rs::exclusive_scan_hit_totals -->
 <!-- @source: src/gpu/kernels.rs::find_hits_dense -->
 <!-- @source: src/gpu/kernels.rs::find_hits_dense_warp -->
 
@@ -27,9 +29,9 @@ sequenceDiagram
 ## C.2 — Turn counts into global prefixes
 <!-- @id: c-scan-hits -->
 WHAT GOES IN: Per-seed hit counts on the device.
-WHAT HAPPENS: Device blocks scan locally, the host exclusively scans small block sums, then offsets are added back.
+WHAT HAPPENS: Device blocks scan locally, the host exclusively scans small block sums, then offsets are added back. A batch whose total exceeds the 32-bit hit index is refused, never wrapped.
 WHAT COMES OUT: A global inclusive prefix and the total number of anchors.
-INVARIANT: Only block sums cross the bus unless MAX_HITS actually forces element-level chunking.
+INVARIANT: Only block sums cross the bus; when MAX_HITS cuts a batch, only the 256-count block holding each boundary is copied as well.
 
 ```mermaid
 sequenceDiagram
@@ -46,7 +48,7 @@ sequenceDiagram
 ## C.3 — Cut at MAX_HITS boundaries
 <!-- @id: c-chunks -->
 WHAT GOES IN: Global hit prefixes, total hits, and the resolved MAX_HITS cap.
-WHAT HAPPENS: The common case uses one chunk; oversized streams reproduce KegAlign's lower-bound walk over seed prefixes.
+WHAT HAPPENS: The common case uses one chunk; oversized streams reproduce KegAlign's lower-bound walk over seed prefixes, located through the block sums (`HSPZ_CHUNK_WALK=full` copies the whole prefix array instead).
 WHAT COMES OUT: Contiguous seed ranges and their exact hit ranges.
 INVARIANT: A seed is never split across chunks, so a chunk may exceed MAX_HITS by one seed bucket.
 

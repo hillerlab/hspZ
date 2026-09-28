@@ -82,9 +82,9 @@ mod partition;
 mod plan;
 mod run;
 mod scoring;
-mod sink;
 mod seed;
 mod sequence;
+mod sink;
 mod timing;
 
 use clap::Parser;

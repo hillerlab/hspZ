@@ -298,7 +298,7 @@ pub fn peak_rss_kib() -> u64 {
         .and_then(|s| {
             s.lines()
                 .find_map(|l| l.strip_prefix("VmHWM:"))
-                .and_then(|v| v.trim().split_whitespace().next()?.parse().ok())
+                .and_then(|v| v.split_whitespace().next()?.parse().ok())
         })
         .unwrap_or(0)
 }
@@ -318,10 +318,10 @@ pub fn peak_rss_kib() -> u64 {
 /// deeper than stated).
 pub fn available_host_bytes() -> Option<u64> {
     // Test/CI override: deterministic, no platform dependence.
-    if let Ok(v) = std::env::var("HSPZ_HOST_MEMORY_BYTES") {
-        if let Ok(bytes) = v.parse::<u64>() {
-            return Some(bytes);
-        }
+    if let Ok(v) = std::env::var("HSPZ_HOST_MEMORY_BYTES")
+        && let Ok(bytes) = v.parse::<u64>()
+    {
+        return Some(bytes);
     }
     let proc = std::fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     // v2: one `0::<path>` line, unified hierarchy.
@@ -381,11 +381,11 @@ fn cgroup_available(
     let mut dir = mount.join(rel.trim_start_matches('/'));
     let mut best: Option<u64> = None;
     loop {
-        if let Some(current) = read(&dir, current_file) {
-            if let Some(limit) = limit_files.iter().filter_map(|f| read(&dir, f)).min() {
-                let free = limit.saturating_sub(current);
-                best = Some(best.map_or(free, |b: u64| b.min(free)));
-            }
+        if let Some(current) = read(&dir, current_file)
+            && let Some(limit) = limit_files.iter().filter_map(|f| read(&dir, f)).min()
+        {
+            let free = limit.saturating_sub(current);
+            best = Some(best.map_or(free, |b: u64| b.min(free)));
         }
         if dir == mount {
             break;
@@ -403,7 +403,7 @@ fn mem_available() -> Option<u64> {
     let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
     for line in meminfo.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:") {
-            let kb: u64 = rest.trim().split_whitespace().next()?.parse().ok()?;
+            let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
             return Some(kb * 1024);
         }
     }

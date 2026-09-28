@@ -125,7 +125,9 @@ impl Format {
     pub fn detect(path: &Path) -> Result<Self, String> {
         let mut head = [0u8; 4];
         let mut f = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let n = f.read(&mut head).map_err(|e| format!("{}: {e}", path.display()))?;
+        let n = f
+            .read(&mut head)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         if n >= 4 {
             let be = u32::from_be_bytes(head);
             let le = u32::from_le_bytes(head);
@@ -188,15 +190,17 @@ pub fn pack<'a>(
     let mut chrs = Vec::new();
     let mut block_len: usize = 0;
     for (name, seq) in records {
-        chrs.push(Chr { name: format!("{prefix}{name}"), start: buf.len(), len: seq.len() as u32 });
+        chrs.push(Chr {
+            name: format!("{prefix}{name}"),
+            start: buf.len(),
+            len: seq.len() as u32,
+        });
         buf.extend_from_slice(seq);
         block_len += seq.len();
         buf.push(SEP);
         block_len += 1;
     }
-    if block_len > 0 {
-        block_len -= 1; // the last '&' is in the buffer but not in the block
-    }
+    block_len = block_len.saturating_sub(1); // the last '&' is in the buffer but not in the block
     (buf, chrs, block_len)
 }
 
@@ -216,7 +220,11 @@ pub fn reverse_complement(buf: &[u8], chrs: &[Chr], block_len: usize) -> (Vec<u8
     let rc_chrs = chrs
         .iter()
         .rev()
-        .map(|c| Chr { name: c.name.clone(), start: n - c.start - c.len as usize, len: c.len })
+        .map(|c| Chr {
+            name: c.name.clone(),
+            start: n - c.start - c.len as usize,
+            len: c.len,
+        })
         .collect();
     (rc, rc_chrs)
 }
@@ -225,6 +233,7 @@ pub fn reverse_complement(buf: &[u8], chrs: &[Chr], block_len: usize) -> (Vec<u8
 /// without packing or any block-size guard. The multi-block
 /// executor needs the records themselves so it can bin them; [`Genome::load`]
 /// is the single-block wrapper that packs and enforces the old guard.
+#[allow(clippy::type_complexity)]
 pub fn read_records(path: &Path) -> Result<(Format, Vec<(String, Vec<u8>)>, u64), String> {
     let format = Format::detect(path)?;
     let records = match format {
@@ -244,8 +253,10 @@ impl Genome {
     pub fn load(path: &Path, prefix: &str, seq_block_size: u32) -> Result<Self, String> {
         let (format, records, bytes_read) = read_records(path)?;
 
-        let (buf, chrs, block_len) =
-            pack(records.iter().map(|(n, s)| (n.as_str(), s.as_slice())), prefix);
+        let (buf, chrs, block_len) = pack(
+            records.iter().map(|(n, s)| (n.as_str(), s.as_slice())),
+            prefix,
+        );
         if block_len > seq_block_size as usize {
             // This guard stays until the multi-block executor is
             // the selected path; removing it earlier would swap a clear message
@@ -417,7 +428,10 @@ mod tests {
         for (a, b) in [(b'A', b'T'), (b'C', b'G'), (b'G', b'C'), (b'T', b'A')] {
             assert_eq!(REV_COMP[a as usize], b);
         }
-        assert_eq!(REV_COMP[SEP as usize], SEP, "separators must survive revcomp");
+        assert_eq!(
+            REV_COMP[SEP as usize], SEP,
+            "separators must survive revcomp"
+        );
         assert_eq!(REV_COMP[b'a' as usize], b't', "soft-masking is preserved");
         assert_eq!(REV_COMP[b'N' as usize], b'N');
     }
@@ -433,8 +447,16 @@ mod tests {
     #[test]
     fn chr_lookup_is_upper_bound_minus_one() {
         let chrs = vec![
-            Chr { name: "a".into(), start: 0, len: 10 },
-            Chr { name: "b".into(), start: 11, len: 10 },
+            Chr {
+                name: "a".into(),
+                start: 0,
+                len: 10,
+            },
+            Chr {
+                name: "b".into(),
+                start: 11,
+                len: 10,
+            },
         ];
         assert_eq!(chr_at(&chrs, 0), 0);
         assert_eq!(chr_at(&chrs, 10), 0); // the separator belongs to the left chr
@@ -448,8 +470,8 @@ mod tests {
     /// real file format rather than the crate's own writer.
     #[test]
     fn three_formats_load_to_the_same_sequence_set() {
-        use flate2::write::GzEncoder;
         use flate2::Compression;
+        use flate2::write::GzEncoder;
         use std::io::Write;
 
         let records = vec![
@@ -475,7 +497,10 @@ mod tests {
 
         let gz_path = dir.join("x.fa.gz");
         {
-            let mut enc = GzEncoder::new(std::fs::File::create(&gz_path).unwrap(), Compression::default());
+            let mut enc = GzEncoder::new(
+                std::fs::File::create(&gz_path).unwrap(),
+                Compression::default(),
+            );
             enc.write_all(fa.as_bytes()).unwrap();
             enc.finish().unwrap();
         }
@@ -493,7 +518,11 @@ mod tests {
             assert_eq!(g.buf, expected_buf, "{label}: plain FASTA buf");
             assert_eq!(other.buf, expected_buf, "{label}: buf differs from FASTA");
             assert_eq!(other.block_len, g.block_len, "{label}: block_len");
-            assert_eq!(other.digest(), g.digest(), "{label}: SequenceSet digest differs");
+            assert_eq!(
+                other.digest(),
+                g.digest(),
+                "{label}: SequenceSet digest differs"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -528,7 +557,10 @@ mod tests {
         // One record: seqLen u32 + nBlockCount u32 + (start,size) pairs +
         // mBlockCount u32 + (start,size) pairs + reserved u32 + bases.
         let rec_len = |_name: &str, seq: &[u8]| -> u32 {
-            (4 + 4 + 8 * n_blocks(seq).len() + 4 + 8 * mask_blocks(seq).len()
+            (4 + 4
+                + 8 * n_blocks(seq).len()
+                + 4
+                + 8 * mask_blocks(seq).len()
                 + 4
                 + seq.len().div_ceil(4)) as u32
         };
@@ -609,5 +641,4 @@ mod tests {
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(&file).unwrap();
     }
-
 }

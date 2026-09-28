@@ -1152,7 +1152,7 @@ fn check_manifest_params(
     if m.step != args.step {
         bad.push(format!("step {} vs {}", m.step, args.step));
     }
-    if m.transitions != !args.notransition {
+    if m.transitions == args.notransition {
         bad.push("transitions".into());
     }
     if m.xdrop != args.xdrop {
@@ -1454,10 +1454,12 @@ fn run_bins(
     tx: &std::sync::mpsc::SyncSender<UnitOutput>,
     run_started: Instant,
 ) -> Fallible<WorkerReport> {
-    let mut rep = WorkerReport::default();
-    rep.job_stats = vec![Stats::default(); jobs.len()];
-    rep.job_hit_stats = (0..jobs.len()).map(|_| HitStats::default()).collect();
-    rep.job_audits = (0..jobs.len()).map(|_| None).collect();
+    let mut rep = WorkerReport {
+        job_stats: vec![Stats::default(); jobs.len()],
+        job_hit_stats: (0..jobs.len()).map(|_| HitStats::default()).collect(),
+        job_audits: (0..jobs.len()).map(|_| None).collect(),
+        ..Default::default()
+    };
     if visits.is_empty() {
         return Ok(rep);
     }
@@ -2764,6 +2766,7 @@ impl JobRouter {
     /// Buffers `(job, ordinal)` after validating it against that job's plan,
     /// then drains and returns every newly consecutive unit for the job in
     /// ordinal order. The caller emits the returned units immediately.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn push(
         &mut self,
         job: usize,
@@ -3872,7 +3875,7 @@ pub(crate) fn n1_eligibility(enc: &[u8], sub_mat: &[i32], xdrop: i32, hspthresh:
             (true, 0)
         };
         if stop {
-            if mass < hspthresh as i64 && lo.checked_add(1).unwrap_or(usize::MAX) <= i {
+            if mass < hspthresh as i64 && lo.saturating_add(1) <= i {
                 eligible[lo + 1..=i].fill(true);
             }
             lo = i.checked_add(1).expect("query block too large");
@@ -3881,7 +3884,7 @@ pub(crate) fn n1_eligibility(enc: &[u8], sub_mat: &[i32], xdrop: i32, hspthresh:
             mass = mass.checked_add(pm).expect("N1 gap mass overflow");
         }
     }
-    if mass < hspthresh as i64 && lo.checked_add(1).unwrap_or(usize::MAX) <= n {
+    if mass < hspthresh as i64 && lo.saturating_add(1) <= n {
         eligible[lo + 1..=n].fill(true);
     }
     eligible
@@ -4773,8 +4776,10 @@ mod tests {
                 score: 4,
             }
         }
-        let mut payload = Pass::default();
-        payload.intervals = vec![(vec![seg(); 10], Vec::new())];
+        let payload = Pass {
+            intervals: vec![(vec![seg(); 10], Vec::new())],
+            ..Default::default()
+        };
         let (a, b, c, _) = empty();
         r.push(0, 2, 0, 2, &plan, a, b, c, payload).unwrap();
         let (a, b, c, p) = empty();
@@ -4855,7 +4860,7 @@ mod tests {
                 .collect()
         }
 
-        let units = vec![
+        let units = [
             // Empty unit: a real work unit with zero HSPs on both strands, the
             // completeness gap a count-only check would miss.
             UnitOutput {
@@ -5070,14 +5075,14 @@ mod tests {
         use crate::sequence::{self, Genome};
 
         let mut q = Vec::new();
-        q.extend_from_slice(&vec![b'A'; 100]);
-        q.extend_from_slice(&vec![b'a'; 10]);
-        q.extend_from_slice(&vec![b'A'; 25]);
-        q.extend_from_slice(&vec![b'a'; 10]);
-        q.extend_from_slice(&vec![b'A'; 155]);
+        q.extend_from_slice(&[b'A'; 100]);
+        q.extend_from_slice(&[b'a'; 10]);
+        q.extend_from_slice(&[b'A'; 25]);
+        q.extend_from_slice(&[b'a'; 10]);
+        q.extend_from_slice(&[b'A'; 155]);
         assert_eq!(q.len(), 300);
 
-        let r = [b"N".as_slice(), &vec![b'A'; 20], b"N", &vec![b'T'; 20]].concat();
+        let r = [b"N".as_slice(), &[b'A'; 20], b"N", &[b'T'; 20]].concat();
         assert_eq!(r.len(), 42);
 
         let shape = Shape::parse("12of19").unwrap();
@@ -5087,7 +5092,7 @@ mod tests {
         let cm = n1_colmax(&sub_mat);
         assert_eq!([cm[0], cm[1], cm[2], cm[3]], [91, 100, 100, 91]);
         assert!(cm[4] < -910 && cm[5] < -910 && cm[7] < -910);
-        assert!(!(cm[6] < -910));
+        assert!((cm[6] >= -910));
 
         let (qbuf, qchrs, qblock) = sequence::pack([("q", q.as_slice())], "");
         let (rbuf, rchrs, rblock) = sequence::pack([("r", r.as_slice())], "");

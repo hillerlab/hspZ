@@ -94,7 +94,11 @@ impl SurvivorAudit {
     /// dump. Bare `1` keeps the original scalar-only S0 diagnostic.
     pub fn dump_path() -> Option<std::path::PathBuf> {
         std::env::var_os("HSPZ_ANCHOR_CENSUS").and_then(|value| {
-            if value.is_empty() || value == "1" { None } else { Some(value.into()) }
+            if value.is_empty() || value == "1" {
+                None
+            } else {
+                Some(value.into())
+            }
         })
     }
 
@@ -161,7 +165,10 @@ impl SurvivorAudit {
                 if s >= STRONG_HSP_SCORE {
                     b.accepted_strong += 1;
                 }
-                accepted_hsps.push(AcceptedHsp { hsp, common: r > 32 });
+                accepted_hsps.push(AcceptedHsp {
+                    hsp,
+                    common: r > 32,
+                });
             }
         }
     }
@@ -187,7 +194,13 @@ impl SurvivorAudit {
     pub fn report(&self) -> String {
         let tot = |f: fn(&Bucket) -> u64| -> u64 { self.buckets.iter().map(f).sum() };
         let (hits, surv, acc) = (tot(|b| b.hits), tot(|b| b.survivors), tot(|b| b.accepted));
-        let pct = |n: u64, d: u64| if d == 0 { 0.0 } else { n as f64 / d as f64 * 100.0 };
+        let pct = |n: u64, d: u64| {
+            if d == 0 {
+                0.0
+            } else {
+                n as f64 / d as f64 * 100.0
+            }
+        };
 
         let mut out = String::from(
             "S0 SURVIVOR AUDIT  (HSPZ_ANCHOR_CENSUS)\n  \
@@ -205,7 +218,11 @@ impl SurvivorAudit {
                 pct(b.survivors, surv),
                 b.accepted,
                 pct(b.accepted, acc),
-                if b.accepted == 0 { 0.0 } else { b.accepted_score as f64 / b.accepted as f64 },
+                if b.accepted == 0 {
+                    0.0
+                } else {
+                    b.accepted_score as f64 / b.accepted as f64
+                },
                 b.accepted_strong,
             ));
         }
@@ -250,10 +267,19 @@ mod tests {
         let survivors = [0u32, 5, 40, 43];
         let accepted = [1u32, 1, 0, 1];
         let hsps = [
-            SegmentPair { score: 50_000, ..Default::default() },
-            SegmentPair { score: 3_000, ..Default::default() },
+            SegmentPair {
+                score: 50_000,
+                ..Default::default()
+            },
+            SegmentPair {
+                score: 3_000,
+                ..Default::default()
+            },
             SegmentPair::default(),
-            SegmentPair { score: 12_000, ..Default::default() },
+            SegmentPair {
+                score: 12_000,
+                ..Default::default()
+            },
         ];
         let mut accepted_hsps = Vec::new();
         let mut a = SurvivorAudit::default();
@@ -274,7 +300,10 @@ mod tests {
         assert_eq!(a.buckets[4].hits, 40);
 
         assert_eq!(a.buckets[1].survivors, 1);
-        assert_eq!(a.buckets[4].survivors, 2, "ids 5 and 40 belong to the r=40 seed");
+        assert_eq!(
+            a.buckets[4].survivors, 2,
+            "ids 5 and 40 belong to the r=40 seed"
+        );
         assert_eq!(a.buckets[2].survivors, 1, "id 43 belongs to the r=3 seed");
 
         // Accepted and score bands follow the same attribution.
@@ -314,7 +343,10 @@ mod tests {
             &[40],
             &[0],
             &[1],
-            &[SegmentPair { score: 5_000, ..Default::default() }],
+            &[SegmentPair {
+                score: 5_000,
+                ..Default::default()
+            }],
             4,
             &mut Vec::new(),
         );
@@ -325,8 +357,14 @@ mod tests {
             &[0, 41],
             &[1, 1],
             &[
-                SegmentPair { score: 20_000, ..Default::default() },
-                SegmentPair { score: 20_000, ..Default::default() },
+                SegmentPair {
+                    score: 20_000,
+                    ..Default::default()
+                },
+                SegmentPair {
+                    score: 20_000,
+                    ..Default::default()
+                },
             ],
             8,
             &mut Vec::new(),
@@ -337,7 +375,10 @@ mod tests {
         assert_eq!(a.buckets[4].hits, 120);
         assert_eq!(a.buckets[4].survivors, 3);
         assert_eq!(a.buckets[4].accepted, 3);
-        assert_eq!(a.buckets[4].accepted_strong, 2, "only the 20000s are strong");
+        assert_eq!(
+            a.buckets[4].accepted_strong, 2,
+            "only the 20000s are strong"
+        );
         assert_eq!(a.launches, 2);
         assert_eq!(a.peak_launch_bytes, peak_b, "peak is a max, not a sum");
     }
@@ -348,7 +389,10 @@ mod tests {
     fn transport_is_measured_and_reported() {
         let mut a = SurvivorAudit::default();
         let counts = [4u32];
-        let hsps = [SegmentPair { score: 2_500, ..Default::default() }; 2];
+        let hsps = [SegmentPair {
+            score: 2_500,
+            ..Default::default()
+        }; 2];
         a.observe_counts(&counts);
         a.ingest_survivors(&counts, &[0, 1], &[1, 1], &hsps, 4, &mut Vec::new());
         let r = a.report();

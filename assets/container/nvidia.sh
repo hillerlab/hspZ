@@ -40,7 +40,7 @@ fi
 # `bash` argument and die on "unrecognized subcommand").
 case "${1:-}" in
     hspZ)                      shift; exec hspZ "$@" ;;
-    run|benchmark|compare|--help|--version|-h|-V)
+    run|index|benchmark|compare|hits-estimate|--help|--version|-h|-V)
                                exec hspZ "$@" ;;
     *)                         exec "$@" ;;
 esac

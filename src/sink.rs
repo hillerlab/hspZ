@@ -38,7 +38,10 @@ pub struct DirectorySink {
 impl DirectorySink {
     pub fn new(dir: &Path) -> Fallible<Self> {
         std::fs::create_dir_all(dir)?;
-        Ok(Self { dir: dir.to_path_buf(), bytes: 0 })
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            bytes: 0,
+        })
     }
 }
 
@@ -74,7 +77,11 @@ impl TarGzSink {
             std::fs::create_dir_all(parent)?;
         }
         let gz = GzEncoder::new(BufWriter::new(File::create(path)?), Compression::default());
-        Ok(Self { tar: tar::Builder::new(gz), path: path.to_path_buf(), bytes: 0 })
+        Ok(Self {
+            tar: tar::Builder::new(gz),
+            path: path.to_path_buf(),
+            bytes: 0,
+        })
     }
 }
 
@@ -120,7 +127,10 @@ mod tests {
         let big = vec![b'x'; 200_000];
         let files: Vec<(String, Vec<u8>)> = vec![
             ("tmp1.block0.r0.plus.segments".into(), big),
-            ("tmp2.block0.r0.minus.segments".into(), b"acgtacgt\n".to_vec()),
+            (
+                "tmp2.block0.r0.minus.segments".into(),
+                b"acgtacgt\n".to_vec(),
+            ),
             ("empty.segments".into(), Vec::new()),
         ];
 

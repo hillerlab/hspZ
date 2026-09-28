@@ -41,7 +41,7 @@ sequenceDiagram
 ## F.3 — Reproduce KegAlign's float boundary
 <!-- @id: f-threshold -->
 WHAT GOES IN: Total score, composition counts, and `logf(4)` widened to double.
-WHAT HAPPENS: Normalized entropy scales the score, then the result follows KegAlign's conversion points before comparison with K.
+WHAT HAPPENS: With at least 20 counted bases, normalized entropy scales the score (with fewer, the score stands), then the result follows KegAlign's conversion points before comparison with K.
 WHAT COMES OUT: An accepted entropy-adjusted score or rejection.
 INVARIANT: Replacing widened `logf(4)` or the score conversions with mathematically cleaner doubles can change boundary cases.
 

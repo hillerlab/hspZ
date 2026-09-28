@@ -223,6 +223,7 @@ mod tests {
     /// on both strands — which the estimator must reproduce exactly. The
     /// window starts come from [`seed::chunks`], the same batch walk the
     /// device seeder and `cpu_stats` both execute.
+    #[allow(clippy::too_many_arguments)]
     fn oracle_hits(
         ref_buf: &[u8],
         fwd: &[u8],
@@ -265,20 +266,20 @@ mod tests {
     fn toy_estimator_matches_pipeline_oracle() {
         let shape = Shape::parse("TTT0T").unwrap(); // size 5, k 4, all-transition
         let lastz = 7; // force several intervals on ~20 bp blocks
-        let ref_recs = vec![
+        let ref_recs = [
             ("r1", b"ACGTACGTACGTACGT".as_slice()),
             ("r2", b"AAAANNNNAAAACCCC".as_slice()),
             ("r3", b"acgtACGTacgtACGT".as_slice()),
         ];
-        let qry_recs = vec![
+        let qry_recs = [
             ("q1", b"TTTTGGGGAAAACCCCGGGG".as_slice()),
             ("q2", b"ACnnACGTACGTACGTAC".as_slice()),
         ];
         let (ref_buf, _, ref_len) = sequence::pack(ref_recs.iter().map(|(n, s)| (*n, *s)), "");
         let (fwd, fwd_chrs, block_len) = sequence::pack(qry_recs.iter().map(|(n, s)| (*n, *s)), "");
         let (rc, _) = sequence::reverse_complement(&fwd, &fwd_chrs, block_len);
-        assert!(ref_buf.iter().any(|&c| c == b'N'));
-        assert!(ref_buf.iter().any(|&c| c == b'a'));
+        assert!(ref_buf.contains(&b'N'));
+        assert!(ref_buf.contains(&b'a'));
 
         for transitions in [true, false] {
             for (plus, minus) in [(true, true), (true, false), (false, true)] {

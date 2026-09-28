@@ -52,8 +52,12 @@ pub fn build_sub_mat(
     let field = fields[0];
     let (reward, penalty) = if fields.len() == 3 {
         (
-            fields[1].parse::<i32>().map_err(|e| format!("--ambiguous reward: {e}"))?,
-            -fields[2].parse::<i32>().map_err(|e| format!("--ambiguous penalty: {e}"))?,
+            fields[1]
+                .parse::<i32>()
+                .map_err(|e| format!("--ambiguous reward: {e}"))?,
+            -fields[2]
+                .parse::<i32>()
+                .map_err(|e| format!("--ambiguous penalty: {e}"))?,
         )
     } else if ambiguous == "n" || ambiguous == "iupac" {
         (0, 0)
@@ -76,7 +80,11 @@ pub fn build_sub_mat(
     }
     m[l * NUC + l] = BAD;
 
-    let n_score = if field == "n" || field == "iupac" { (penalty, reward) } else { (BAD, BAD) };
+    let n_score = if field == "n" || field == "iupac" {
+        (penalty, reward)
+    } else {
+        (BAD, BAD)
+    };
     for i in 0..n {
         m[i * NUC + n] = n_score.0;
         m[n * NUC + i] = n_score.0;
@@ -171,8 +179,7 @@ fn load_scoring_matrix(path: &Path) -> Result<[[i32; 4]; 4], String> {
     let col_chars: Vec<u8> = header
         .split_whitespace()
         .map(|f| {
-            parse_char_code(f, &at(hn))?
-                .ok_or_else(|| format!("empty column label ({})", at(hn)))
+            parse_char_code(f, &at(hn))?.ok_or_else(|| format!("empty column label ({})", at(hn)))
         })
         .collect::<Result<_, _>>()?;
     let num_cols = col_chars.len();
@@ -277,7 +284,10 @@ mod tests {
 
     fn write(name: &str, body: &str) -> std::path::PathBuf {
         let p = std::env::temp_dir().join(format!("hspz-score-{name}-{}", std::process::id()));
-        std::fs::File::create(&p).unwrap().write_all(body.as_bytes()).unwrap();
+        std::fs::File::create(&p)
+            .unwrap()
+            .write_all(body.as_bytes())
+            .unwrap();
         p
     }
 
@@ -329,7 +339,10 @@ mod tests {
         );
         assert_eq!(load_scoring_matrix(&p).unwrap(), DEFAULT_ACGT);
         // ... and the full matrix is then identical to the built-in default.
-        assert_eq!(build_sub_mat("", 910, Some(&p)).unwrap(), build_sub_mat("", 910, None).unwrap());
+        assert_eq!(
+            build_sub_mat("", 910, Some(&p)).unwrap(),
+            build_sub_mat("", 910, None).unwrap()
+        );
     }
 
     #[test]
@@ -358,8 +371,16 @@ mod tests {
     #[test]
     fn rejects_malformed_matrices_clearly() {
         let bad = [
-            ("ragged", "  A  C\nA 1 2\nC 3\n", "inconsistent number of score columns"),
-            ("wide", "  A  C\nA 1 2 3 4\n", "wrong number of score columns"),
+            (
+                "ragged",
+                "  A  C\nA 1 2\nC 3\n",
+                "inconsistent number of score columns",
+            ),
+            (
+                "wide",
+                "  A  C\nA 1 2 3 4\n",
+                "wrong number of score columns",
+            ),
             ("float", "  A\nA 1.5\n", "scores must be integers"),
             ("quantum", "  A~T\nA 1\n", "quantum alphabet"),
             ("empty", "fill_score = -1\n", "no scoring matrix"),

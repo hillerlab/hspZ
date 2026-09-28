@@ -2121,7 +2121,7 @@ impl Engine {
             )
             .into());
         }
-        if self.seed_shape.len() == 0 {
+        if self.seed_shape.is_empty() {
             let pos: Vec<u32> = shape.pos.iter().map(|&p| p as u32).collect();
             self.seed_shape = DeviceBuffer::from_host(&self.stream, &pos)?;
         }
@@ -2283,7 +2283,6 @@ impl Engine {
     }
 
     /// One `SeedAndFilter(seed_offset_vector, rev, buffer)` call, over the seeds
-
     /// Lazily creates the block-span event pair (two CU_EVENT_DEFAULT events
     /// reused across chunks).
     #[cfg(feature = "ref-loc-buckets")]
@@ -3423,11 +3422,11 @@ impl Engine {
                                     break;
                                 }
                             }
-                            if let Some(&last) = ids.last() {
-                                if last >= iter_num_hits {
-                                    ok = false;
-                                    detail = format!("last={last} n={iter_num_hits}");
-                                }
+                            if let Some(&last) = ids.last()
+                                && last >= iter_num_hits
+                            {
+                                ok = false;
+                                detail = format!("last={last} n={iter_num_hits}");
                             }
                             if !ok {
                                 eprintln!(
@@ -3668,11 +3667,13 @@ impl Engine {
         }
         // The upload ran concurrently, so its duration belongs in the overlapped
         // section of the table, not in `accounted`.
-        if self.async_seed_copy && self.timing && num_seeds > 0 {
-            if let Some(start) = &self.copy_start[slot] {
-                let ms = start.elapsed_ms(&self.copy_ready[slot])? as f64;
-                self.phases.add_overlapped_ms("H->D seeds (standalone)", ms);
-            }
+        if self.async_seed_copy
+            && self.timing
+            && num_seeds > 0
+            && let Some(start) = &self.copy_start[slot]
+        {
+            let ms = start.elapsed_ms(&self.copy_ready[slot])? as f64;
+            self.phases.add_overlapped_ms("H->D seeds (standalone)", ms);
         }
         Ok(out)
     }
@@ -3715,27 +3716,27 @@ impl Engine {
             // so anything outside [0, 1000] ms is dropped rather than trusted.
             // Intervals above 1,000 ms are unit-transition work (query pack, ref
             // prep) counted separately so they stay visible instead of silent.
-            if let (Some(prev), Some((start, _))) = (self.last_end.as_ref(), p.events.as_ref()) {
-                if let Ok(gap) = prev.elapsed_ms(start) {
-                    if (0.0f32..=1000.0f32).contains(&gap) {
-                        self.gap_ms += gap;
-                        self.gap_n += 1;
-                        if gap > self.gap_max {
-                            self.gap_max = gap;
-                            self.gap_max_pair = (self.last_name, p.name);
-                        }
-                        let key = (self.last_name, p.name);
-                        match self.gap_pairs.iter_mut().find(|e| e.0 == key) {
-                            Some(e) => {
-                                e.1 += gap;
-                                e.2 += 1;
-                            }
-                            None => self.gap_pairs.push((key, gap, 1)),
-                        }
-                    } else if gap > 1000.0 {
-                        self.gap_long_n += 1;
-                        self.gap_long_ms += gap;
+            if let (Some(prev), Some((start, _))) = (self.last_end.as_ref(), p.events.as_ref())
+                && let Ok(gap) = prev.elapsed_ms(start)
+            {
+                if (0.0f32..=1000.0f32).contains(&gap) {
+                    self.gap_ms += gap;
+                    self.gap_n += 1;
+                    if gap > self.gap_max {
+                        self.gap_max = gap;
+                        self.gap_max_pair = (self.last_name, p.name);
                     }
+                    let key = (self.last_name, p.name);
+                    match self.gap_pairs.iter_mut().find(|e| e.0 == key) {
+                        Some(e) => {
+                            e.1 += gap;
+                            e.2 += 1;
+                        }
+                        None => self.gap_pairs.push((key, gap, 1)),
+                    }
+                } else if gap > 1000.0 {
+                    self.gap_long_n += 1;
+                    self.gap_long_ms += gap;
                 }
             }
             if let Some((_, end)) = p.events {
@@ -3798,10 +3799,10 @@ impl Engine {
     pub fn finish_bucket_autotune(&self) {
         #[cfg(feature = "ref-loc-buckets")]
         {
-            if let Some(k) = self.bucket_undecided_blocks() {
-                if self.timing {
-                    eprintln!("ref buckets: auto undecided (engine ended after {k} blocks)");
-                }
+            if let Some(k) = self.bucket_undecided_blocks()
+                && self.timing
+            {
+                eprintln!("ref buckets: auto undecided (engine ended after {k} blocks)");
             }
         }
     }
@@ -5211,7 +5212,7 @@ mod tests {
             );
             total_fetches += fetches as u64;
             total_boundaries += boundaries as u64;
-            if matches!(&expected, Ok(_)) {
+            if expected.is_ok() {
                 ok_fetches += fetches as u64;
                 ok_boundaries += boundaries as u64;
             }
