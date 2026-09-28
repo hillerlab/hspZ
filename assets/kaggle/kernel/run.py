@@ -197,10 +197,13 @@ def build():
     # library, which has no resource directory, so bindgen resolves `#include
     # <stddef.h>` against nothing and dies on /usr/include/stdlib.h. Internet is
     # enabled, so install clang and take both paths from it.
-    if not shutil.which("clang") or not shutil.which("time"):
+    # The cuda-oxide codegen backend at the Cargo.lock pin links -lffi, which needs the
+    # unversioned libffi.so from libffi-dev.
+    need_ffi = not out("ldconfig -p | grep -E 'libffi\\.so \\('")
+    if not shutil.which("clang") or not shutil.which("time") or need_ffi:
         # `time` is not in the Kaggle image either, and the arms report max RSS.
         sh(
-            "apt-get -qq update && apt-get -qq install -y clang libclang-dev time",
+            "apt-get -qq update && apt-get -qq install -y clang libclang-dev time libffi-dev",
             check=False,
         )
     if not shutil.which("clang"):
