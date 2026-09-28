@@ -36,13 +36,13 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
-## [0.0.4] — 2026-09-13
+## [0.0.4] — 2026-09-28
 
 Exact speed-ups for the GPU pass, a work-unit scheduler for multi-GPU runs, and a
 new way to run one reference against many queries. Every arm of every measurement
 below produced byte-identical output to 0.0.3 at the same plan and cap, on every
-device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA); the score-gate diet and
-`run --index` without `-r` ran on the L4, RTX 4090 and ZLUDA, not yet on a T4.
+device tested (NVIDIA L4, RTX 4090, Tesla T4, AMD via ZLUDA); `run --index` without
+`-r` ran on the L4, RTX 4090 and ZLUDA, not yet on a T4.
 
 - **One reference, many queries: `--query-list`.** `hspZ run --reference ref.fa --query-list queries.txt
   --output OUT` runs every listed query FASTA in one process: each reference bin is built and uploaded

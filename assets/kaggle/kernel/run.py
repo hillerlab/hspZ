@@ -460,6 +460,51 @@ def seed_mechanism(text):
     return device, async_upload, int(field(text, "seed uploads:") or 0)
 
 
+def lifecycle(text, gpus):
+    """Stage 8: one reference build, engine and upload per bin visit, never R x Q.
+
+    Whole-bin scheduling visits each of the R bins once. With several GPUs the unit
+    partition may split bins across workers: it cuts the leftover bins into W
+    consecutive pieces, which adds at most W-1 visits, so visits run from R to
+    R + W - 1, and W is at most the `--gpus` the arm asked for. Returns
+    (R, Q, units, "ok" or the VOID reason).
+    """
+    R = Q = units = builds = engines = ref_uploads = swaps = 0
+    lc = [s for s in text.splitlines() if "lifecycle:" in s]
+    if lc:
+        f = lc[-1].split()
+        R, units, builds, engines, ref_uploads, swaps = (
+            int(f[1]),
+            int(f[4]),
+            int(f[7]),
+            int(f[9]),
+            int(f[11]),
+            int(f[14]),
+        )
+        Q = units // R if R else 0
+    # `schedule: policy=unit-partition W=2 visits=8 extra_replicas=1 (reason)`; a
+    # run without the line is one worker visiting each bin once.
+    sched = [s for s in text.splitlines() if s.startswith("schedule: policy=")]
+    head = sched[-1].split(" (", 1)[0].split()[1:] if sched else []
+    kv = dict(t.split("=", 1) for t in head if "=" in t)
+    W, visits = int(kv.get("W", 1)), int(kv.get("visits", R))
+    ok = (
+        1 <= W <= gpus
+        and builds == engines == ref_uploads == visits
+        and R <= visits <= R + W - 1
+        and swaps == units
+    )
+    mech = (
+        "ok"
+        if ok
+        else (
+            f"VOID R={R} W={W} gpus={gpus} visits={visits} builds={builds} "
+            f"engines={engines} uploads={ref_uploads} swaps={swaps} units={units}"
+        )
+    )
+    return R, Q, units, mech
+
+
 def arm(
     hspZ, ref, qry, label, gpus, extra=(), env=None, block=None, variant="baseline"
 ):
@@ -514,27 +559,7 @@ def arm(
         else ""
     )
 
-    lc = [l for l in p.stderr.splitlines() if "lifecycle:" in l]
-    R = Q = units = builds = engines = ref_uploads = swaps = 0
-    if lc:
-        f = lc[-1].split()
-        R, units, builds, engines, ref_uploads, swaps = (
-            int(f[1]),
-            int(f[4]),
-            int(f[7]),
-            int(f[9]),
-            int(f[11]),
-            int(f[14]),
-        )
-        Q = units // R if R else 0
-    # Stage 8: reference-side work must equal R, never R x Q, on both arms.
-    mech = (
-        "ok"
-        if (builds == engines == ref_uploads == R and swaps == units)
-        else (
-            f"VOID R={R} builds={builds} engines={engines} uploads={ref_uploads} swaps={swaps} units={units}"
-        )
-    )
+    R, Q, units, mech = lifecycle(p.stderr, gpus)
 
     dig_dir = d
     if tar.exists():
