@@ -4,7 +4,7 @@ import AlgorithmJourney from "../../../components/AlgorithmJourney.astro"
 import journey from "../../../journeys/execution.md?raw"
 ---
 
-<DocsLayout title="H. Parallel execution" description="Own reference bins end to end, overlap order-neutral preparation, and replay arbitrary GPU completions deterministically." wide>
+<DocsLayout title="H. Parallel execution" description="Split work units or whole reference bins across workers, overlap order-neutral preparation, and replay arbitrary GPU completions deterministically." wide>
   <p>Parallelism changes who runs a WorkUnit and when it finishes. It does not change the plan, within-unit hit stream, or the ordinal order observed by the emitter.</p>
   <AlgorithmJourney markdown={journey} />
 </DocsLayout>

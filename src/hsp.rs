@@ -26,8 +26,9 @@ use std::cmp::Ordering;
 /// write and, worth more, in `find_hsps`' HSP store.
 ///
 /// Measured on an NVIDIA L4: `find_hsps` -4.25% (A) / -2.49% (B), whole run
-/// -3.3% / -3.2% drift-corrected. Under ZLUDA the same change was flat, so this
-/// is free there and a real win on native NVIDIA.
+/// -3.3% / -3.2% drift-corrected, non-overlapping in 4/4 paired rounds and
+/// winning in both run orders. Under ZLUDA the same change was flat, so this is
+/// free there and a real win on native NVIDIA (round 13).
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, cuda_core::DeviceCopy)]
 pub struct SegmentPair {
@@ -171,7 +172,7 @@ impl Groups {
 
 /// One printed `.segments` record, still numeric.
 ///
-/// This is the unit `-D` partitions: partition structs, never text.
+/// This is the unit `-D` partitions (partition structs, never text).
 /// Coordinates are exactly what gets printed — 1-based, chromosome-relative,
 /// inclusive at both ends — because the oracle's partitioner reads them off the
 /// printed file and its diagonal keys are defined on those values.
@@ -216,21 +217,24 @@ pub fn records(hsps: &[SegmentPair], r_chrs: &[Chr], q_chrs: &[Chr], strand: cha
     } else {
         Box::new(hsps.iter())
     };
-    ordered
-        .map(|e| {
-            let ri = chr_at(r_chrs, e.ref_start as usize);
-            let qi = chr_at(q_chrs, e.query_start as usize);
-            Record {
-                r_chr: ri as u32,
-                q_chr: qi as u32,
-                r_start: e.ref_start as usize + 1 - r_chrs[ri].start,
-                r_end: e.ref_start as usize + e.len as usize + 1 - r_chrs[ri].start,
-                q_start: e.query_start as usize + 1 - q_chrs[qi].start,
-                q_end: e.query_start as usize + e.len as usize + 1 - q_chrs[qi].start,
-                score: e.score,
-            }
-        })
-        .collect()
+    ordered.map(|e| record(e, r_chrs, q_chrs)).collect()
+}
+
+/// Maps one block-relative HSP through the same chromosome tables used by the
+/// production writer. Diagnostics call this instead of duplicating coordinate
+/// arithmetic that output hashes cannot validate.
+pub fn record(e: &SegmentPair, r_chrs: &[Chr], q_chrs: &[Chr]) -> Record {
+    let ri = chr_at(r_chrs, e.ref_start as usize);
+    let qi = chr_at(q_chrs, e.query_start as usize);
+    Record {
+        r_chr: ri as u32,
+        q_chr: qi as u32,
+        r_start: e.ref_start as usize + 1 - r_chrs[ri].start,
+        r_end: e.ref_start as usize + e.len as usize + 1 - r_chrs[ri].start,
+        q_start: e.query_start as usize + 1 - q_chrs[qi].start,
+        q_end: e.query_start as usize + e.len as usize + 1 - q_chrs[qi].start,
+        score: e.score,
+    }
 }
 
 /// Renders records back to `.segments` text.

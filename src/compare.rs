@@ -29,8 +29,9 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
 
     eprintln!("running Rust implementation ...");
     let run_args = RunArgs {
-        reference: args.reference.clone(),
-        query: args.query.clone(),
+        reference: Some(args.reference.clone()),
+        query: Some(args.query.clone()),
+        query_list: None,
         output: rust_dir.clone(),
         strand: "both".into(),
         seed: args.tuning.seed.clone(),
@@ -57,6 +58,8 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
         no_ref_prefetch: false,
         kegalign_bins: false,
         dump_plan: None,
+        dump_manifest: None,
+        from_manifest: None,
         gpus: 1,
         no_async_stages: false,
         no_async_seed_copy: false,
@@ -64,11 +67,12 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
         hit_stats: false,
         cpu_only: false,
         dump_raw: None,
-        // `compare` is oracle parity only. The oracle writes a directory of
-        // unsplit FASTA-derived segments, so -D/-Z are not offered here; their
-        // correctness is self-parity, checked in `run`.
+        // `compare` is oracle parity only. The oracle writes a
+        // directory of unsplit FASTA-derived segments, so -D/-Z are not offered
+        // here; their correctness is self-parity, checked in `run`.
         diagonal_partition: false,
         tarball: None,
+        index: None,
     };
     let start = Instant::now();
     let rust_stats = run(&run_args, 0.0, Instant::now())?;

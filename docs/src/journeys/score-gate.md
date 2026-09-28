@@ -4,6 +4,10 @@
 <!-- @source: src/gpu/kernels.rs::count_survivors -->
 <!-- @source: src/gpu/kernels.rs::emit_survivors -->
 <!-- @source: src/gpu/mod.rs::seed_and_filter -->
+<!-- @source: src/gpu/mod.rs::keep_threshold -->
+<!-- @source: src/gpu/kernels.rs::bucket_scatter -->
+<!-- @source: src/gpu/kernels.rs::mark_score_survivors_reordered -->
+<!-- @source: src/gpu/kernels.rs::sort_survivors -->
 
 ## D.1 — Feed coalesced anchor chunks to a warp
 <!-- @id: d-coalesced-anchors -->
@@ -25,27 +29,29 @@ sequenceDiagram
 
 ## D.2 — Compute a score-only X-drop bound
 <!-- @id: d-score-only -->
-WHAT GOES IN: One anchor, encoded sequences, substitution matrix, and X-drop.
-WHAT HAPPENS: Lanes score right and left prefixes, stop on the first X-drop or edge, and retain only the best total score.
-WHAT COMES OUT: An upper score for the anchored ungapped segment.
-INVARIANT: The threshold value rounds through KegAlign's `f32` conversion before comparison.
+WHAT GOES IN: One anchor, encoded sequences, substitution matrix, X-drop, and the keep threshold the host precomputed from K.
+WHAT HAPPENS: Lanes score right and left prefixes four bases per lane and stop on the first X-drop or edge: one ballot marks the lanes with any drop, and each side reads the maximum before its first drop from its first dropping lane (from its last lane when nothing drops). Only the best total score is kept.
+WHAT COMES OUT: An upper score for the anchored ungapped segment and its keep decision.
+INVARIANT: The host computes once per engine the least total KegAlign's `f32`-rounded comparison keeps, so one integer comparison on the device decides exactly as that comparison does and the output is byte-identical.
 
 ```mermaid
 sequenceDiagram
+    participant H as Host
     participant A as Anchor
     participant R as Right prefix
     participant L as Left prefix
     participant G as Threshold gate
+    H->>G: keep threshold, once per engine
     A->>R: score until X-drop or edge
     A->>L: score until X-drop or edge
-    R-->>G: right maximum
-    L-->>G: left maximum
-    G->>G: KegAlign float comparison
+    R-->>G: maximum before the first drop
+    L-->>G: maximum before the first drop
+    G->>G: integer total vs keep threshold
 ```
 
 ## D.3 — Write one byte per decision
 <!-- @id: d-flags -->
-WHAT GOES IN: The score-only total and hsp threshold K.
+WHAT GOES IN: The score-only total and the keep threshold for hsp threshold K.
 WHAT HAPPENS: The common reject path writes zero; plausible anchors write a one-byte survivor flag.
 WHAT COMES OUT: A dense flag vector aligned with the original anchor array.
 INVARIANT: Rejection creates no HSP record, while every active flag slot is overwritten before reuse.
@@ -56,9 +62,9 @@ sequenceDiagram
     participant F as Byte flags
     participant R as Reject path
     participant K as Keep path
-    G->>R: rounded score below K
+    G->>R: total below the keep threshold
     R-->>F: 0
-    G->>K: rounded score at least K
+    G->>K: total at least the keep threshold
     K-->>F: 1
 ```
 
@@ -80,4 +86,23 @@ sequenceDiagram
     C-->>H: one count per block
     H-->>E: exclusive block offsets
     E-->>S: original IDs in order
+```
+
+## D.5 — Optionally gate anchors by reference window
+<!-- @id: d-ref-buckets -->
+WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`, default `auto`).
+WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, each a window that fits three quarters of the L2, so consecutive warps gather from one cached window; the gate then writes one keep bit per anchor.
+WHAT COMES OUT: Survivor IDs mapped back through each anchor's raw index and sorted into ascending raw hit order.
+INVARIANT: The materializer sees the same survivors in the same order as without bucketing, so the HSP set and file bytes are unchanged.
+
+```mermaid
+sequenceDiagram
+    participant A as Packed anchors
+    participant B as Bucket sort
+    participant G as Score gate
+    participant S as Survivor IDs
+    A->>B: reference address bucket
+    B->>G: bucket-major anchors + raw index
+    G-->>S: keep bits mapped to raw IDs
+    S->>S: sort back to raw hit order
 ```

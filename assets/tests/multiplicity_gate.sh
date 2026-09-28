@@ -5,23 +5,26 @@
 #
 #   DUPLICATES-ONLY  distinct anchors identical; the extra lines are exact
 #                    duplicates of anchors both sides keep (`max_hits` chunking)
-#   CONTAINED-EXTRA  one side keeps a segment the other absorbed into the segment
-#                    containing it on the same diagonal — scope-sensitive
-#                    `contained()` removal, a real alignment, not a duplicate
+#   CONTAINED-EXTRA  containment *equivalence*, not directional coverage:
+#                    an extra segment is accepted if it contains, *or is
+#                    contained by*, a kept segment on the same diagonal in the
+#                    *other* arm. A shorter candidate inside a longer baseline
+#                    therefore returns CONTAINED-EXTRA. Fixed-plan kernel,
+#                    batching and sharding changes must use EXACT, not this.
 #
 # Anything else is FAIL: a lost anchor, or an extra that is neither. Comparing
 # distinct *counts* would pass a run that dropped one anchor and gained another,
 # so the sets are compared as sets and every differing line is classified.
 #
-# Usage: assets/tests/multiplicity_gate.sh <label> <A dir|file> <B dir|file>
-#        assets/tests/multiplicity_gate.sh --self-test
+# Usage: tests/multiplicity_gate.sh <label> <A dir|file> <B dir|file>
+#        tests/multiplicity_gate.sh --self-test
 # Exit 0: EXACT, DUPLICATES-ONLY or CONTAINED-EXTRA.  Exit 1: FAIL.
 set -uo pipefail
 export LC_ALL=C
 
 gate() {  # label A B
     local label=$1 a=$2 b=$3
-    local t; t=$(mktemp -d "${TMPDIR:-/tmp}/hspZ-gate-XXXXXX")
+    local t; t=$(mktemp -d "${TMPDIR:-/tmp}/hspz-gate-XXXXXX")
     # shellcheck disable=SC2064
     trap "rm -rf '$t'" RETURN
 
@@ -127,7 +130,7 @@ PY
 }
 
 self_test() {
-    local t; t=$(mktemp -d "${TMPDIR:-/tmp}/hspZ-gate-self-XXXXXX")
+    local t; t=$(mktemp -d "${TMPDIR:-/tmp}/hspz-gate-self-XXXXXX")
     local rc=0 out
     mk() { mkdir -p "$t/$1"; printf '%b' "$2" > "$t/$1/x.segments"; }
     expect() {  # want_verdict want_exit label A B

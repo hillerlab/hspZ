@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 pub trait OutputSink {
     /// Emits one logical output file. `name` is the bare file name.
     fn write_entry(&mut self, name: &str, bytes: &[u8]) -> Fallible<()>;
-    /// Flushes and closes. Must be called; `-Z` needs the tar trailer.
-    fn finish(self: Box<Self>) -> Fallible<()>;
+    /// Flushes and closes, returning the bytes that landed on disk — which
+    /// differs from `bytes_in` once compression is involved, and is only final
+    /// here: a `.tar.gz` holds its last gzip block and both trailers until the
+    /// sink finishes. Must be called; `-Z` needs the tar trailer.
+    fn finish(self: Box<Self>) -> Fallible<u64>;
     /// Total bytes handed to the sink, for the output report.
     fn bytes_in(&self) -> u64;
-    /// Bytes actually landed on disk, which differs from `bytes_in` once
-    /// compression is involved.
-    fn bytes_out(&self) -> Fallible<u64>;
 }
 
 pub struct DirectorySink {
@@ -54,16 +54,12 @@ impl OutputSink for DirectorySink {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Fallible<()> {
-        Ok(())
+    fn finish(self: Box<Self>) -> Fallible<u64> {
+        Ok(self.bytes)
     }
 
     fn bytes_in(&self) -> u64 {
         self.bytes
-    }
-
-    fn bytes_out(&self) -> Fallible<u64> {
-        Ok(self.bytes)
     }
 }
 
@@ -74,8 +70,8 @@ pub struct TarGzSink {
 }
 
 impl TarGzSink {
-    /// Default compression, not maximum — this is an output sink, not an
-    /// archival tool.
+    /// Default compression, not maximum — this is an output sink,
+    /// not an archival tool.
     pub fn new(path: &Path) -> Fallible<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -103,18 +99,15 @@ impl OutputSink for TarGzSink {
         Ok(())
     }
 
-    fn finish(self: Box<Self>) -> Fallible<()> {
+    fn finish(self: Box<Self>) -> Fallible<u64> {
+        let TarGzSink { tar, path, .. } = *self;
         // `into_inner` writes the tar trailer, then the gzip trailer.
-        self.tar.into_inner()?.finish()?.flush()?;
-        Ok(())
+        tar.into_inner()?.finish()?.flush()?;
+        Ok(std::fs::metadata(&path)?.len())
     }
 
     fn bytes_in(&self) -> u64 {
         self.bytes
-    }
-
-    fn bytes_out(&self) -> Fallible<u64> {
-        Ok(std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0))
     }
 }
 
@@ -122,8 +115,8 @@ impl OutputSink for TarGzSink {
 mod tests {
     use super::*;
 
-    /// After extraction, `-Z` output must be byte-identical to the directory
-    /// output, and two archives of the same input must be identical.
+    /// After extraction, `-Z` output must be byte-identical to the
+    /// directory output, and two archives of the same input must be identical.
     #[test]
     fn tar_round_trip_matches_directory_and_is_reproducible() {
         use std::io::Read;
@@ -146,7 +139,8 @@ mod tests {
         for (n, b) in &files {
             ds.write_entry(n, b).unwrap();
         }
-        Box::new(ds).finish().unwrap();
+        let formatted: u64 = files.iter().map(|(_, b)| b.len() as u64).sum();
+        assert_eq!(Box::new(ds).finish().unwrap(), formatted);
 
         // Tar output, twice, for reproducibility.
         let mut archives = Vec::new();
@@ -156,7 +150,10 @@ mod tests {
             for (n, b) in &files {
                 ts.write_entry(n, b).unwrap();
             }
-            Box::new(ts).finish().unwrap();
+            // The size is read after the trailers are written, so it is the
+            // archive's final length, not whatever the buffers had flushed.
+            let landed = Box::new(ts).finish().unwrap();
+            assert_eq!(landed, std::fs::metadata(&path).unwrap().len());
             archives.push(path);
         }
         assert_eq!(

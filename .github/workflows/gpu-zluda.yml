@@ -4,6 +4,9 @@
 # which no hosted runner has. It is therefore the only workflow that answers "are the HSPs still
 # identical to the C++ reference", and it is free and unlimited.
 #
+# Machine paths (CUDA toolkit root, ZLUDA, shim, oracle, test data) are not in this file either:
+# they live in the self-hosted runner host's per-user test.env and are read by the first step.
+#
 # SECURITY, non-negotiable. A self-hosted runner that executes pull-request code from a fork is
 # arbitrary code execution on the workstation. The job-level `if` below is the control -- not the
 # repository's "require approval" setting, because an approved fork PR would still run here.
@@ -37,22 +40,53 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, linux, x64, zluda]
     timeout-minutes: 120
-    env:
-      CUDACONDA: /home/alejandro/opt/cudaconda
-      ZLUDA: /home/alejandro/opt/zluda
-      HIPFIX: /home/alejandro/opt/zluda-guide/hipfix.so
-      KEGALIGN: /tmp/kegalign/build/kegalign
-      TESTDATA: /tmp/kegalign/test-data
-      # Outside the workspace on purpose: actions/checkout runs `git clean -ffdx`, which would
-      # throw away the incremental build on every run.
-      CARGO_TARGET_DIR: /home/alejandro/.cache/hspZ-ci-target
     steps:
       - uses: actions/checkout@v4
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # Machine paths are not in the tree: they live in this runner host's per-user file
+      # (plain KEY=value lines, never committed), read before anything else needs them.
+      # CARGO_TARGET_DIR also stays outside the workspace on purpose: actions/checkout runs
+      # `git clean -ffdx`, which would throw away the incremental build on every run.
+      - name: machine environment (runner host file, not the tree)
+        run: |
+          f=${HSPZ_TEST_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/hspz/test.env}
+          if [ ! -f "$f" ]; then
+            echo "::error::missing machine path file $f (CUDA_HOME, ZLUDA, HIPFIX, KEGALIGN, TESTDATA)"
+            exit 1
+          fi
+          set -a; . "$f"; set +a
+          for v in CUDA_HOME ZLUDA KEGALIGN TESTDATA; do
+            if ! eval "[ -n \"\${$v:-}\" ]"; then
+              echo "::error::$v not set in $f"
+              exit 1
+            fi
+            eval "printf '%s=%s\n' '$v' \"\${$v}\"" >> "$GITHUB_ENV"
+          done
+          if [ -n "${HIPFIX:-}" ]; then
+            printf 'HIPFIX=%s\n' "$HIPFIX" >> "$GITHUB_ENV"
+          fi
+          echo "CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/.cache/hspZ-ci-target}" >> "$GITHUB_ENV"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      # The codegen backend must come from the cuda-oxide revision pinned in Cargo.lock: when
+      # the runner's backend cache is missing or invalidated, cargo-oxide would otherwise clone
+      # upstream HEAD, which tracks newer nightlies (see assets/container/Dockerfile).
+      - name: pin the cuda-oxide backend source
+        run: |
+          pin=$(grep -m1 -o 'cuda-oxide\.git#[0-9a-f]\{40\}' Cargo.lock | cut -d'#' -f2)
+          test -n "$pin"
+          src="${CARGO_HOME:-$HOME/.cargo}/cuda-oxide/src"
+          if [ "$(git -C "$src" rev-parse HEAD 2>/dev/null)" != "$pin" ]; then
+            git init -q "$src"
+            git -C "$src" fetch -q --depth 1 https://github.com/NVlabs/cuda-oxide.git "$pin"
+            git -C "$src" checkout -q --detach FETCH_HEAD
+            rm -f "$(dirname "$src")/librustc_codegen_cuda.so"
+          fi
+          test "$(git -C "$src" rev-parse HEAD)" = "$pin"
 
       - name: build
         run: |
-          export CUDA_HOME="$CUDACONDA" LD_LIBRARY_PATH="$ZLUDA:$CUDACONDA/lib"
+          export LD_LIBRARY_PATH="$ZLUDA:$CUDA_HOME/lib"
           cargo oxide build -- --release --locked
           strings -n 6 "$CARGO_TARGET_DIR/release/hspZ" | grep -qx '.target sm_80' \
             || { echo "::error::expected sm_80 PTX -- is .cargo/cuda-oxide.toml present?"; exit 1; }

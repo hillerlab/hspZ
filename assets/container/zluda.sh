@@ -37,7 +37,7 @@ fi
 # by whatever is exec'd, so the task shell gets ZLUDA's libcuda.so.1 too.
 case "${1:-}" in
     hspZ)                      shift; exec hspZ "$@" ;;
-    run|benchmark|compare|--help|--version|-h|-V)
+    run|index|benchmark|compare|hits-estimate|--help|--version|-h|-V)
                                exec hspZ "$@" ;;
     *)                         exec "$@" ;;
 esac

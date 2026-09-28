@@ -197,10 +197,13 @@ def build():
     # library, which has no resource directory, so bindgen resolves `#include
     # <stddef.h>` against nothing and dies on /usr/include/stdlib.h. Internet is
     # enabled, so install clang and take both paths from it.
-    if not shutil.which("clang") or not shutil.which("time"):
+    # The cuda-oxide codegen backend at the Cargo.lock pin links -lffi, which needs the
+    # unversioned libffi.so from libffi-dev.
+    need_ffi = not out("ldconfig -p | grep -E 'libffi\\.so \\('")
+    if not shutil.which("clang") or not shutil.which("time") or need_ffi:
         # `time` is not in the Kaggle image either, and the arms report max RSS.
         sh(
-            "apt-get -qq update && apt-get -qq install -y clang libclang-dev time",
+            "apt-get -qq update && apt-get -qq install -y clang libclang-dev time libffi-dev",
             check=False,
         )
     if not shutil.which("clang"):
@@ -263,10 +266,30 @@ def build():
     # a cargo invocation from anywhere else fails with "could not choose a version of
     # cargo to run" — which is exactly how the first attempt died.
     sh(f"cd {SRC} && rustup show active-toolchain")
+    # cargo-oxide and its codegen backend come from the cuda-oxide SHA pinned in Cargo.lock,
+    # never upstream HEAD: HEAD tracks newer nightlies than rust-toolchain.toml. The backend
+    # source is seeded at the pin because cargo-oxide's first build would otherwise clone it
+    # unpinned into $CARGO_HOME/cuda-oxide/src.
+    pin = out(f"grep -m1 -o 'cuda-oxide\\.git#[0-9a-f]\\{{40\\}}' {SRC}/Cargo.lock | cut -d'#' -f2")
+    if len(pin) != 40:
+        raise RuntimeError("no cuda-oxide pin found in Cargo.lock")
     if not shutil.which("cargo-oxide"):
         sh(
-            f"cd {SRC} && cargo install --quiet --git https://github.com/NVlabs/cuda-oxide.git cargo-oxide"
+            f"cd {SRC} && cargo install --quiet --git https://github.com/NVlabs/cuda-oxide.git "
+            f"--rev {pin} --locked cargo-oxide"
         )
+    cargo_home = pathlib.Path(os.environ.get("CARGO_HOME", str(pathlib.Path.home() / ".cargo")))
+    backend_src = cargo_home / "cuda-oxide" / "src"
+    if out(f"git -C {backend_src} rev-parse HEAD") != pin:
+        # Absent, or left at another revision (e.g. an earlier unpinned clone): check out the pin
+        # and drop any backend built from the old source so cargo-oxide rebuilds it.
+        sh(
+            f"git init -q {backend_src} && git -C {backend_src} fetch -q --depth 1 "
+            f"https://github.com/NVlabs/cuda-oxide.git {pin} && git -C {backend_src} checkout -q --detach FETCH_HEAD"
+        )
+        (backend_src.parent / "librustc_codegen_cuda.so").unlink(missing_ok=True)
+    if out(f"git -C {backend_src} rev-parse HEAD") != pin:
+        raise RuntimeError(f"cuda-oxide backend source at {backend_src} is not at the Cargo.lock pin {pin}")
     # One binary. Both stages here exercise the shipped default build; the seeding path is
     # chosen at runtime on the worker count, so a feature-gated second build would be
     # byte-identical anyway.

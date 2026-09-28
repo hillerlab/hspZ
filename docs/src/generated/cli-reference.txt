@@ -5,10 +5,12 @@ GPU-accelerated high-scoring ungapped alignment pair backend
 Usage: hspZ <COMMAND>
 
 Commands:
-  run        Seed, extend and filter one reference/query pair
-  benchmark  Cold/warm benchmark: timed runs against wall clock
-  compare    Run the C++ CUDA reference and this implementation back to back and compare runtime and HSP output
-  help       Print this message or the help of the given subcommand(s)
+  run            Seed, extend and filter one reference/query pair
+  index          Write one reference's per-bin seed tables to an on-disk index
+  benchmark      Cold/warm benchmark: timed runs against wall clock
+  compare        Run the C++ CUDA reference and this implementation back to back and compare runtime and HSP output
+  hits-estimate  Exact per-unit seed-hit estimates before any GPU work (CPU-only)
+  help           Print this message or the help of the given subcommand(s)
 
 Options:
   -h, --help     Print help
@@ -20,13 +22,15 @@ $ hspZ run --help
 
 Seed, extend and filter one reference/query pair
 
-Usage: hspZ run [OPTIONS] --reference <REFERENCE> --query <QUERY>
+Usage: hspZ run [OPTIONS]
 
 Options:
   -r, --reference <REFERENCE>
-          
+          Reference FASTA. Optional with `--index`: the index then supplies the records, and a FASTA given here is verified against the index in the background; no output is written until it matches
   -q, --query <QUERY>
           
+      --query-list <QUERY_LIST>
+          One query FASTA path per line (blank lines and `#` comments ignored). Batch: one reference × many queries, spread over `--gpus` workers by the same unit partition as single queries (a slot position never becomes a query-bin id). All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -52,15 +56,15 @@ Options:
   -Q, --query-prefix <QUERY_PREFIX>
           [default: ""]
   -C, --wga-chunk-size <WGA_CHUNK_SIZE>
-          [default: 250000]
+          Query positions per seed batch; must be positive [default: 250000]
   -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
-          [default: 10000000]
+          LASTZ interval size on the query; must be positive [default: 10000000]
   -B, --seq-block-size <SEQ_BLOCK_SIZE>
-          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall, about `total_reference_bp / W` (one ref bin per worker) is faster and a *different* HSP set. Never overwritten from `--gpus`. See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
+          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest, and it stays the multi-GPU default: with `--gpus W` the unit partition spreads its work units over the workers, while coarser layouts (down to one bin per worker) measured 17-22% slower on a 2-GPU test host. Any other target is a *different* HSP set. Never overwritten from `--gpus`; `-B 0` runs a printed automatic layout (opt-in, for per-machine measurement). See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
       --query-block-size <QUERY_BLOCK_SIZE>
           Bin target for the *query* side; defaults to `--seq-block-size`. Splitting the reference is what balances workers — splitting the query only multiplies work units (`R × Q`), and each unit costs a query swap and its own `MAX_HITS` chunk boundary on every worker. Raise this above `-B` to pick a reference layout without paying for a query one. Changes the plan, so it changes the HSP set: keep a digest per layout
   -m, --max-hits <MAX_HITS>
-          Hits per GPU chunk; 0 derives KegAlign's `4194304 * GiB` default [default: 0]
+          Semantic hits per GPU chunk (target H); 0 derives KegAlign's `4194304 * GiB` default. Physical capacity C>=H is derived from free VRAM and only affects success/failure, never successful output bytes [default: 0]
   -t, --threads <THREADS>
           Worker threads for seed generation; 0 uses available parallelism [default: 0]
   -b, --hsp-blocks <HSP_BLOCKS>
@@ -73,14 +77,20 @@ Options:
           Bin records the way KegAlign does — sequential fill in input order, closing a block once it exceeds `--seq-block-size` — instead of the balanced planner. For matched-granularity benchmarking only: it makes block membership, and so the dedup scope, identical on both sides. The planner will not shrink the block size to fit the GPU in this mode; it errors instead, because shrinking would unmatch the granularity
       --dump-plan <DUMP_PLAN>
           Write the plan's bin membership to this file and continue: one `side<TAB>bin<TAB>record_name<TAB>bp` line per record. Matched-granularity benchmarking compares it against KegAlign's `{ref,query}_block*.name`, which is the only way to *show* both tools binned the input the same way
+      --dump-manifest <DUMP_MANIFEST>
+          Write a frozen executable plan (GPU `run` only, same binary required for replay). A second node given `--from-manifest` will *validate fit and fail*, not replan
+      --from-manifest <FROM_MANIFEST>
+          Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one [default: 1]
+          GPUs to run on. With one worker per device and every device the same class (SM count, L2, clocks within 10%), the plan's work units are split across workers by count quotas; otherwise each worker owns whole reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces either). Output follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same policy over `(job, unit)` slots [default: 1]
       --no-async-stages
-          Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral, but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges
+          Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy
           Upload each batch's seeds with a blocking copy at the point of use. The default uploads on a second stream one batch ahead, so the DMA overlaps the previous batch's kernels: exposed `H->D seeds` 5,734 -> 72 ms on an L4. The overlap needs pinned staging and the persistent seed buffers, and turns itself off when either is missing (ZLUDA has no `cuMemHostAlloc`, and an async copy from pageable memory blocks anyway)
       --no-ref-prefetch
           Build each reference bin only when its turn comes. The default builds the next bin's pack + seed table on a worker thread while the current bin's work units run on the GPU; that build is the largest host cost the GPU cannot otherwise hide (7.1% of an L4 multi5 run)
+      --index <INDEX>
+          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The index MANIFEST supplies the reference records for planning, so `-r` is optional; a reference given with `-r` is verified against the index in the background before any output is written. The planned reference bins must equal the index's, or it errors naming the mismatch
   -y, --time
           Report the full wall-time accounting
   -d, --hit-stats
@@ -92,7 +102,35 @@ Options:
   -D, --diagonal-partition
           Split each output file along its diagonal, KegAlign-style, emitting `*.split1.segments` onward instead of one file. Partitions the HSP structs directly — no unsplit file is written first
   -Z, --tarball [<TARBALL>]
-          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes
+          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes. In batch mode (`--query-list`) one archive per job is written (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is printed)
+  -h, --help
+          Print help
+
+------------------------------------------------------------------------------
+
+$ hspZ index --help
+
+Write one reference's per-bin seed tables to an on-disk index
+
+Usage: hspZ index [OPTIONS] --reference <REFERENCE> --index <INDEX>
+
+Options:
+  -r, --reference <REFERENCE>
+          Reference FASTA (or FASTA.gz / 2bit) to index
+      --index <INDEX>
+          Directory to write the index into. Required; must not exist yet (no --force: delete it or pick another path)
+  -s, --seed <SEED>
+          12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts [default: 12of19]
+  -e, --step <STEP>
+          [default: 1]
+  -B, --seq-block-size <SEQ_BLOCK_SIZE>
+          Target bin size in bases, as in `run` (`-B 0` rejected: the automatic layout is device-dependent and cannot be frozen into an index) [default: 500000000]
+      --kegalign-bins
+          Bin records the way KegAlign does — sequential fill in input order — instead of the balanced planner. Must match the `run` side
+  -t, --threads <THREADS>
+          Worker threads for seed generation; 0 uses available parallelism [default: 0]
+  -y, --time
+          Report per-bin build/write timings and payload sizes
   -h, --help
           Print help
 
@@ -102,13 +140,15 @@ $ hspZ benchmark --help
 
 Cold/warm benchmark: timed runs against wall clock
 
-Usage: hspZ benchmark [OPTIONS] --reference <REFERENCE> --query <QUERY>
+Usage: hspZ benchmark [OPTIONS] --reference <REFERENCE>
 
 Options:
   -r, --reference <REFERENCE>
           
   -q, --query <QUERY>
           
+      --query-list <QUERY_LIST>
+          One query FASTA path per line (blank lines and `#` comments ignored). Batch: one reference × many queries, spread over `--gpus` workers by the same unit partition as single queries (a slot position never becomes a query-bin id). All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
@@ -134,15 +174,15 @@ Options:
   -Q, --query-prefix <QUERY_PREFIX>
           [default: ""]
   -C, --wga-chunk-size <WGA_CHUNK_SIZE>
-          [default: 250000]
+          Query positions per seed batch; must be positive [default: 250000]
   -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
-          [default: 10000000]
+          LASTZ interval size on the query; must be positive [default: 10000000]
   -B, --seq-block-size <SEQ_BLOCK_SIZE>
-          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest. For `--gpus W` wall, about `total_reference_bp / W` (one ref bin per worker) is faster and a *different* HSP set. Never overwritten from `--gpus`. See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
+          Target bin size in bases (not a hard cut; chromosomes stay atomic). Default 500 Mbp is the KegAlign-matched digest, and it stays the multi-GPU default: with `--gpus W` the unit partition spreads its work units over the workers, while coarser layouts (down to one bin per worker) measured 17-22% slower on a 2-GPU test host. Any other target is a *different* HSP set. Never overwritten from `--gpus`; `-B 0` runs a printed automatic layout (opt-in, for per-machine measurement). See <https://hillerlab.github.io/hspZ/docs/gpus/> [default: 500000000]
       --query-block-size <QUERY_BLOCK_SIZE>
           Bin target for the *query* side; defaults to `--seq-block-size`. Splitting the reference is what balances workers — splitting the query only multiplies work units (`R × Q`), and each unit costs a query swap and its own `MAX_HITS` chunk boundary on every worker. Raise this above `-B` to pick a reference layout without paying for a query one. Changes the plan, so it changes the HSP set: keep a digest per layout
   -m, --max-hits <MAX_HITS>
-          Hits per GPU chunk; 0 derives KegAlign's `4194304 * GiB` default [default: 0]
+          Semantic hits per GPU chunk (target H); 0 derives KegAlign's `4194304 * GiB` default. Physical capacity C>=H is derived from free VRAM and only affects success/failure, never successful output bytes [default: 0]
   -t, --threads <THREADS>
           Worker threads for seed generation; 0 uses available parallelism [default: 0]
   -b, --hsp-blocks <HSP_BLOCKS>
@@ -155,14 +195,20 @@ Options:
           Bin records the way KegAlign does — sequential fill in input order, closing a block once it exceeds `--seq-block-size` — instead of the balanced planner. For matched-granularity benchmarking only: it makes block membership, and so the dedup scope, identical on both sides. The planner will not shrink the block size to fit the GPU in this mode; it errors instead, because shrinking would unmatch the granularity
       --dump-plan <DUMP_PLAN>
           Write the plan's bin membership to this file and continue: one `side<TAB>bin<TAB>record_name<TAB>bp` line per record. Matched-granularity benchmarking compares it against KegAlign's `{ref,query}_block*.name`, which is the only way to *show* both tools binned the input the same way
+      --dump-manifest <DUMP_MANIFEST>
+          Write a frozen executable plan (GPU `run` only, same binary required for replay). A second node given `--from-manifest` will *validate fit and fail*, not replan
+      --from-manifest <FROM_MANIFEST>
+          Replay a frozen plan from `--dump-manifest` (GPU `run` only). Requires the same binary, inputs, resolved scoring matrix, strand and record prefixes. The planner will not shrink bins or the hit cap
   -G, --gpus <GPUS>
-          GPUs to run on. Reference bins are split across that many workers by deterministic LPT, each owning its bins end to end; output still follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one [default: 1]
+          GPUs to run on. With one worker per device and every device the same class (SM count, L2, clocks within 10%), the plan's work units are split across workers by count quotas; otherwise each worker owns whole reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces either). Output follows `WorkUnit.ordinal`, so it does not depend on which GPU finished first. More workers than devices time-slices one GPU: a correctness configuration, not a performance one. Batch mode (`--query-list`) uses the same policy over `(job, unit)` slots [default: 1]
       --no-async-stages
-          Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral, but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges
+          Wait for the GPU after every stage instead of enqueueing the whole per-batch chain. The default enqueues and waits only where the host needs a device result; on its own that was neutral (round 29), but together with the overlapped seed upload it is worth -1.51% on an L4 with disjoint ranges over six paired rounds (round 30)
       --no-async-seed-copy
           Upload each batch's seeds with a blocking copy at the point of use. The default uploads on a second stream one batch ahead, so the DMA overlaps the previous batch's kernels: exposed `H->D seeds` 5,734 -> 72 ms on an L4. The overlap needs pinned staging and the persistent seed buffers, and turns itself off when either is missing (ZLUDA has no `cuMemHostAlloc`, and an async copy from pageable memory blocks anyway)
       --no-ref-prefetch
           Build each reference bin only when its turn comes. The default builds the next bin's pack + seed table on a worker thread while the current bin's work units run on the GPU; that build is the largest host cost the GPU cannot otherwise hide (7.1% of an L4 multi5 run)
+      --index <INDEX>
+          Load per-bin reference tables from an on-disk index written by `hspZ index` instead of rebuilding them. The run still parses the reference and plans as usual, then requires the planned reference bins to equal the index's, or it errors naming the mismatch
   -y, --time
           Report the full wall-time accounting
   -d, --hit-stats
@@ -174,7 +220,7 @@ Options:
   -D, --diagonal-partition
           Split each output file along its diagonal, KegAlign-style, emitting `*.split1.segments` onward instead of one file. Partitions the HSP structs directly — no unsplit file is written first
   -Z, --tarball [<TARBALL>]
-          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes
+          Write output into one `.tar.gz` instead of a directory. Without a path, `<output>.tar.gz` is used. Archived directly from the formatted bytes. In batch mode (`--query-list`) one archive per job is written (`OUT/000001.tar.gz` …) and a custom path value is ignored (a note is printed)
   -i, --iterations <ITERATIONS>
           Timed Seed + Filter iterations after the warmup [default: 20]
   -w, --warmup <WARMUP>
@@ -221,5 +267,45 @@ Options:
           [default: 3000]
   -c, --scoring <SCORING>
           
+  -h, --help
+          Print help
+
+------------------------------------------------------------------------------
+
+$ hspZ hits-estimate --help
+
+Exact per-unit seed-hit estimates before any GPU work (CPU-only)
+
+Usage: hspZ hits-estimate [OPTIONS] --reference <REFERENCE> --query <QUERY>
+
+Options:
+  -r, --reference <REFERENCE>
+          
+  -q, --query <QUERY>
+          
+  -B, --seq-block-size <SEQ_BLOCK_SIZE>
+          Target bin size in bases, as in `run` (`-B 0` resolves to the default) [default: 500000000]
+      --query-block-size <QUERY_BLOCK_SIZE>
+          Bin target for the query side; defaults to `--seq-block-size`
+      --kegalign-bins
+          Bin records the way KegAlign does (sequential fill, not LPT)
+      --seed <SEED>
+          12of19, 14of22, or an arbitrary pattern of 1s, 0s and Ts (k<=12) [default: 12of19]
+  -e, --step <STEP>
+          [default: 1]
+      --notransition
+          Don't allow one transition in a seed hit
+  -S, --strand <STRAND>
+          plus / minus / both [default: both]
+  -t, --threads <THREADS>
+          Worker threads for histogram passes; 0 uses available parallelism [default: 0]
+  -I, --lastz-interval-size <LASTZ_INTERVAL_SIZE>
+          LASTZ interval size, as in `run` (`-I`): interval boundaries decide which shared window starts the pipeline seeds once and which twice [default: 10000000]
+  -C, --wga-chunk-size <WGA_CHUNK_SIZE>
+          Query seed chunk size, as in `run` (`-C`): the interval schedule (`seed::chunks`) is part of the count, so this must match `run` [default: 250000]
+      --stride <STRIDE>
+          Count every S-th query window start and scale by S (approximation) [default: 1]
+      --dump-plan <DUMP_PLAN>
+          Write the plan's bin membership to this file and continue
   -h, --help
           Print help

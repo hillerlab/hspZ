@@ -9,8 +9,8 @@
 //!
 //! The script partitions an already-written `.segments` file: it reads the text
 //! back, parses coordinates, sorts, and rewrites the pieces. This does the same
-//! partitioning on the numeric [`Record`]s before anything is formatted
-//! so no unsplit file is ever created.
+//! partitioning on the numeric [`Record`]s before anything is formatted, so
+//! no unsplit file is ever created.
 //!
 //! Two deliberate differences from the script:
 //!
@@ -167,9 +167,6 @@ pub fn split(recs: Vec<Record>, strand: char, chunk: usize) -> Vec<Vec<Record>> 
         // Ascending by (count, pair), then greedy first-fit-by-order packing —
         // the script's `sorted([(len, pair)])` followed by its aggregation loop.
         skip.sort_by_key(|(k, v)| (v.len(), *k));
-        // the index is the partition number being filled
-        #[allow(clippy::needless_range_loop)]
-        // the tuple is the partition key; naming it would not make it clearer
         #[allow(clippy::type_complexity)]
         let mut bins: Vec<Vec<((u32, u32), Vec<Record>)>> = vec![Vec::new()];
         let mut current = 0usize;

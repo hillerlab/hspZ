@@ -1,17 +1,31 @@
 import DocsLayout from "../../layouts/DocsLayout.astro"
 
-<DocsLayout title="GPUs and seeding" description="Reference bins are distributed across workers; output is replayed in deterministic work-unit order.">
+<DocsLayout title="GPUs and seeding" description="Work units are split across workers; output is replayed in deterministic work-unit order.">
 
 ## Worker model
 
-`--gpus W` creates up to W workers and assigns complete reference bins by
-deterministic longest-processing-time scheduling. Every worker runs all query
-bins against the reference bins it owns. More workers than reference bins
-leave workers idle; more workers than devices time-slice a device and are a
-correctness configuration, not a speed configuration.
+`--gpus W` creates up to W workers, and never more workers than the plan has
+reference bins: a plan with a single reference bin runs on one worker whatever
+`--gpus` says. When each worker has its own device and every device the run uses
+is the same class (equal SM count and L2, nominal clocks within 10%), the frozen
+plan's work units are split across the workers by count quotas: whole reference
+bins first, then contiguous query slices of as few bins as possible, at the
+price of one extra reference build per split bin. Otherwise each worker owns
+complete reference bins, assigned by deterministic longest-processing-time
+scheduling, and runs every query bin against them. `HSPZ_UNIT_PARTITION=0|1`
+forces either policy (see the knobs below). More workers than devices time-slice
+a device and are a correctness configuration, not a speed configuration.
+
+Every GPU run prints `schedule:` lines with the chosen policy, the reason for it and
+each worker's visits, written `R<bin>[<first>..<end>)` for a reference bin and
+its slice of query bins. With `--time`, one `unit ledger:` row per work unit
+adds its worker, device, bins, GPU time, host start and end, seeds, hits and
+HSPs, followed by each worker's finish and busy times.
 
 GPU completion order never controls output order. Each result carries its
 `WorkUnit.ordinal`, and the emitter replays those ordinals in the planned order.
+A duplicate or out-of-plan work unit is an error, and once the workers have
+finished the emitter checks that every unit arrived.
 
 ## Seeder policy
 
@@ -27,24 +41,165 @@ HSPZ_DEVICE_SEEDS=0 hspZ run ...  # force CPU
 HSPZ_DEVICE_SEEDS=1 hspZ run ...  # force device
 ```
 
-## Choosing `-B`
+## Runtime tuning knobs (0.0.4)
 
-The default 500 Mbp preserves the KegAlign-matched one-GPU digest; hspZ never
-changes it merely because `--gpus` changed.
+Every knob is exact: every mode produces the same HSP set and the same bytes.
+An unrecognised value of `HSPZ_REF_BUCKETS`, `HSPZ_REF_BUCKET_SHIFT` or
+`HSPZ_UNIT_PARTITION` is an error; `HSPZ_CHUNK_WALK` and `HSPZ_DEVICE_SEEDS`
+ignore values they do not know.
 
-When a new digest is acceptable, start near the coarsest target that yields at
-least one reference bin per worker:
+| variable | default | what it does |
+| --- | --- | --- |
+| `HSPZ_REF_BUCKETS=auto\|1\|0` | `auto` | Reference-locality bucketing before the score gate. It wins where lower DRAM traffic lets a power-capped GPU raise its clock (L4: −6.5% whole-genome wall) and loses where the card already runs near its boost clock (RTX 4090: +3.7%). `auto` measures both paths per engine in blocks of ≥3 s, discards each block's first second, and after six blocks keeps bucketing only if it was at least 3% faster (median of the three off/on pairs) — about 20 s of gate time per engine. Shorter engines, for example 5 Mbp queries run as separate processes, stay on the off path, so set `HSPZ_REF_BUCKETS=1` on L4-class cards for those. `--time` prints the blocks and the decision. Cards whose L2 cannot hold the smallest window (T4) stay off. |
+| `HSPZ_REF_BUCKET_SHIFT=<16..31>` | derived from L2 | Pins the bucket window to 2^shift bytes and turns bucketing on (`HSPZ_REF_BUCKETS=0` still wins). A shift that would need more than 32 buckets for a reference bin is an error. |
+| `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array for every seed batch above `--max-hits` (rollback only). |
+| `HSPZ_UNIT_PARTITION=0\|1` | unset (auto) | Splits the frozen plan's work units across workers by count quotas when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. `0` forces whole-bin ownership and `1` forces the partition; any other value, including `auto`, is an error. −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. Other worker counts and device classes are unmeasured; compare with `HSPZ_UNIT_PARTITION=0`. |
 
-```text
---seq-block-size ≈ total reference bp / W
+## Many queries against one reference
+
+`--query-list` runs every listed query FASTA in one process:
+
+```bash
+hspZ run \
+  --reference ref.2bit \
+  --query-list queries.txt \
+  --output OUT \
+  --gpus 1
 ```
 
-On one measured 4× RTX 4090 host, two bins per worker (`≈ total / 2W`) was 3.2%
-faster than one bin per worker. Treat that as a per-machine refinement, not a
-new default. Finer bins multiply work units and can be much slower.
+`queries.txt` holds one query path per line (blank lines and `#` comments are
+ignored; relative paths are resolved against the directory of `queries.txt`).
+Each reference bin is built and uploaded once instead of once per query, while
+every query keeps its own plan, cap, seed batches, dedup scopes and `-D`
+history, so its output under `OUT/000001/`, `OUT/000002/`, … is byte-identical
+to a standalone run. `-Z` writes one archive per job (`OUT/000001.tar.gz`, …; a
+path given to `-Z` is ignored with a note), and `--dump-plan`, `--dump-manifest`
+and `--dump-raw` write one file per job with the job number appended
+(`plan.tsv.000001`, …). `OUT/queries.tsv` maps job → path, size, sha256, blocks,
+units, HSPs and completion. A failing job aborts the batch (partial outputs may
+remain). `--query-list` belongs to `run`; `benchmark` and `--cpu-only` reject
+it.
 
-Use `--query-block-size` to avoid splitting the query merely because the
-reference needs more bins. Any changed block geometry gets its own frozen
-digest.
+With `--gpus W` above one, the whole batch's work units are spread over the
+workers by the same count partition a single query uses (`HSPZ_UNIT_PARTITION`
+still decides the policy), and the receiver reorders each job's results, so the
+per-job output is unchanged. On two RTX 4090s, 100 queries of 5 Mbp against hg38
+finish in 255 s at `--gpus 2` against 497 s at `--gpus 1`; on one L4 the same
+list takes 1,890–1,900 s batched against 10,400–11,600 s as separate runs. Both
+arms of each comparison ran the same pinned settings (device seeder; bucketing on
+for the L4, off for the RTX 4090s; the partition forced at `--gpus 2`), not the
+`--gpus 1` defaults. Whole-chromosome queries (61–121 Mbp) gained 2.6%;
+whole-genome queries are expected to gain under 1% (reference setup is 0.27% of
+a whole-genome run; not measured in batch mode). The saving is the reference
+preparation, which by the cost model dominates only below roughly 130 Mbp of
+query per run on a 4090 (30 Mbp on an L4).
+
+All jobs must plan to identical reference bins; `-B 0`, `--kegalign-bins` and
+`--from-manifest` are rejected in batch mode, and a job whose standalone plan the
+multi-worker device budget would change is refused rather than replanned.
+Bin-major order delays the first result, so amortized time per query is not
+request latency. Job directories (or archives) are created at the start (with
+`--index`, when a job's first unit is written) and fill as units finish;
+`OUT/queries.tsv` is written only after every job has succeeded, so in a fresh
+`OUT` its presence marks a complete batch; a rerun into the same `OUT` does not
+remove an earlier `queries.tsv`.
+
+## Reusing a reference across runs
+
+When queries arrive in separate runs, build the reference's tables once:
+
+```bash
+hspZ index --reference ref.2bit --index /local/ref.hspz-index
+hspZ run --query q.fa --index /local/ref.hspz-index --output OUT
+```
+
+`hspZ index` writes each reference bin's seed tables and encoded bases as raw
+arrays with a text manifest, published atomically once a `READY` marker is
+written: the directory holds `MANIFEST`, `READY` and one subdirectory per bin
+(`000`, `001`, …) with little-endian `index_table`, `pos_table` and `enc` files
+without headers. It is built in a sibling `.tmp` directory and renamed onto the
+`--index` path, which must not exist yet. A run given `--index` plans from the
+reference record names and lengths stored in the `MANIFEST` and loads the arrays
+instead of rebuilding, inside the same prefetch; its output is byte-identical
+to a run without the index. Before any upload the run proves the index
+matches: `--seed`, `--step`, `-B` and `--kegalign-bins` must equal the values it
+was built with, and the resolved plan must have exactly the index's bins. Each
+bin's arrays are then checked against their recorded lengths and checksums as
+the bin loads, so a damaged file never reaches the device.
+
+`--reference` is optional with `--index`. When it is given, the FASTA is
+verified against the index in the background while the run proceeds: its
+records must hash to the value recorded at index time (an edit of the same size
+is caught) and carry exactly the index's record names and lengths. No output is
+written until it matches; a mismatch exits non-zero and leaves no output files.
+Without `--reference` no FASTA is read and the index is trusted; its arrays are
+still checksum-verified as bins load. The run prints an `index: using …` line
+before the workers start and an `index: loaded …` line with what it validated at
+the end; with `--time`, the `lifecycle:` line adds a `loads` count, and a run
+given `--reference` reports the background parse as
+`input.reference (background)` and time the run spends blocked on the
+verification as `index.verify wait` (plus the overlapped
+`index.verify wait (emitter)`, the wait at a job's first unit).
+
+hg38 at the default layout takes about 120 s to index and 8.9 GB on disk, and
+each run then loads its seven bins in roughly 12 s. On an L4 all but the first
+load (about 1.7 s) hide behind the GPU; on faster cards a small query's GPU time
+per bin (about 0.6 s for 5 Mbp on an RTX 4090) is shorter than a bin load (about
+1.8 s), so the loads set the pace. On an L4, with bucketing pinned on, the device
+seeder and the index on local NVMe with a warm page cache, 100 queries of 5 Mbp
+run as separate processes fall from 10,800 s to 2,680 s; those runs also
+re-read and re-hashed the reference before planning (about 4–5 s for hg38). A
+run without `--reference` skips that work entirely. On an L4 at the default
+settings, separate 5 Mbp runs against an hg38 index (20 runs per arm, identical
+output) took 23.5 s each without `--reference`, against 27.8 s when the
+reference was parsed before planning (−15.6%); the first work unit started after
+1.76 s instead of 6.15 s, and peak RSS fell from 5.1 GB to 2.0 GB. On an RTX
+4090 (one pass per arm) the same runs took 16.0 s with `--reference` checked in the background and
+15.8 s without it, against 20.8 s (−22.9% and −23.8%).
+Keep the index on local storage: a bin load above 10 s warns, and on a slow
+network file system loading can cost more than rebuilding. `-B 0` is rejected by
+both commands, and a plan the device budget would shrink to a different bin count
+is rejected rather than silently rebuilt. The index stores record names without
+a prefix, so pass `--target-prefix` to `run`, not to `index`. `hspZ index`
+refuses record names that are empty or contain whitespace, and bins over
+4,294,967,295 bp, before it builds anything. `--index` belongs to `run`;
+`benchmark` and `--cpu-only` reject it.
+
+## Choosing `-B`
+
+The default 500 Mbp preserves the KegAlign-matched digest; hspZ never changes it
+merely because `--gpus` changed. It is also the measured multi-GPU default: the
+unit partition balances the default layout's work units across the workers
+(−11.9% on 2× RTX 4090, −5.1% on 4×), while coarser layouts, down to one
+reference bin per worker, measured 17–22% slower than the default on a 2× T4
+screen.
+
+Any other `-B` or `--query-block-size` is a different frozen plan with its own
+digest. To look for a faster layout on a specific machine, `-B 0` prints and
+runs an automatic count-balanced layout; measure it against the default on that
+machine before adopting it. With one worker (the smaller of `--gpus` and the
+visible GPUs) it is exactly the default plan. With W ≥ 2 the reference takes the
+smallest multiple of W bins that is not coarser than the default layout (at most
+one bin per record), and the query becomes one bin when it fits both the
+per-worker device budget and host memory (an explicit `--query-block-size` is
+honoured); a candidate that does not fit falls back to the default policy, or
+fails when `--query-block-size` was given. The `layout: auto W=…` line prints
+the `--seq-block-size` and `--query-block-size` that reproduce the plan, and
+`--dump-manifest` records them. `-B 0` cannot be combined with
+`--kegalign-bins`, `--query-list` or `--index`; `HSPZ_LAYOUT_FORCE_WORKERS=W`
+resolves the W-worker layout on a machine with fewer GPUs. Use
+`--query-block-size` to avoid splitting the query merely because the reference
+needs more bins.
+
+Before spending GPU time on a layout, `hspZ hits-estimate` (CPU only) prints one
+row per work unit: reference bin, query bin, their sizes in bp and the exact
+number of seed hits the unit will expand. It plans like `run` with the same
+flags, as long as `run` does not shrink the plan to fit the device (`-B 0`
+resolves to the default layout, as `run` does on one GPU; to preview an automatic
+layout, pass the `--seq-block-size` and `--query-block-size` its `layout:` line
+printed), and its counts equal the `hits` column of the `--time` unit ledger; GPU time per unit
+tracks that count (about 0.37 ns per hit on an RTX 4090). `--stride N` counts
+every N-th query window and scales by N, an approximation. `run` never calls
+it.
 
 </DocsLayout>

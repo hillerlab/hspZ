@@ -44,11 +44,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PATH=/usr/local/cargo/bin:$PATH
 
 # clang/libclang 18 is what cuda-oxide actually resolves (doctor reports resource dir
-# /usr/lib/clang/18) — the plan's LLVM 21 requirement does not apply, and `llc` comes from
-# rustup's llvm-tools component, not from a system LLVM (amendment A2).
+# /usr/lib/clang/18) — no LLVM 21 is needed, and `llc` comes from rustup's llvm-tools
+# component, not from a system LLVM. libffi-dev: the codegen backend at the pinned
+# cuda-oxide revision links -lffi (build stage only; the runtime images do not need it).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git build-essential pkg-config python3 \
-        clang libclang-dev \
+        clang libclang-dev libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # CUDA 12.4 headers, libNVVM, libdevice, ptxas and nvJitLink. cuda_cudart gives cuda.h and
@@ -88,7 +89,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 WORKDIR /src
 
-# cargo-oxide is pinned to the SHA in Cargo.lock, never to upstream HEAD (plan Phase 1.3).
+# cargo-oxide is pinned to the SHA in Cargo.lock, never to upstream HEAD.
+#
+# The codegen backend needs the same pin. On its first build cargo-oxide clones the backend
+# source into $CARGO_HOME/cuda-oxide/src with an unpinned `git clone --depth 1`, i.e.
+# upstream HEAD, and HEAD tracks newer nightlies than rust-toolchain.toml: in September
+# 2026 it stopped compiling on the pinned nightly (rustc_public API drift) and every image
+# build broke. Seeding that directory at the pin first makes cargo-oxide skip its clone,
+# so the CLI, the backend and the cuda-* crates all come from one revision.
 COPY Cargo.lock Cargo.toml rust-toolchain.toml ./
 RUN set -eux; \
     sha=$(grep -m1 -o 'cuda-oxide\.git#[0-9a-f]\{40\}' Cargo.lock \
@@ -96,7 +104,12 @@ RUN set -eux; \
     test -n "$sha"; \
     echo "cuda-oxide pin: $sha" | tee /cuda-oxide.sha; \
     cargo install cargo-oxide --git https://github.com/NVlabs/cuda-oxide.git \
-        --rev "$sha" --locked --root /usr/local
+        --rev "$sha" --locked --root /usr/local; \
+    src="$CARGO_HOME/cuda-oxide/src"; \
+    git init -q "$src"; \
+    git -C "$src" fetch -q --depth 1 https://github.com/NVlabs/cuda-oxide.git "$sha"; \
+    git -C "$src" checkout -q --detach FETCH_HEAD; \
+    test "$(git -C "$src" rev-parse HEAD)" = "$sha"
 
 COPY . .
 # One target tree per architecture so artifacts cannot leak between them.
@@ -137,7 +150,7 @@ RUN mkdir -p /build/fixtures && python3 assets/tests/gen_fixtures.py /build/fixt
 FROM nvidia/cuda:12.6.3-base-ubuntu24.04 AS nvidia
 ARG HSPZ_NVIDIA_ARCH=sm_75
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.3
+ARG HSPZ_VERSION=0.0.4
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \
       org.opencontainers.image.version="$HSPZ_VERSION" \
@@ -170,7 +183,7 @@ FROM rocm/dev-ubuntu-24.04:6.2 AS zluda
 ARG ZLUDA_VERSION=v6
 ARG ZLUDA_ASSET=zluda-linux-3fe12063.tar.gz
 ARG GIT_SHA=unknown
-ARG HSPZ_VERSION=0.0.3
+ARG HSPZ_VERSION=0.0.4
 
 LABEL org.opencontainers.image.source="https://github.com/hillerlab/hspZ" \
       org.opencontainers.image.revision="$GIT_SHA" \

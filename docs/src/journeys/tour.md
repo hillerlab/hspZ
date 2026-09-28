@@ -30,7 +30,7 @@ sequenceDiagram
 <!-- @id: planning -->
 WHAT GOES IN: Record metadata, block targets, worker count, and device memory.
 WHAT HAPPENS: The planner builds deterministic bins, forms a reference × query grid, and halves unsafe targets.
-WHAT COMES OUT: Ordered WorkUnits assigned to GPU workers by reference bin.
+WHAT COMES OUT: Ordered WorkUnits assigned to GPU workers as count-balanced unit slices or whole reference bins.
 INVARIANT: A chromosome is never split to satisfy a target or a memory budget.
 
 ```mermaid
@@ -105,7 +105,7 @@ sequenceDiagram
 ## 0.6 — Make multi-GPU completion deterministic
 <!-- @id: deterministic-output -->
 WHAT GOES IN: WorkUnits distributed across independently finishing GPU workers.
-WHAT HAPPENS: Results enter an ordinal buffer, then one emitter performs host dedup, LASTZ ordering, coordinate conversion, and optional partitioning.
+WHAT HAPPENS: Workers dedup and LASTZ-order HSPs per MAX_HITS chunk; results enter an ordinal buffer, then the emitter (one per job with `--query-list`) performs coordinate conversion, optional partitioning, and writing.
 WHAT COMES OUT: The same bytes for one or many GPUs within the same layout.
 INVARIANT: Worker completion order never controls file order or partition history.
 

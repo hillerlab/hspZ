@@ -13,7 +13,13 @@ tmp<n>.block<query-bin>.r<reference-bin>.minus.segments
 
 `n` is the one-based query-interval number. `-D` adds `.split1`, `.split2`, …
 before `.segments`; `-Z` writes the same logical entries directly into one
-reproducible `.tar.gz` archive with pinned mtimes.
+reproducible `.tar.gz` archive with pinned mtimes, `<output>.tar.gz` unless a
+path follows `-Z`.
+
+With `--query-list`, each job writes this layout into its own directory,
+`OUT/000001/`, `OUT/000002/`, … (or its own `OUT/000001.tar.gz`, … with `-Z`),
+and `OUT/queries.tsv` lists the jobs once all of them have finished (see
+*GPUs and seeding*).
 
 ## Record format
 
@@ -29,8 +35,9 @@ reverse anchor order, matching KegAlign/LASTZ expectations.
 
 ## Ordering and deduplication
 
-Accepted GPU HSPs are stably sorted by diagonal, adjacent contained/duplicate
-records are removed with KegAlign's previous-input semantics, and survivors are
-stably sorted into LASTZ query-major order before coordinate conversion.
+Within each `MAX_HITS` chunk, accepted GPU HSPs are stably sorted by diagonal,
+adjacent contained/duplicate records are removed with KegAlign's previous-input
+semantics, and survivors are stably sorted into LASTZ query-major order before
+coordinate conversion.
 
 </DocsLayout>

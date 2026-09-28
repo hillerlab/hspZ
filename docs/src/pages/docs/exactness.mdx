@@ -5,15 +5,30 @@ import DocsLayout from "../../layouts/DocsLayout.astro"
 ## The rule
 
 hspZ is byte-identical to the C++ oracle when the plan, seed stream, scoring
-parameters, and `MAX_HITS` match. A changed layout gets a new frozen digest; it
-is not compared against a digest from another layout.
+parameters, and `MAX_HITS` match — on every tested fixture and on whole hg38 ×
+mm39. The oracle is KegAlign with the uninitialised-read fix in
+`assets/tests/kegalign-uninit-rchr.patch`; unpatched, KegAlign is not
+deterministic. Two limits remain: the entropy logarithm is an independent
+implementation (relative error ≤ 3.4e-14), so an entropy-adjusted score, or its
+comparison with the threshold, can differ when the product of score and entropy lands within about
+1e-10 of an integer, though no difference has been observed; and a seed batch
+whose hits exceed 2^32 is refused, because both tools index hits with 32 bits.
+The error names the work unit and the remedies: soft-mask repeats, or choose a
+smaller `-B`, `-C` or `-I`, which is a new layout. A changed layout gets a
+new frozen digest; it is not compared against a digest from another layout.
 
 | knob | default | why the HSP set can move |
 | --- | --- | --- |
 | `-B`, `--seq-block-size` | 500,000,000 | changes reference bins and, unless overridden, query bins |
 | `--query-block-size` | `-B` | changes query bins and per-unit chunk/dedup scope |
-| `--max-hits` | `4,194,304 × device GiB` | changes hit-stream chunk boundaries |
+| `--max-hits` | `4,194,304 × device GiB` (device 0) | changes hit-stream chunk boundaries |
 | `--kegalign-bins` | off | replaces balanced LPT bins with KegAlign sequential fill |
+| `-C`, `--wga-chunk-size` | 250,000 | changes seed-batch boundaries, and with them chunk and dedup scope |
+| `-I`, `--lastz-interval-size` | 10,000,000 | changes the query intervals (`tmp<n>` files) and the seed batches inside them |
+
+`--max-hits` is the semantic chunk target, resolved once per run. The physical
+hit capacity is derived separately from free device memory and decides only
+whether a run fits, never its bytes.
 
 Within one layout and `MAX_HITS`, one and many GPUs emit byte-identical files,
 including diagonal partitions and tarballs.
@@ -38,10 +53,17 @@ chr1–19,X,Y produced 15,158,480 HSPs at `-B 1000000000` and 15,157,574 at
 
 ## Memory preflight can refine the plan
 
-`plan_within_budget` silently halves the requested block target until the
-largest work unit fits device memory. If a chromosome is too large to fit
-atomically, hspZ fails before allocation. Use `--time` to inspect the accepted
+`plan_within_budget` silently halves the requested block targets, reference and
+query together, until the largest work unit fits device memory. If a chromosome
+is too large to fit atomically, hspZ fails before allocation; `--kegalign-bins`
+never shrinks and fails instead. Use `--time` to inspect the accepted
 `lifecycle:` line and `--dump-plan plan.tsv` to record bin membership.
+
+To run the same plan elsewhere, `--dump-manifest` freezes the accepted plan and
+hit cap, and `--from-manifest` replays it. The replaying node must use the same
+binary, inputs and parameters, including the resolved scoring matrix, strand and
+record prefixes, and it fails rather than replans when the frozen plan does not
+fit its devices.
 
 ## Multiplicity verdicts
 
