@@ -1,8 +1,3 @@
-> [!WARNING]
-> This is a preview release, use at your own risk.
-
----
-
 <p align="center">
   <p align="center">
     <img width=100 align="center" src="./assets/figures/hz.png" >
@@ -33,11 +28,17 @@
   </span>
 
   <p align="center">
-    GPU-accelerated HSPs backend.<br>
+    <samp>
+    <span> GPU-accelerated HSPs backend </span>
+    <br>
+    <span> The Hiller Lab at the Senckenberg  Research Institute </span>
+    <br>
+    <br>
     <a href="https://hillerlab.github.io/hspZ/">docs</a>
     · <a href="https://hillerlab.github.io/hspZ/docs/install/">install</a>
     · <a href="https://hillerlab.github.io/hspZ/docs/algorithm/tour/">algorithm</a>
     . <a href="https://hillerlab.com">us</a>
+    </samp>
   </p>
 
   <p align="center">
