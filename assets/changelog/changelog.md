@@ -62,8 +62,16 @@ byte-identical output to 0.0.4 at the same plan and cap; other GPU classes were 
   2 GPUs with no run slower, −0.9% on 4 and −7.1% on 6; on 8 GPUs one run (Ascaphus × axolotl) replays +3.7%.
   `HSPZ_UNIT_COST=count` restores the 0.0.4 schedule exactly; `HSPZ_UNIT_COST=hits:PATH` weighs units by a
   `hspZ hits-estimate` table of the same plan instead (1% margin). A `note: unit cost …` line reports both
-  modelled splits and the choice. hspZ still runs at most one worker per reference bin, which `--gpus` help
-  now states.
+  modelled splits and the choice.
+- **Opt-in: more GPUs than reference bins, `HSPZ_WORKER_CAP=units`.** hspZ starts at most one worker per
+  reference bin, so at the default `-B 500 Mbp` GPUs beyond about reference size / 500 Mbp sit idle (3 for a
+  bird, fish, snake or frog reference). `HSPZ_WORKER_CAP=units` allows up to one worker per work unit under the
+  unit partition: several GPUs then share a reference bin, each running its own slice of the bin's query units and
+  building its own copy of the bin. On two A100s, one 446 Mbp reference bin × eight axolotl query bins ran in
+  268 s instead of 515 s on one GPU (**−48%**, output identical). A replay of the 34 measured species pairs puts the
+  total at −5% / −19% / −30% on 4 / 6 / 8 GPUs for about 13% more GPU-hours at 8, but 4–8 GPUs were not
+  measured, so the default stays one worker per bin (`HSPZ_WORKER_CAP=bins`, stated in `--gpus` help).
+  Whole-bin ownership ignores the setting with a note.
 
 ## [0.0.4] — 2026-09-28
 

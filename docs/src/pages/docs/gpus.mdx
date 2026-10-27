@@ -4,9 +4,12 @@ import DocsLayout from "../../layouts/DocsLayout.astro"
 
 ## Worker model
 
-`--gpus W` creates up to W workers, and never more workers than the plan has
-reference bins: a plan with a single reference bin runs on one worker whatever
-`--gpus` says. When each worker has its own device and every device the run uses
+`--gpus W` creates up to W workers, and by default never more workers than the
+plan has reference bins: a plan with a single reference bin runs on one worker
+whatever `--gpus` says. `HSPZ_WORKER_CAP=units` (opt-in, see the knobs below)
+raises that limit to one worker per work unit under the unit partition, so
+several GPUs can share a reference bin, each running its own slice of the bin's
+query units and building its own copy of the bin. When each worker has its own device and every device the run uses
 is the same class (equal SM count and L2, nominal clocks within 10%), the frozen
 plan's work units are split across the workers by estimated cost. Each unit is
 weighted by its reference bin's length times its query bin's length; whole
@@ -55,7 +58,7 @@ HSPZ_DEVICE_SEEDS=1 hspZ run ...  # force device
 
 Every knob is exact: every mode produces the same HSP set and the same bytes.
 An unrecognised value of `HSPZ_REF_BUCKETS`, `HSPZ_REF_BUCKET_SHIFT`,
-`HSPZ_UNIT_PARTITION` or `HSPZ_UNIT_COST` is an error; `HSPZ_CHUNK_WALK` and
+`HSPZ_UNIT_PARTITION`, `HSPZ_UNIT_COST` or `HSPZ_WORKER_CAP` is an error; `HSPZ_CHUNK_WALK` and
 `HSPZ_DEVICE_SEEDS` ignore values they do not know, and a non-integer
 `HSPZ_FIND_HITS_WARP_MIN_DENSITY` is ignored with a warning.
 
@@ -66,6 +69,7 @@ An unrecognised value of `HSPZ_REF_BUCKETS`, `HSPZ_REF_BUCKET_SHIFT`,
 | `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array for every seed batch above `--max-hits` (rollback only). |
 | `HSPZ_UNIT_PARTITION=0\|1` | unset (auto) | Splits the frozen plan's work units across workers (weighted as `HSPZ_UNIT_COST` says) when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. `0` forces whole-bin ownership and `1` forces the partition; any other value, including `auto`, is an error. With the 0.0.4 count quotas: −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. Other worker counts and device classes are unmeasured; compare with `HSPZ_UNIT_PARTITION=0`. |
 | `HSPZ_UNIT_COST=bp\|count\|hits:PATH` | `bp` | How the partition weighs work units. `bp` (reference bin bp × query bin bp, from the plan alone) uses the cost split when it models at least 3% lighter than the count quotas; `count` restores the 0.0.4 count quotas exactly; `hits:PATH` weighs units by a `hspZ hits-estimate` table of this exact plan (its seed hits plus 6 per query bp, 1% margin; a table for another plan is an error, and batch mode rejects it). The `note: unit cost …` line reports both modelled splits and the choice. On two A100 80GB: an axolotl query of 4 chromosomes + 4 scaffolds against xenTro9 (3×8 units) 1,469 → 1,107 s (−24.7%), HLmyoMyo6 × HLmyoDau2 at 50% (3×3) 482 → 400 s (−17.1%); a balanced plan (danRer11 × oryLat2, 3×2) keeps the count split. |
+| `HSPZ_WORKER_CAP=bins\|units` | `bins` | How many workers a run may start. `bins` allows at most one per reference bin; `units` allows up to one per work unit when the unit partition is in use (whole-bin ownership keeps one per bin and says so), so GPUs beyond the bin count are no longer idle. Each extra worker on a bin builds its own copy of the bin (a few seconds, hidden by prefetch when it fits) and needs its own host buffers; output is unchanged. Opt-in because it is measured on two GPUs only: on two A100s one 446 Mbp reference bin × eight axolotl query bins ran on both GPUs instead of one, 515 → 268 s (−48%). A replay of 34 measured A100 runs gives −5% / −19% / −30% total wall at 4 / 6 / 8 GPUs for about 13% more GPU-hours at 8; compare with the default on your machine before relying on it. Any other value is an error. |
 | `HSPZ_FIND_HITS_WARP_MIN_DENSITY=<n>` | 8 | Mean hits per seed from which a `find_hits` launch walks each seed with one warp instead of one thread (16 before 0.0.5; `0` sends every launch to the warp kernel). For controlled measurements; see [the algorithm notes](/hspZ/docs/algorithm/hit-discovery/). |
 
 ## Many queries against one reference
