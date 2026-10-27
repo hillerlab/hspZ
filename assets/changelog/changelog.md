@@ -36,6 +36,35 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.5] — 2026-10-27
+
+Two exact speed-ups, both on by default, both measured on NVIDIA A100 80GB PCIe GPUs. Every arm produced
+byte-identical output to 0.0.4 at the same plan and cap; other GPU classes were not re-measured.
+
+- **`find_hits` takes the warp kernel from 8 hits per seed (was 16).** The launch cutoff between one thread and
+  one warp per seed now sits where the two kernels break even on an A100: below about 8 hits per seed the
+  thread kernel is faster (hg38 chr21 × mm39, 2.3 hits/seed: the warp kernel costs +174% `find_hits` time;
+  chr13, 6.6: +19%), above it the warp kernel is (chr7, 9.4: −16%; chr1, 12.9: −35%). The old cutoff also sent
+  skewed launches, whose mean sits under 16 while most hits live in a few long seeds, to the thread kernel,
+  which then kept 12% of its lanes busy against the warp kernel's 40%: an Ascaphus truei reference bin of
+  small scaffolds against an axolotl chromosome (mean 14.5 hits/seed, median 8, max 88,589) runs 221 → 139 s
+  (**−37%**, `find_hits` −82%), and Ascaphus × axolotl at 50% on two A100s 2,156 → 1,977 s (**−8.3%**). The
+  whole Ascaphus × axolotl genome is projected at about −26% on one or two GPUs from its measured units (not
+  run). `HSPZ_FIND_HITS_WARP_MIN_DENSITY` overrides the cutoff for controlled measurements.
+- **Cost-weighted multi-GPU partition.** With `--gpus W ≥ 2` on matching devices, each work unit is weighted by
+  reference bin bp × query bin bp; whole bins go out within each worker's share, then one stream of query
+  slices is cut so the busiest worker carries as little as possible, still with at most one extra reference
+  build per extra worker. The cost split replaces the 0.0.4 count quotas only when it models at least 3%
+  lighter, so balanced plans keep their schedule. On two A100 80GB: xenTro9 × an axolotl query of 4
+  chromosomes and 4 scaffolds (3×8 units) 1,469 → 1,107 s (**−24.7%**; under count quotas one GPU sat idle
+  after 725 s), HLmyoMyo6 × HLmyoDau2 at 50% 482 → 400 s (**−17.1%**), and danRer11 × oryLat2 (3×2) keeps the
+  count split. Replayed over 34 measured species pairs (not measured at these counts), total wall is −4.0% on
+  2 GPUs with no run slower, −0.9% on 4 and −7.1% on 6; on 8 GPUs one run (Ascaphus × axolotl) replays +3.7%.
+  `HSPZ_UNIT_COST=count` restores the 0.0.4 schedule exactly; `HSPZ_UNIT_COST=hits:PATH` weighs units by a
+  `hspZ hits-estimate` table of the same plan instead (1% margin). A `note: unit cost …` line reports both
+  modelled splits and the choice. hspZ still runs at most one worker per reference bin, which `--gpus` help
+  now states.
+
 ## [0.0.4] — 2026-09-28
 
 Exact speed-ups for the GPU pass, a work-unit scheduler for multi-GPU runs, and a
