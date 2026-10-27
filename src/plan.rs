@@ -308,6 +308,305 @@ pub fn unit_partition_dims(
     visits
 }
 
+/// Hit-equivalents charged per query bp on top of a unit's seed hits when the
+/// cost comes from a `hits-estimate` table (`HSPZ_UNIT_COST=hits:PATH`).
+///
+/// The A100 unit ledgers fit `ms = 0.5657 ns x hits + 3.455 ms per query Mbp`
+/// (746 units, 32 runs, RMS 3.6%); the per-bp term in hit units is
+/// 3.455e-6 / 0.5657e-6 = 6.1. It keeps a zero-hit unit (an all-masked
+/// scaffold bin) from being free, and is below 4% of any unit that has hits.
+pub const HITS_PER_QUERY_BP: u64 = 6;
+
+/// Modelled gain, in percent, that the cost split must clear over the count
+/// split before [`cost_unit_partition`] uses it: 3 for the default reference bp x
+/// query bp weights, 1 for exact `hits-estimate` weights. A 2026-10-27 replay of
+/// the 34 measured A100 runs (2-8 GPUs, cutoff-8 unit times) showed the bp
+/// model's small misreads (+1.7..+1.8% at 4 GPUs on mm39 x rn7 and hg38 x
+/// canFam6 at a 1% margin) gone at 3%, with every 2-GPU gain kept.
+pub const COST_SPLIT_MARGIN_BP_PCT: u32 = 3;
+/// See [`COST_SPLIT_MARGIN_BP_PCT`].
+pub const COST_SPLIT_MARGIN_HITS_PCT: u32 = 1;
+
+/// Which split [`cost_unit_partition`] returned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostPick {
+    /// The count partition, i.e. exactly [`unit_partition_dims`].
+    Count,
+    /// The cost-weighted split.
+    Cost,
+}
+
+/// A cost-aware partition and the modelled makespans it was chosen on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CostPartition {
+    pub visits: Vec<Vec<Visit>>,
+    pub pick: CostPick,
+    /// Busiest worker's summed slot cost under the count partition.
+    pub count_makespan: u128,
+    /// The same for the cost-weighted candidate, whether or not it was picked
+    /// (equal to `count_makespan` when none was built: W = 1, no slots, or
+    /// all-zero costs).
+    pub cost_makespan: u128,
+    /// Sum of every slot cost.
+    pub total: u128,
+}
+
+/// Busiest worker's summed slot cost.
+pub fn modelled_makespan(part: &[Vec<Visit>], slot_costs: &[Vec<u64>]) -> u128 {
+    part.iter()
+        .map(|visits| {
+            visits
+                .iter()
+                .flat_map(|t| slot_costs[t.bin][t.queries.clone()].iter())
+                .map(|&c| u128::from(c))
+                .sum::<u128>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Cost-aware static unit partition (the default since 2026-10-27;
+/// `HSPZ_UNIT_COST=count` restores the count partition).
+///
+/// [`unit_partition_dims`] hands out units by count, so when units differ in
+/// cost (axolotl's 0.7-1.7 Gbp chromosome bins next to 7 Mbp scaffold bins)
+/// the residual cut can give one worker every heavy unit: xenTro9 x axolotl
+/// ran 89/88 units but 67% of the seed hits on one of two A100s. This builds a
+/// cost-weighted candidate and keeps it only if its modelled makespan is at
+/// least `margin_pct`% below the count partition's, so a cost model that is
+/// noisy at the margin cannot trade a balanced count split for a worse one;
+/// otherwise the result is exactly [`unit_partition_dims`].
+///
+/// `slot_costs[b][s]` is the cost of slot `s` of reference bin `b` (bins by
+/// id, every row `M` long; the slot coordinate is the one
+/// [`unit_partition_dims`] uses). The candidate:
+///
+/// 1. Whole bins, descending cost (ties by bin id), each to the least-loaded
+///    worker (ties by worker index) if that keeps it within the ideal share
+///    `total / W`; a bin that fits nowhere joins the residual.
+/// 2. The residual bins, in that order, form one stream of slots in slot
+///    order. Workers take consecutive pieces of it in ascending committed
+///    load (ties by index), each filling greedily up to a cap; the cap is the
+///    smallest that consumes the stream (binary search over integers), i.e.
+///    the optimal makespan for that piece order.
+///
+/// Every worker owns whole bins plus at most one piece, so a worker never
+/// visits a bin twice and the extra visits (reference replicas) are at most
+/// `W - 1`: the residual stream is cut `W - 1` times and only a cut inside a
+/// bin adds a visit. That is the count partition's bound too. Pure and
+/// deterministic; integer arithmetic only.
+pub fn cost_unit_partition(
+    reference_bins: &[Bin],
+    slot_costs: &[Vec<u64>],
+    workers: usize,
+    margin_pct: u32,
+) -> CostPartition {
+    let w = workers.max(1);
+    let r = reference_bins.len();
+    let m = slot_costs.first().map_or(0, Vec::len);
+    assert!(
+        slot_costs.len() == r && slot_costs.iter().all(|row| row.len() == m),
+        "slot costs must be one row of M slots per reference bin"
+    );
+    debug_assert!(
+        reference_bins
+            .iter()
+            .enumerate()
+            .all(|(i, b)| b.id as usize == i),
+        "reference bin ids are their positions"
+    );
+    let count = unit_partition_dims(reference_bins, m, w);
+    let count_makespan = modelled_makespan(&count, slot_costs);
+    let total: u128 = slot_costs.iter().flatten().map(|&c| u128::from(c)).sum();
+    if w == 1 || r == 0 || m == 0 || total == 0 {
+        return CostPartition {
+            visits: count,
+            pick: CostPick::Count,
+            count_makespan,
+            cost_makespan: count_makespan,
+            total,
+        };
+    }
+    let cand = cost_split(slot_costs, w, total);
+    let cost_makespan = modelled_makespan(&cand, slot_costs);
+    // Switch only for a >= margin_pct% modelled gain: cost * (100 + m) < count * 100.
+    let (visits, pick) = if cost_makespan * (100 + u128::from(margin_pct)) < count_makespan * 100 {
+        (cand, CostPick::Cost)
+    } else {
+        (count, CostPick::Count)
+    };
+    CostPartition {
+        visits,
+        pick,
+        count_makespan,
+        cost_makespan,
+        total,
+    }
+}
+
+/// The cost-weighted candidate of [`cost_unit_partition`] (whole-bin LPT within
+/// the ideal share, then one bottleneck-cut residual stream).
+fn cost_split(slot_costs: &[Vec<u64>], w: usize, total: u128) -> Vec<Vec<Visit>> {
+    let r = slot_costs.len();
+    let m = slot_costs[0].len();
+    let bin_cost: Vec<u128> = slot_costs
+        .iter()
+        .map(|row| row.iter().map(|&c| u128::from(c)).sum())
+        .collect();
+    let mut order: Vec<usize> = (0..r).collect();
+    order.sort_by(|&a, &b| bin_cost[b].cmp(&bin_cost[a]).then(a.cmp(&b)));
+    let wu = w as u128;
+    let mut base = vec![0u128; w];
+    let mut visits: Vec<Vec<Visit>> = vec![Vec::new(); w];
+    let mut rest: Vec<usize> = Vec::new();
+    for b in order {
+        let x = (0..w)
+            .min_by_key(|&i| (base[i], i))
+            .expect("at least one worker");
+        if (base[x] + bin_cost[b]) * wu <= total {
+            base[x] += bin_cost[b];
+            visits[x].push(Visit {
+                bin: b,
+                queries: 0..m,
+            });
+        } else {
+            rest.push(b);
+        }
+    }
+    let stream: Vec<(usize, usize, u128)> = rest
+        .iter()
+        .flat_map(|&b| (0..m).map(move |s| (b, s, u128::from(slot_costs[b][s]))))
+        .collect();
+    if !stream.is_empty() {
+        let mut piece_order: Vec<usize> = (0..w).collect();
+        piece_order.sort_by_key(|&i| (base[i], i));
+        let floor = base.iter().copied().max().unwrap_or(0);
+        let (mut lo, mut hi) = (floor, floor + stream.iter().map(|t| t.2).sum::<u128>());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if fill_stream(&stream, &base, &piece_order, mid).0 == stream.len() {
+                hi = mid;
+            } else {
+                lo = mid + 1;
+            }
+        }
+        let (end, pieces) = fill_stream(&stream, &base, &piece_order, lo);
+        debug_assert_eq!(end, stream.len(), "the cap consumes the stream");
+        for (x, start, stop) in pieces {
+            let mut k = start;
+            while k < stop {
+                let b = stream[k].0;
+                let mut e = k + 1;
+                while e < stop && stream[e].0 == b {
+                    e += 1;
+                }
+                visits[x].push(Visit {
+                    bin: b,
+                    queries: stream[k].1..stream[e - 1].1 + 1,
+                });
+                k = e;
+            }
+        }
+    }
+    for v in &mut visits {
+        v.sort_by_key(|t| t.bin);
+        debug_assert!(
+            v.windows(2).all(|w| w[0].bin != w[1].bin),
+            "two visits of one bin on a worker"
+        );
+    }
+    visits
+}
+
+/// Greedy fill of the residual stream: each worker in `order` takes stream
+/// entries while its load stays `<= cap`. Returns how far the stream was
+/// consumed and each worker's `(worker, start, end)` piece.
+fn fill_stream(
+    stream: &[(usize, usize, u128)],
+    base: &[u128],
+    order: &[usize],
+    cap: u128,
+) -> (usize, Vec<(usize, usize, usize)>) {
+    let mut pos = 0usize;
+    let mut pieces = Vec::with_capacity(order.len());
+    for &x in order {
+        let start = pos;
+        let mut acc = base[x];
+        while pos < stream.len() && acc + stream[pos].2 <= cap {
+            acc += stream[pos].2;
+            pos += 1;
+        }
+        pieces.push((x, start, pos));
+    }
+    (pos, pieces)
+}
+
+/// Parses a `hspZ hits-estimate` table (`r q ref_bp qry_bp hits`, one row per
+/// unit, tab or space separated) into `hits[r][q]` for `plan`.
+///
+/// Refuses a table that does not describe this plan: every unit exactly once,
+/// and each row's bin sizes equal to the plan's (a table estimated for another
+/// layout, a shrunk plan or other inputs is stale, not approximately right).
+pub fn parse_unit_hits(text: &str, plan: &Plan) -> Result<Vec<Vec<u64>>, String> {
+    let r = plan.reference_bins.len();
+    let q = plan.query_bins.len();
+    let mut hits: Vec<Vec<Option<u64>>> = vec![vec![None; q]; r];
+    for (n, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        let num = |i: usize| -> Result<u64, String> {
+            f.get(i).and_then(|v| v.parse::<u64>().ok()).ok_or_else(|| {
+                format!(
+                    "unit hits line {}: expected 5 integers, got {line:?}",
+                    n + 1
+                )
+            })
+        };
+        if f.len() != 5 {
+            return Err(format!(
+                "unit hits line {}: expected 5 fields (r q ref_bp qry_bp hits), got {}",
+                n + 1,
+                f.len()
+            ));
+        }
+        let (rb, qb, rbp, qbp, h) = (num(0)?, num(1)?, num(2)?, num(3)?, num(4)?);
+        let (rb, qb) = (rb as usize, qb as usize);
+        if rb >= r || qb >= q {
+            return Err(format!(
+                "unit hits line {}: unit R{rb} Q{qb} is outside this {r}x{q} plan",
+                n + 1
+            ));
+        }
+        if plan.reference_bins[rb].total_bp != rbp || plan.query_bins[qb].total_bp != qbp {
+            return Err(format!(
+                "unit hits line {}: R{rb} Q{qb} is {rbp} x {qbp} bp in the table but {} x {} bp \
+                 in this plan (stale table, or a different layout)",
+                n + 1,
+                plan.reference_bins[rb].total_bp,
+                plan.query_bins[qb].total_bp
+            ));
+        }
+        if hits[rb][qb].replace(h).is_some() {
+            return Err(format!(
+                "unit hits line {}: R{rb} Q{qb} appears twice",
+                n + 1
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(r);
+    for (rb, row) in hits.into_iter().enumerate() {
+        let mut v = Vec::with_capacity(q);
+        for (qb, h) in row.into_iter().enumerate() {
+            v.push(h.ok_or_else(|| format!("unit hits: no row for R{rb} Q{qb}"))?);
+        }
+        out.push(v);
+    }
+    Ok(out)
+}
+
 /// KegAlign's block rule, reproduced exactly, for matched-granularity runs
 /// (matched-granularity mode).
 ///
@@ -3530,5 +3829,466 @@ mod unit_partition_tests {
                 }
             }
         }
+    }
+}
+
+/// Cost-aware unit partition (`HSPZ_UNIT_COST`).
+#[cfg(test)]
+mod cost_partition_tests {
+    use super::{
+        Bin, COST_SPLIT_MARGIN_BP_PCT, COST_SPLIT_MARGIN_HITS_PCT, CostPick, Plan, Visit, WorkUnit,
+        cost_unit_partition, modelled_makespan, parse_unit_hits, unit_partition_dims,
+    };
+
+    const BP: u32 = COST_SPLIT_MARGIN_BP_PCT;
+    const HITS: u32 = COST_SPLIT_MARGIN_HITS_PCT;
+
+    fn bins(bps: &[u64]) -> Vec<Bin> {
+        bps.iter()
+            .enumerate()
+            .map(|(i, &bp)| Bin {
+                id: i as u32,
+                record_ids: Vec::new(),
+                total_bp: bp,
+            })
+            .collect()
+    }
+
+    fn v(bin: usize, lo: usize, hi: usize) -> Visit {
+        Visit {
+            bin,
+            queries: lo..hi,
+        }
+    }
+
+    fn bp_costs(ref_bp: &[u64], qry_bp: &[u64]) -> Vec<Vec<u64>> {
+        ref_bp
+            .iter()
+            .map(|&r| qry_bp.iter().map(|&q| r * q).collect())
+            .collect()
+    }
+
+    fn total_visits(part: &[Vec<Visit>]) -> usize {
+        part.iter().map(Vec::len).sum()
+    }
+
+    /// Exact cover, non-empty contiguous ranges, one visit per (worker, bin),
+    /// bin order, and at most `W - 1` extra visits.
+    fn check(r: usize, m: usize, w: usize, part: &[Vec<Visit>]) {
+        assert_eq!(part.len(), w.max(1));
+        let mut seen = vec![vec![false; m]; r];
+        for (x, visits) in part.iter().enumerate() {
+            for pair in visits.windows(2) {
+                assert!(
+                    pair[0].bin < pair[1].bin,
+                    "worker {x}: bins not strictly ascending"
+                );
+            }
+            for t in visits {
+                assert!(
+                    t.bin < r && !t.queries.is_empty() && t.queries.end <= m,
+                    "worker {x}: bad visit {t:?}"
+                );
+                for s in t.queries.clone() {
+                    assert!(!seen[t.bin][s], "unit R{} S{s} covered twice", t.bin);
+                    seen[t.bin][s] = true;
+                }
+            }
+        }
+        assert!(seen.iter().flatten().all(|&s| s), "a unit is missing");
+        if r > 0 && m > 0 {
+            assert!(
+                total_visits(part) < r + w.max(1),
+                "more than W-1 extra visits"
+            );
+        }
+    }
+
+    /// Deterministic generator for the property tests.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// xenTro9 (R = 3) x axolotl (Q = 59) at -B 500 Mbp: 21 chromosome bins of
+    /// 0.68-1.74 Gbp, then 38 scaffold bins of 7-22 Mbp.
+    const XT9_REF_BP: [u64; 3] = [408777206, 422514288, 441217916];
+    const XT9_AXL_QBP: [u64; 59] = [
+        1740248193, 1712875843, 1688878803, 1562490720, 1556349587, 1555688883, 1522428745,
+        1517496340, 1493858272, 1489131749, 1405184295, 1387282310, 1321645039, 1309048778,
+        1298128260, 1273943533, 1258501305, 1171543370, 989673443, 848590089, 675505429, 22403628,
+        17436952, 16645515, 16142638, 13820453, 13702397, 13166701, 7297556, 7285351, 7292363,
+        7308691, 7322874, 7289632, 7279594, 7275850, 7273088, 7278004, 7288451, 7281335, 7292874,
+        7289536, 7292120, 7297918, 7290699, 7300399, 7294743, 7272886, 7295599, 7295019, 7292083,
+        7293792, 7291609, 7314052, 7302034, 7285154, 7307758, 7282039, 7290266,
+    ];
+    /// The exact per-unit seed hits (`hspZ hits-estimate`, equal to the A100 ledger).
+    #[rustfmt::skip]
+    const XT9_AXL_HITS: [[u64; 59]; 3] = [
+        [
+            310434342047, 298959078497, 297919802145, 281688523378, 273620614518, 275610092897,
+            262447009084, 263533225534, 264756254326, 262341705255, 243376779534, 242551360743,
+            232847621115, 230396938724, 229391841640, 225330264061, 225191733283, 208595504635,
+            174675276981, 139838063076, 117457847710, 22484917, 48845908, 175742708,
+            935965164, 61203072, 1983477961, 8938626, 24243223, 130300240,
+            3642965, 345289726, 288549734, 823643115, 202152118, 404405618,
+            85026714, 191495549, 1206021465, 430671877, 159959838, 220167940,
+            378973805, 137814924, 25943705, 54921566, 431386979, 309001179,
+            170782634, 20789712, 239024200, 233508033, 253699192, 608247082,
+            531802540, 135502602, 555256710, 408185652, 281429065,
+        ],
+        [
+            310411098598, 298950445469, 297991339648, 281662403343, 273632455471, 275653892825,
+            262385437835, 263487873379, 264784705580, 262308818001, 243423397859, 242623988340,
+            232866015318, 230319650522, 229420162354, 225276207074, 225183779926, 208652930307,
+            174694232476, 139746346188, 117412907262, 22424365, 48838719, 175484563,
+            935769435, 60902615, 1982352458, 8915523, 24147943, 129936555,
+            3635316, 344893161, 288311701, 823321368, 202024599, 403708653,
+            84913641, 190622498, 1204959228, 430582173, 160063404, 220182297,
+            378853611, 137656154, 25922260, 54927124, 431241711, 308812754,
+            170412188, 20778750, 238809224, 233637981, 253779519, 607909269,
+            531431967, 135292295, 554453278, 407954684, 281331301,
+        ],
+        [
+            331340710003, 319083643584, 317892144118, 300671916615, 292008996825, 294104960870,
+            280163854803, 281306481070, 282538198489, 280022232565, 259697898223, 258794424326,
+            248492891751, 245988586025, 244795983565, 240550351764, 240351263525, 222575166110,
+            186408911426, 149346458663, 125403274253, 24032716, 52120459, 187722874,
+            999437344, 65540435, 2117514450, 9578112, 25891959, 139062420,
+            3900234, 368863034, 308313935, 879434346, 215891990, 432560182,
+            90908706, 205212478, 1288648412, 459844241, 170759847, 234965949,
+            404797966, 147433220, 27725386, 58647566, 460733156, 329806210,
+            182610583, 22241328, 255226480, 249142542, 270779577, 649627513,
+            567819167, 144787920, 593253015, 435861551, 300539786,
+        ],
+    ];
+
+    fn share(x: u128, total: u128) -> f64 {
+        x as f64 / total as f64
+    }
+
+    /// The measured v0.0.4 failure: 89/88 units, but the count cut of R0 put
+    /// all 21 chromosome units on worker 0 (67% of the hits, 74% efficiency).
+    /// With bp weights the split is 50.7/49.3 for the same one extra replica.
+    #[test]
+    fn xentro9_axolotl_bp_w2() {
+        let b = bins(&XT9_REF_BP);
+        let costs = bp_costs(&XT9_REF_BP, &XT9_AXL_QBP);
+        assert_eq!(
+            unit_partition_dims(&b, 59, 2),
+            vec![
+                vec![v(0, 0, 30), v(2, 0, 59)],
+                vec![v(0, 30, 59), v(1, 0, 59)]
+            ],
+            "the logged v0.0.4 schedule"
+        );
+        let cp = cost_unit_partition(&b, &costs, 2, BP);
+        assert_eq!(cp.pick, CostPick::Cost);
+        assert_eq!(
+            cp.visits,
+            vec![
+                vec![v(0, 10, 59), v(2, 0, 59)],
+                vec![v(0, 0, 10), v(1, 0, 59)]
+            ]
+        );
+        assert!((share(cp.count_makespan, cp.total) - 0.6656).abs() < 1e-4);
+        assert!((share(cp.cost_makespan, cp.total) - 0.5068).abs() < 1e-4);
+        assert_eq!(total_visits(&cp.visits), 4, "one extra replica, as before");
+        check(3, 59, 2, &cp.visits);
+    }
+
+    /// Same pair weighted by its exact hits (+ 6 per query bp): 67.3% -> 50.6%.
+    #[test]
+    fn xentro9_axolotl_hits_w2() {
+        let b = bins(&XT9_REF_BP);
+        let costs: Vec<Vec<u64>> = XT9_AXL_HITS
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .zip(&XT9_AXL_QBP)
+                    .map(|(&h, &q)| h + super::HITS_PER_QUERY_BP * q)
+                    .collect()
+            })
+            .collect();
+        let cp = cost_unit_partition(&b, &costs, 2, HITS);
+        assert_eq!(cp.pick, CostPick::Cost);
+        assert_eq!(
+            cp.visits,
+            vec![
+                vec![v(1, 10, 59), v(2, 0, 59)],
+                vec![v(0, 0, 59), v(1, 0, 10)]
+            ]
+        );
+        assert!((share(cp.count_makespan, cp.total) - 0.6731).abs() < 1e-4);
+        assert!((share(cp.cost_makespan, cp.total) - 0.5057).abs() < 1e-4);
+        check(3, 59, 2, &cp.visits);
+        // W = 3 (one bin each by count) and W = 4 also improve, within the bound.
+        for (w, count, cost) in [(3, 0.3475, 0.3359), (4, 0.3472, 0.2561)] {
+            let cp = cost_unit_partition(&b, &costs, w, HITS);
+            assert_eq!(cp.pick, CostPick::Cost, "W={w}");
+            assert!(
+                (share(cp.count_makespan, cp.total) - count).abs() < 1e-4,
+                "W={w}"
+            );
+            assert!(
+                (share(cp.cost_makespan, cp.total) - cost).abs() < 1e-4,
+                "W={w}"
+            );
+            check(3, 59, w, &cp.visits);
+        }
+    }
+
+    /// A 3x3 input (HLmyoMyo6 x HLmyoDau2 50%, exact hits): the count split is
+    /// 5/4 units but 62% of the hits; the cost split is 51.7% with 1 extra replica.
+    #[test]
+    fn small_input_hits_w2() {
+        let b = bins(&[418893576, 329023177, 344055123]);
+        let costs = vec![
+            vec![159088284659, 213096994739, 146432611795],
+            vec![121990923726, 163438029973, 112420622722],
+            vec![113746503325, 153297576874, 105290494490],
+        ];
+        let cp = cost_unit_partition(&b, &costs, 2, HITS);
+        assert_eq!(cp.pick, CostPick::Cost);
+        assert_eq!(cp.count_makespan, 804046844892);
+        assert_eq!(cp.cost_makespan, 664893656620);
+        assert_eq!(
+            cp.visits,
+            vec![vec![v(0, 0, 3), v(2, 2, 3)], vec![v(1, 0, 3), v(2, 0, 2)]]
+        );
+        check(3, 3, 2, &cp.visits);
+    }
+
+    /// Ascaphus x axolotl shape: R = 8 equal bins, bins 4-7 1.6x costlier per
+    /// unit. Count is exact at W = 2 and 4 (kept), 23% / 20% over ideal at W = 6
+    /// and 8 (replaced, within one unit of the ideal share).
+    #[test]
+    fn unequal_bin_costs_w2_to_w8() {
+        let b = bins(&[450_000_000; 8]);
+        let costs: Vec<Vec<u64>> = (0..8)
+            .map(|i| vec![if i < 4 { 100 } else { 160 }; 6])
+            .collect();
+        for (w, pick, count, cost) in [
+            (2, CostPick::Count, 3120, 3120),
+            (4, CostPick::Count, 1560, 1560),
+            (6, CostPick::Cost, 1280, 1060),
+            (8, CostPick::Cost, 960, 800),
+        ] {
+            let cp = cost_unit_partition(&b, &costs, w, BP);
+            assert_eq!(
+                (cp.pick, cp.count_makespan, cp.cost_makespan),
+                (pick, count, cost),
+                "W={w}"
+            );
+            if pick == CostPick::Count {
+                assert_eq!(cp.visits, unit_partition_dims(&b, 6, w), "W={w}");
+            }
+            assert!(
+                cp.cost_makespan <= cp.total / w as u128 + 160,
+                "W={w}: within one unit"
+            );
+            check(8, 6, w, &cp.visits);
+        }
+        assert_eq!(
+            cost_unit_partition(&b, &costs, 8, BP).visits,
+            vec![
+                vec![v(0, 0, 6), v(7, 2, 3)],
+                vec![v(1, 0, 6), v(7, 3, 4)],
+                vec![v(2, 0, 6), v(7, 4, 5)],
+                vec![v(3, 0, 6), v(7, 5, 6)],
+                vec![v(4, 0, 5)],
+                vec![v(4, 5, 6), v(5, 0, 4)],
+                vec![v(5, 4, 6), v(6, 0, 3)],
+                vec![v(6, 3, 6), v(7, 0, 2)],
+            ]
+        );
+    }
+
+    /// Equal unit costs: the count partition is already optimal, so the result
+    /// is exactly `unit_partition_dims` (the env-unset schedule) at every W.
+    #[test]
+    fn uniform_costs_keep_the_count_partition() {
+        for (bps, m) in [
+            (vec![300, 400, 500, 700, 600, 100, 200], 6),
+            (vec![9, 8, 7, 6, 5], 3),
+            (vec![100, 1, 1, 1], 4),
+            (vec![30, 20, 10], 2),
+            (vec![5], 5),
+        ] {
+            let b = bins(&bps);
+            let costs = vec![vec![7u64; m]; bps.len()];
+            for w in 1..=6 {
+                let cp = cost_unit_partition(&b, &costs, w, HITS);
+                assert_eq!(cp.pick, CostPick::Count, "{bps:?} M={m} W={w}");
+                assert_eq!(
+                    cp.visits,
+                    unit_partition_dims(&b, m, w),
+                    "{bps:?} M={m} W={w}"
+                );
+            }
+        }
+    }
+
+    /// No information (all-zero costs), one worker, or no slots: count partition.
+    #[test]
+    fn degenerate_inputs_keep_the_count_partition() {
+        let b = bins(&[300, 200, 100]);
+        for (costs, m, w) in [
+            (vec![vec![0u64; 4]; 3], 4, 2),
+            (vec![vec![5u64, 1, 9, 2]; 3], 4, 1),
+            (vec![Vec::new(); 3], 0, 3),
+        ] {
+            let cp = cost_unit_partition(&b, &costs, w, BP);
+            assert_eq!(cp.pick, CostPick::Count);
+            assert_eq!(cp.visits, unit_partition_dims(&b, m, w));
+        }
+        assert_eq!(
+            cost_unit_partition(&[], &[], 4, BP).visits,
+            vec![Vec::<Visit>::new(); 4]
+        );
+    }
+
+    /// Property test over 6,000 seeded shapes (R <= 7, M <= 9, W <= 8, skewed
+    /// costs incl. zeros), at both shipped margins: exact cover, one visit per
+    /// (worker, bin), <= W-1 replicas, never above the count split under its own
+    /// model, the margin rule, and determinism.
+    #[test]
+    fn random_shapes_hold_the_invariants() {
+        let mut g = Lcg(0x5eed_cafe);
+        let mut switched = [0usize; 2];
+        for case in 0..6000 {
+            let r = 1 + (g.next() % 7) as usize;
+            let m = 1 + (g.next() % 9) as usize;
+            let w = 1 + (g.next() % 8) as usize;
+            let bps: Vec<u64> = (0..r).map(|_| 1 + g.next() % 1000).collect();
+            let skew = g.next() % 4;
+            let costs: Vec<Vec<u64>> = (0..r)
+                .map(|_| {
+                    (0..m)
+                        .map(|_| match skew {
+                            0 => g.next() % 3,
+                            1 => 1 + g.next() % 10,
+                            2 => {
+                                if g.next().is_multiple_of(5) {
+                                    1000 + g.next() % 1000
+                                } else {
+                                    g.next() % 20
+                                }
+                            }
+                            _ => 1 + g.next() % 1_000_000_000,
+                        })
+                        .collect()
+                })
+                .collect();
+            let b = bins(&bps);
+            let count = unit_partition_dims(&b, m, w);
+            for (k, margin) in [HITS, BP].into_iter().enumerate() {
+                let cp = cost_unit_partition(&b, &costs, w, margin);
+                check(r, m, w, &cp.visits);
+                assert_eq!(
+                    cp.count_makespan,
+                    modelled_makespan(&count, &costs),
+                    "case {case}"
+                );
+                // Never above the count split under its own model; the cost split
+                // only when it is >= margin% better.
+                assert!(
+                    modelled_makespan(&cp.visits, &costs) <= cp.count_makespan,
+                    "case {case}"
+                );
+                let better =
+                    cp.cost_makespan * (100 + u128::from(margin)) < cp.count_makespan * 100;
+                match cp.pick {
+                    CostPick::Count => {
+                        assert!(!better, "case {case} margin {margin}");
+                        assert_eq!(cp.visits, count, "case {case} margin {margin}");
+                    }
+                    CostPick::Cost => {
+                        assert!(better, "case {case} margin {margin}");
+                        assert_eq!(
+                            cp.cost_makespan,
+                            modelled_makespan(&cp.visits, &costs),
+                            "case {case}"
+                        );
+                        switched[k] += 1;
+                    }
+                }
+                assert_eq!(
+                    cp,
+                    cost_unit_partition(&b, &costs, w, margin),
+                    "case {case}: deterministic"
+                );
+            }
+        }
+        assert!(
+            switched[0] > 500 && switched[1] > 300 && switched[1] <= switched[0],
+            "the cost split is exercised ({switched:?} cases)"
+        );
+    }
+
+    /// A gain between the two margins: one 100-slot bin over 2 workers whose first
+    /// half costs 4% more per slot. The count split's 50/50 cut models ~1.9% heavier
+    /// than the balanced cut, so the exact-hits margin (1%) takes the cost split and
+    /// the bp margin (3%) keeps the count partition unchanged.
+    #[test]
+    fn the_margin_decides_small_gains() {
+        let b = bins(&[1_000_000]);
+        let costs = vec![
+            (0..100)
+                .map(|s| if s < 50 { 104 } else { 100 })
+                .collect::<Vec<u64>>(),
+        ];
+        let hits = cost_unit_partition(&b, &costs, 2, HITS);
+        assert_eq!(hits.pick, CostPick::Cost);
+        let gain = 1.0 - hits.cost_makespan as f64 / hits.count_makespan as f64;
+        assert!(gain > 0.01 && gain < 0.03, "modelled gain {gain}");
+        check(1, 100, 2, &hits.visits);
+        let bp = cost_unit_partition(&b, &costs, 2, BP);
+        assert_eq!(bp.pick, CostPick::Count);
+        assert_eq!(bp.visits, unit_partition_dims(&b, 100, 2));
+    }
+
+    fn toy_plan(ref_bp: &[u64], qry_bp: &[u64]) -> Plan {
+        let reference_bins = bins(ref_bp);
+        let query_bins = bins(qry_bp);
+        let mut units = Vec::new();
+        for r in &reference_bins {
+            for q in &query_bins {
+                units.push(WorkUnit {
+                    ordinal: units.len() as u32,
+                    reference_bin: r.id,
+                    query_bin: q.id,
+                });
+            }
+        }
+        Plan {
+            reference_bins,
+            query_bins,
+            units,
+        }
+    }
+
+    #[test]
+    fn hits_table_round_trips_and_rejects_other_plans() {
+        let p = toy_plan(&[100, 200], &[10, 20, 30]);
+        let ok = "0\t0\t100\t10\t5\n0\t1\t100\t20\t6\n0\t2\t100\t30\t7\n\
+                  1\t0\t200\t10\t8\n1\t1\t200\t20\t9\n1 2 200 30 0\n\n";
+        assert_eq!(
+            parse_unit_hits(ok, &p).unwrap(),
+            vec![vec![5, 6, 7], vec![8, 9, 0]]
+        );
+        let err = |text: &str| parse_unit_hits(text, &p).unwrap_err();
+        assert!(err(&ok.replace("1\t1\t200\t20\t9\n", "")).contains("no row for R1 Q1"));
+        assert!(err(&ok.replace("1\t1\t200\t20", "1\t0\t200\t10")).contains("appears twice"));
+        assert!(err(&ok.replace("0\t2\t100\t30", "0\t2\t100\t31")).contains("stale table"));
+        assert!(err(&ok.replace("1 2 200 30 0", "2 0 200 10 0")).contains("outside this 2x3 plan"));
+        assert!(err(&ok.replace("1 2 200 30 0", "1 2 200 30")).contains("expected 5 fields"));
+        assert!(err(&ok.replace("1 2 200 30 0", "1 2 200 30 x")).contains("expected 5 integers"));
     }
 }

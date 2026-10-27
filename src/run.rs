@@ -1567,6 +1567,130 @@ pub(crate) fn partition_policy(
     ))
 }
 
+/// `HSPZ_UNIT_COST`: how the unit partition weighs units.
+///
+/// Unset (or `bp`, the default since 2026-10-27) weighs a unit by reference bp x
+/// query bp, from the plan alone, and uses the cost split only when it models at
+/// least [`plan::COST_SPLIT_MARGIN_BP_PCT`]% lighter than the count split.
+/// `count` is the v0.0.4 count partition, unchanged. `hits:PATH` reads a
+/// `hspZ hits-estimate` table for this exact plan and weighs a unit by its seed
+/// hits plus [`plan::HITS_PER_QUERY_BP`] per query bp (margin
+/// [`plan::COST_SPLIT_MARGIN_HITS_PCT`]%). Only *which worker runs which unit*
+/// changes: units keep their ordinals and the emitter writes them in ordinal
+/// order, so output bytes do not depend on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnitCost {
+    Count,
+    Bp,
+    Hits(std::path::PathBuf),
+}
+
+impl UnitCost {
+    fn label(&self) -> String {
+        match self {
+            UnitCost::Count => "count".to_string(),
+            UnitCost::Bp => "bp".to_string(),
+            UnitCost::Hits(p) => format!("hits:{}", p.display()),
+        }
+    }
+
+    /// The modelled gain the cost split must clear for this cost source.
+    fn margin_pct(&self) -> u32 {
+        match self {
+            UnitCost::Hits(_) => plan::COST_SPLIT_MARGIN_HITS_PCT,
+            UnitCost::Count | UnitCost::Bp => plan::COST_SPLIT_MARGIN_BP_PCT,
+        }
+    }
+}
+
+/// Parses `HSPZ_UNIT_COST`; anything but unset, `count`, `bp` or `hits:PATH` is
+/// a startup error. Unset is `bp`. Pure over its input so the decision is
+/// unit-testable.
+pub(crate) fn unit_cost_policy(env: Option<&str>) -> Result<UnitCost, String> {
+    match env {
+        Some("count") => Ok(UnitCost::Count),
+        None | Some("bp") => Ok(UnitCost::Bp),
+        Some(v) => match v.strip_prefix("hits:") {
+            Some(path) if !path.is_empty() => Ok(UnitCost::Hits(path.into())),
+            _ => Err(format!(
+                "HSPZ_UNIT_COST must be unset, count, bp or hits:PATH, got {v:?}"
+            )),
+        },
+    }
+}
+
+/// Per-bin slot costs aligned with [`build_slot_lists`] (the coordinate the
+/// unit partition cuts in): reference bp x query-bin bp, or, with `hits`
+/// (single job, `hits[r][q]`), the unit's hits plus
+/// [`plan::HITS_PER_QUERY_BP`] per query bp.
+pub(crate) fn slot_costs(
+    reference_bins: &[plan::Bin],
+    jobs: &[BatchJob<'_>],
+    hits: Option<&[Vec<u64>]>,
+) -> Vec<Vec<u64>> {
+    build_slot_lists(reference_bins, jobs)
+        .iter()
+        .enumerate()
+        .map(|(r, entries)| {
+            entries
+                .iter()
+                .map(|e| {
+                    let qbp = jobs[e.job].plan.query_bins[e.unit.query_bin as usize].total_bp;
+                    match hits {
+                        Some(h) => h[e.unit.reference_bin as usize][e.unit.query_bin as usize]
+                            .saturating_add(qbp.saturating_mul(plan::HITS_PER_QUERY_BP)),
+                        None => reference_bins[r].total_bp.saturating_mul(qbp),
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// Slot costs for `cost` on the single-query path, or `None` for
+/// [`UnitCost::Count`] (the caller then runs [`plan::unit_partition`] exactly as
+/// before). A `hits:PATH` table that does not describe `plan` is an error.
+pub(crate) fn single_query_slot_costs(
+    cost: &UnitCost,
+    hits_table: Option<&str>,
+    plan: &plan::Plan,
+    qry_records: &[(String, Vec<u8>)],
+) -> Result<Option<Vec<Vec<u64>>>, String> {
+    let jobs = [BatchJob { plan, qry_records }];
+    match cost {
+        UnitCost::Count => Ok(None),
+        UnitCost::Bp => Ok(Some(slot_costs(&plan.reference_bins, &jobs, None))),
+        UnitCost::Hits(_) => {
+            let hits = plan::parse_unit_hits(hits_table.unwrap_or(""), plan)
+                .map_err(|e| format!("HSPZ_UNIT_COST={}: {e}", cost.label()))?;
+            Ok(Some(slot_costs(&plan.reference_bins, &jobs, Some(&hits))))
+        }
+    }
+}
+
+/// One stderr line recording what the cost model chose (printed only when
+/// `HSPZ_UNIT_COST` is set and the unit partition is active).
+fn note_unit_cost(cost: &UnitCost, cp: &plan::CostPartition) {
+    let share = |x: u128| {
+        if cp.total == 0 {
+            0.0
+        } else {
+            x as f64 / cp.total as f64
+        }
+    };
+    eprintln!(
+        "note: unit cost {}: busiest worker {:.4} of the modelled total with the count split, \
+         {:.4} with the cost split; using the {} split",
+        cost.label(),
+        share(cp.count_makespan),
+        share(cp.cost_makespan),
+        match cp.pick {
+            plan::CostPick::Count => "count",
+            plan::CostPick::Cost => "cost",
+        }
+    );
+}
+
 /// Whether to generate the query seed stream on the device (round 69).
 ///
 /// The trade reverses with GPU count. On one GPU the device seeder adds ~165 s of
@@ -2052,6 +2176,9 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // per-device profiles are known; until then the env value is just carried.
     let unit_env = std::env::var("HSPZ_UNIT_PARTITION").ok();
     partition_policy(unit_env.as_deref(), 1, &[])?;
+    // `HSPZ_UNIT_COST` is validated here too, so a bad value fails at startup.
+    let unit_cost_env = std::env::var("HSPZ_UNIT_COST").ok();
+    let unit_cost = unit_cost_policy(unit_cost_env.as_deref())?;
     // Round 95: `--index` replaces only the reference-table producer. It needs
     // the planner's bins, so the automatic layout (device-dependent) and the
     // GPU-free path both reject it up front.
@@ -2075,6 +2202,15 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     if args.query_list.is_some() {
         return run_batch(args, &mut phases, pre_main_ms, started);
     }
+    // A `hits:PATH` table is read now so a missing file fails before any input
+    // is loaded; it is checked against the plan once the plan exists.
+    let unit_hits_table = match &unit_cost {
+        UnitCost::Hits(p) => Some(
+            std::fs::read_to_string(p)
+                .map_err(|e| format!("HSPZ_UNIT_COST: cannot read {}: {e}", p.display()))?,
+        ),
+        _ => None,
+    };
 
     // Shared config, parsed once.
     let shape = Shape::parse(&args.seed)?;
@@ -2388,8 +2524,28 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     };
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
+    if !use_units && workers > 1 && unit_cost_env.is_some() && unit_cost != UnitCost::Count {
+        eprintln!(
+            "note: HSPZ_UNIT_COST={} has no effect: the whole-bin policy is in use",
+            unit_cost.label()
+        );
+    }
     let part: Vec<Vec<plan::Visit>> = if use_units {
-        plan::unit_partition(&plan, workers)
+        match single_query_slot_costs(&unit_cost, unit_hits_table.as_deref(), &plan, &qry_records)?
+        {
+            // Unset / `count`: the v0.0.4 call, unchanged.
+            None => plan::unit_partition(&plan, workers),
+            Some(costs) => {
+                let cp = plan::cost_unit_partition(
+                    &plan.reference_bins,
+                    &costs,
+                    workers,
+                    unit_cost.margin_pct(),
+                );
+                note_unit_cost(&unit_cost, &cp);
+                cp.visits
+            }
+        }
     } else {
         let q = plan.query_bins.len();
         plan::assign_bins(&plan.reference_bins, workers)
@@ -3350,6 +3506,16 @@ fn run_batch(
     // error before any input is read).
     let unit_env = std::env::var("HSPZ_UNIT_PARTITION").ok();
     partition_policy(unit_env.as_deref(), 1, &[])?;
+    // A hits-estimate table describes one plan; a batch has one per job.
+    let unit_cost_env = std::env::var("HSPZ_UNIT_COST").ok();
+    let unit_cost = unit_cost_policy(unit_cost_env.as_deref())?;
+    if let UnitCost::Hits(_) = unit_cost {
+        return Err(
+            "HSPZ_UNIT_COST=hits:PATH needs a single --query (a hits-estimate table \
+             describes one plan); use HSPZ_UNIT_COST=bp with --query-list"
+                .into(),
+        );
+    }
     let workers_req = args.gpus.max(1);
 
     // Resolve `--max-hits 0` ONCE for the whole batch (design: never from
@@ -3581,7 +3747,33 @@ fn run_batch(
     };
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
-    let part: Vec<Vec<plan::Visit>> = if use_units {
+    if !use_units && workers > 1 && unit_cost_env.is_some() && unit_cost != UnitCost::Count {
+        eprintln!(
+            "note: HSPZ_UNIT_COST={} has no effect: the whole-bin policy is in use",
+            unit_cost.label()
+        );
+    }
+    let part: Vec<Vec<plan::Visit>> = if use_units && unit_cost == UnitCost::Bp {
+        // Same slot coordinate as the executor's lists (job-list order, then
+        // each job's unit order), one reference bp x query-bin bp per slot.
+        let jobs: Vec<BatchJob<'_>> = plans
+            .iter()
+            .zip(&qry_records_list)
+            .map(|(p, recs)| BatchJob {
+                plan: p,
+                qry_records: recs,
+            })
+            .collect();
+        let costs = slot_costs(&plans[0].reference_bins, &jobs, None);
+        let cp = plan::cost_unit_partition(
+            &plans[0].reference_bins,
+            &costs,
+            workers,
+            unit_cost.margin_pct(),
+        );
+        note_unit_cost(&unit_cost, &cp);
+        cp.visits
+    } else if use_units {
         plan::unit_partition_dims(&plans[0].reference_bins, m_slots, workers)
     } else {
         plan::assign_bins(&plans[0].reference_bins, workers)
@@ -5786,5 +5978,121 @@ mod partition_policy_tests {
         let b = h.join().expect("waiter panicked");
         assert_eq!(a, b);
         assert!(a.is_ok());
+    }
+}
+
+/// `HSPZ_UNIT_COST`: parsing, the bp default, and slot costs in the executor's
+/// slot coordinate.
+#[cfg(test)]
+mod unit_cost_tests {
+    use super::{BatchJob, UnitCost, single_query_slot_costs, slot_costs, unit_cost_policy};
+    use crate::plan::{self, Bin, Plan, WorkUnit};
+
+    #[test]
+    fn unset_is_bp_and_count_restores_the_count_partition() {
+        assert_eq!(unit_cost_policy(None), Ok(UnitCost::Bp));
+        assert_eq!(unit_cost_policy(Some("count")), Ok(UnitCost::Count));
+        assert_eq!(unit_cost_policy(Some("bp")), Ok(UnitCost::Bp));
+        assert_eq!(UnitCost::Bp.margin_pct(), plan::COST_SPLIT_MARGIN_BP_PCT);
+        assert_eq!(
+            UnitCost::Hits("/tmp/h.tsv".into()).margin_pct(),
+            plan::COST_SPLIT_MARGIN_HITS_PCT
+        );
+        assert_eq!(
+            unit_cost_policy(Some("hits:/tmp/h.tsv")),
+            Ok(UnitCost::Hits("/tmp/h.tsv".into()))
+        );
+        for bad in ["", "BP", "hits", "hits:", "1", "bp "] {
+            assert_eq!(
+                unit_cost_policy(Some(bad)).unwrap_err(),
+                format!("HSPZ_UNIT_COST must be unset, count, bp or hits:PATH, got {bad:?}"),
+            );
+        }
+    }
+
+    fn bins(bps: &[u64]) -> Vec<Bin> {
+        bps.iter()
+            .enumerate()
+            .map(|(i, &bp)| Bin {
+                id: i as u32,
+                record_ids: vec![i as u32],
+                total_bp: bp,
+            })
+            .collect()
+    }
+
+    fn cartesian(ref_bp: &[u64], qry_bp: &[u64]) -> Plan {
+        let (reference_bins, query_bins) = (bins(ref_bp), bins(qry_bp));
+        let mut units = Vec::new();
+        for r in &reference_bins {
+            for q in &query_bins {
+                units.push(WorkUnit {
+                    ordinal: units.len() as u32,
+                    reference_bin: r.id,
+                    query_bin: q.id,
+                });
+            }
+        }
+        Plan {
+            reference_bins,
+            query_bins,
+            units,
+        }
+    }
+
+    /// Count gives no costs, so the caller's v0.0.4 `unit_partition` call runs
+    /// unchanged; bp and hits follow the slot lists (= query bins here).
+    #[test]
+    fn single_query_costs_follow_the_slot_lists() {
+        let p = cartesian(&[100, 200], &[10, 20, 30]);
+        let empty: Vec<(String, Vec<u8>)> = Vec::new();
+        assert_eq!(
+            single_query_slot_costs(&UnitCost::Count, None, &p, &empty),
+            Ok(None)
+        );
+        assert_eq!(
+            single_query_slot_costs(&UnitCost::Bp, None, &p, &empty),
+            Ok(Some(vec![vec![1000, 2000, 3000], vec![2000, 4000, 6000]]))
+        );
+        let table =
+            "0 0 100 10 5\n0 1 100 20 6\n0 2 100 30 7\n1 0 200 10 8\n1 1 200 20 9\n1 2 200 30 0\n";
+        let k = plan::HITS_PER_QUERY_BP;
+        assert_eq!(
+            single_query_slot_costs(&UnitCost::Hits("t".into()), Some(table), &p, &empty),
+            Ok(Some(vec![
+                vec![5 + 10 * k, 6 + 20 * k, 7 + 30 * k],
+                vec![8 + 10 * k, 9 + 20 * k, 30 * k],
+            ]))
+        );
+        let stale = table.replace("1 2 200 30 0", "1 2 200 31 0");
+        let err = single_query_slot_costs(&UnitCost::Hits("t".into()), Some(&stale), &p, &empty)
+            .unwrap_err();
+        assert!(
+            err.starts_with("HSPZ_UNIT_COST=hits:t: unit hits line 6"),
+            "{err}"
+        );
+    }
+
+    /// Batch: slot s of bin r is the s-th (job, unit) entry of that bin, job-list
+    /// order first, so the costs line up with `build_slot_lists`.
+    #[test]
+    fn batch_costs_are_job_major() {
+        let p0 = cartesian(&[100, 200], &[7]);
+        let p1 = cartesian(&[100, 200], &[3, 5]);
+        let empty: Vec<(String, Vec<u8>)> = Vec::new();
+        let jobs = [
+            BatchJob {
+                plan: &p0,
+                qry_records: &empty,
+            },
+            BatchJob {
+                plan: &p1,
+                qry_records: &empty,
+            },
+        ];
+        assert_eq!(
+            slot_costs(&p0.reference_bins, &jobs, None),
+            vec![vec![700, 300, 500], vec![1400, 600, 1000]]
+        );
     }
 }
