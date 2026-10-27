@@ -1,20 +1,33 @@
 import DocsLayout from "../../layouts/DocsLayout.astro"
 
-<DocsLayout title="GPUs and seeding" description="Work units are split across workers; output is replayed in deterministic work-unit order.">
+<DocsLayout title="GPUs and seeding" description="Work units are split across workers by estimated cost; output is replayed in deterministic work-unit order.">
 
 ## Worker model
 
-`--gpus W` creates up to W workers, and never more workers than the plan has
-reference bins: a plan with a single reference bin runs on one worker whatever
-`--gpus` says. When each worker has its own device and every device the run uses
+`--gpus W` creates up to W workers, and by default never more workers than the
+plan has reference bins: a plan with a single reference bin runs on one worker
+whatever `--gpus` says. `HSPZ_WORKER_CAP=units` (opt-in, see the knobs below)
+raises that limit to one worker per work unit under the unit partition, so
+several GPUs can share a reference bin, each running its own slice of the bin's
+query units and building its own copy of the bin. When each worker has its own device and every device the run uses
 is the same class (equal SM count and L2, nominal clocks within 10%), the frozen
-plan's work units are split across the workers by count quotas: whole reference
-bins first, then contiguous query slices of as few bins as possible, at the
-price of one extra reference build per split bin. Otherwise each worker owns
-complete reference bins, assigned by deterministic longest-processing-time
-scheduling, and runs every query bin against them. `HSPZ_UNIT_PARTITION=0|1`
-forces either policy (see the knobs below). More workers than devices time-slice
-a device and are a correctness configuration, not a speed configuration.
+plan's work units are split across the workers by estimated cost. Each unit is
+weighted by its reference bin's length times its query bin's length; whole
+reference bins go to the least-loaded worker while they fit within its share,
+and the remaining bins form one stream of query slices, cut so that the busiest
+worker carries as little as possible, at the price of at most one extra
+reference build per extra worker. This cost split is used only when it models at
+least 3% lighter than the count quotas of 0.0.4 (whole bins first, then
+contiguous query slices of equal unit counts); otherwise those count quotas run
+unchanged. Units of very different sizes, such as 1.7 Gbp axolotl chromosomes
+next to small scaffolds, are where count quotas fail: on two A100s an
+8-record axolotl query against xenTro9 fell from 1,469 s to 1,107 s
+(−24.7%). Otherwise each worker owns complete reference bins, assigned by
+deterministic longest-processing-time scheduling, and runs every query bin
+against them. `HSPZ_UNIT_PARTITION=0|1` forces either policy and
+`HSPZ_UNIT_COST` chooses the weights (see the knobs below). More workers than
+devices time-slice a device and are a correctness configuration, not a speed
+configuration.
 
 Every GPU run prints `schedule:` lines with the chosen policy, the reason for it and
 each worker's visits, written `R<bin>[<first>..<end>)` for a reference bin and
@@ -41,19 +54,23 @@ HSPZ_DEVICE_SEEDS=0 hspZ run ...  # force CPU
 HSPZ_DEVICE_SEEDS=1 hspZ run ...  # force device
 ```
 
-## Runtime tuning knobs (0.0.4)
+## Runtime tuning knobs (0.0.5)
 
 Every knob is exact: every mode produces the same HSP set and the same bytes.
-An unrecognised value of `HSPZ_REF_BUCKETS`, `HSPZ_REF_BUCKET_SHIFT` or
-`HSPZ_UNIT_PARTITION` is an error; `HSPZ_CHUNK_WALK` and `HSPZ_DEVICE_SEEDS`
-ignore values they do not know.
+An unrecognised value of `HSPZ_REF_BUCKETS`, `HSPZ_REF_BUCKET_SHIFT`,
+`HSPZ_UNIT_PARTITION`, `HSPZ_UNIT_COST` or `HSPZ_WORKER_CAP` is an error; `HSPZ_CHUNK_WALK` and
+`HSPZ_DEVICE_SEEDS` ignore values they do not know, and a non-integer
+`HSPZ_FIND_HITS_WARP_MIN_DENSITY` is ignored with a warning.
 
 | variable | default | what it does |
 | --- | --- | --- |
 | `HSPZ_REF_BUCKETS=auto\|1\|0` | `auto` | Reference-locality bucketing before the score gate. It wins where lower DRAM traffic lets a power-capped GPU raise its clock (L4: −6.5% whole-genome wall) and loses where the card already runs near its boost clock (RTX 4090: +3.7%). `auto` measures both paths per engine in blocks of ≥3 s, discards each block's first second, and after six blocks keeps bucketing only if it was at least 3% faster (median of the three off/on pairs) — about 20 s of gate time per engine. Shorter engines, for example 5 Mbp queries run as separate processes, stay on the off path, so set `HSPZ_REF_BUCKETS=1` on L4-class cards for those. `--time` prints the blocks and the decision. Cards whose L2 cannot hold the smallest window (T4) stay off. |
 | `HSPZ_REF_BUCKET_SHIFT=<16..31>` | derived from L2 | Pins the bucket window to 2^shift bytes and turns bucketing on (`HSPZ_REF_BUCKETS=0` still wins). A shift that would need more than 32 buckets for a reference bin is an error. |
 | `HSPZ_CHUNK_WALK=full` | sparse | Restores the pre-0.0.4 chunk walk that copied the whole cumulative hit array for every seed batch above `--max-hits` (rollback only). |
-| `HSPZ_UNIT_PARTITION=0\|1` | unset (auto) | Splits the frozen plan's work units across workers by count quotas when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. `0` forces whole-bin ownership and `1` forces the partition; any other value, including `auto`, is an error. −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. Other worker counts and device classes are unmeasured; compare with `HSPZ_UNIT_PARTITION=0`. |
+| `HSPZ_UNIT_PARTITION=0\|1` | unset (auto) | Splits the frozen plan's work units across workers (weighted as `HSPZ_UNIT_COST` says) when every device the run uses is the same class and each worker has its own device (W=1, time-sliced workers and mixed classes keep whole-bin ownership); output is unchanged. `0` forces whole-bin ownership and `1` forces the partition; any other value, including `auto`, is an error. With the 0.0.4 count quotas: −11.9% seed-and-filter wall on 2× RTX 4090 (1,400 → 1,233 s) and −5.1% on 4× RTX 4090 (718 → 681 s) at `MAX_HITS=16,711,680`. Other worker counts and device classes are unmeasured; compare with `HSPZ_UNIT_PARTITION=0`. |
+| `HSPZ_UNIT_COST=bp\|count\|hits:PATH` | `bp` | How the partition weighs work units. `bp` (reference bin bp × query bin bp, from the plan alone) uses the cost split when it models at least 3% lighter than the count quotas; `count` restores the 0.0.4 count quotas exactly; `hits:PATH` weighs units by a `hspZ hits-estimate` table of this exact plan (its seed hits plus 6 per query bp, 1% margin; a table for another plan is an error, and batch mode rejects it). The `note: unit cost …` line reports both modelled splits and the choice. On two A100 80GB: an axolotl query of 4 chromosomes + 4 scaffolds against xenTro9 (3×8 units) 1,469 → 1,107 s (−24.7%), HLmyoMyo6 × HLmyoDau2 at 50% (3×3) 482 → 400 s (−17.1%); a balanced plan (danRer11 × oryLat2, 3×2) keeps the count split. |
+| `HSPZ_WORKER_CAP=bins\|units` | `bins` | How many workers a run may start. `bins` allows at most one per reference bin; `units` allows up to one per work unit when the unit partition is in use (whole-bin ownership keeps one per bin and says so), so GPUs beyond the bin count are no longer idle. Each extra worker on a bin builds its own copy of the bin (a few seconds, hidden by prefetch when it fits) and needs its own host buffers; output is unchanged. Opt-in because it is measured on two GPUs only: on two A100s one 446 Mbp reference bin × eight axolotl query bins ran on both GPUs instead of one, 515 → 268 s (−48%). A replay of 34 measured A100 runs gives −5% / −19% / −30% total wall at 4 / 6 / 8 GPUs for about 13% more GPU-hours at 8; compare with the default on your machine before relying on it. Any other value is an error. |
+| `HSPZ_FIND_HITS_WARP_MIN_DENSITY=<n>` | 8 | Mean hits per seed from which a `find_hits` launch walks each seed with one warp instead of one thread (16 before 0.0.5; `0` sends every launch to the warp kernel). For controlled measurements; see [the algorithm notes](/hspZ/docs/algorithm/hit-discovery/). |
 
 ## Many queries against one reference
 
@@ -81,9 +98,10 @@ remain). `--query-list` belongs to `run`; `benchmark` and `--cpu-only` reject
 it.
 
 With `--gpus W` above one, the whole batch's work units are spread over the
-workers by the same count partition a single query uses (`HSPZ_UNIT_PARTITION`
-still decides the policy), and the receiver reorders each job's results, so the
-per-job output is unchanged. On two RTX 4090s, 100 queries of 5 Mbp against hg38
+workers by the same partition a single query uses (`HSPZ_UNIT_PARTITION` still
+decides the policy, and the default `bp` weights apply; `hits:PATH` is for
+single queries), and the receiver reorders each job's results, so the per-job
+output is unchanged. On two RTX 4090s, 100 queries of 5 Mbp against hg38
 finish in 255 s at `--gpus 2` against 497 s at `--gpus 1`; on one L4 the same
 list takes 1,890–1,900 s batched against 10,400–11,600 s as separate runs. Both
 arms of each comparison ran the same pinned settings (device seeder; bucketing on
@@ -198,8 +216,8 @@ flags, as long as `run` does not shrink the plan to fit the device (`-B 0`
 resolves to the default layout, as `run` does on one GPU; to preview an automatic
 layout, pass the `--seq-block-size` and `--query-block-size` its `layout:` line
 printed), and its counts equal the `hits` column of the `--time` unit ledger; GPU time per unit
-tracks that count (about 0.37 ns per hit on an RTX 4090). `--stride N` counts
-every N-th query window and scales by N, an approximation. `run` never calls
-it.
+tracks that count (about 0.37 ns per hit on an RTX 4090, 0.54 on an A100 80GB PCIe). `--stride N`
+counts every N-th query window and scales by N, an approximation. `run` never calls it; to weigh a
+multi-GPU split by these exact counts, pass the table to `run` as `HSPZ_UNIT_COST=hits:PATH`.
 
 </DocsLayout>

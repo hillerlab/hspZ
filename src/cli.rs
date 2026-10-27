@@ -182,12 +182,17 @@ pub(crate) struct RunArgs {
     /// The planner will not shrink bins or the hit cap.
     #[arg(long)]
     pub(crate) from_manifest: Option<PathBuf>,
-    /// GPUs to run on. With one worker per device and every device the same
-    /// class (SM count, L2, clocks within 10%), the plan's work units are split
-    /// across workers by count quotas; otherwise each worker owns whole
-    /// reference bins by deterministic LPT (`HSPZ_UNIT_PARTITION=0|1` forces
-    /// either). Output follows `WorkUnit.ordinal`, so it does not depend on which
-    /// GPU finished first. More workers than devices time-slices one GPU: a
+    /// GPUs to run on; at most one worker per reference bin (per work unit with
+    /// `HSPZ_WORKER_CAP=units`, unit partition only). With one worker per device
+    /// and every device the same class (SM count, L2, clocks within 10%),
+    /// the plan's work units are split across workers by estimated cost
+    /// (reference bp x query bp per unit), falling back to count quotas unless
+    /// that models at least 3% lighter (`HSPZ_UNIT_COST=count` forces count
+    /// quotas, `hits:PATH` weighs units by a `hits-estimate` table); otherwise
+    /// each worker owns whole reference bins by deterministic LPT
+    /// (`HSPZ_UNIT_PARTITION=0|1` forces either). Output follows
+    /// `WorkUnit.ordinal`, so it depends neither on the split nor on which GPU
+    /// finished first. More workers than devices time-slices one GPU: a
     /// correctness configuration, not a performance one. Batch mode
     /// (`--query-list`) uses the same policy over `(job, unit)` slots.
     #[arg(short = 'G', long, default_value_t = 1)]

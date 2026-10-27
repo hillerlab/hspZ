@@ -47,13 +47,42 @@ use std::time::{Duration, Instant};
 
 /// `seed_filter.cu: MAX_HITS_PER_GB`.
 const MAX_HITS_PER_GB: u64 = 4_194_304;
-/// Fixed before round-82 timing. Sparse launches keep the shipped mapping.
-const FIND_HITS_WARP_MIN_DENSITY: u64 = 16;
+/// Mean hits per seed at which a `find_hits` launch moves from one thread per
+/// seed to one warp per seed: 8 since 2026-10-27 (16 from round 82). On A100s the
+/// warp kernel loses below ~8 hits/seed (hg38 chr21 x mm39 at 2.3: +174% kernel
+/// time; chr13 at 6.6: +19%) and wins above it (chr7 at 9.4: -16%; chr1 at 12.9:
+/// -35%). At 16 the thread kernel also took skewed launches whose mean sits under
+/// 16 while most hits live in long seeds: an Ascaphus scaffold bin x an axolotl
+/// chromosome (mean 14.5, median 8, max 88,589) ran -82% kernel time and -37%
+/// unit wall on the warp kernel, output identical.
+const FIND_HITS_WARP_MIN_DENSITY: u64 = 8;
+
+/// The cutoff in effect: `HSPZ_FIND_HITS_WARP_MIN_DENSITY` when set (a benchmark
+/// override; `0` sends every launch to the warp kernel), else the shipped 8.
+/// Read once; the note on stderr records an override in the run's report.
+fn warp_min_density() -> u64 {
+    static CUTOFF: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CUTOFF.get_or_init(|| match std::env::var("HSPZ_FIND_HITS_WARP_MIN_DENSITY") {
+        Err(_) => FIND_HITS_WARP_MIN_DENSITY,
+        Ok(v) => match v.trim().parse::<u64>() {
+            Ok(n) => {
+                eprintln!("note: find_hits warp cutoff {n} hits/seed (HSPZ_FIND_HITS_WARP_MIN_DENSITY)");
+                n
+            }
+            Err(_) => {
+                eprintln!(
+                    "warning: HSPZ_FIND_HITS_WARP_MIN_DENSITY={v:?} is not an integer; using {FIND_HITS_WARP_MIN_DENSITY}"
+                );
+                FIND_HITS_WARP_MIN_DENSITY
+            }
+        },
+    })
+}
 
 #[inline]
 fn use_warp_find_hits(num_hits: u32, num_seeds: u32) -> bool {
     cfg!(feature = "find-hits-warp")
-        && u64::from(num_hits) >= FIND_HITS_WARP_MIN_DENSITY * u64::from(num_seeds)
+        && u64::from(num_hits) >= warp_min_density() * u64::from(num_seeds)
 }
 
 /// Least `total` the score gate keeps at `hspthresh` (`gate-int-keep`).
@@ -4534,11 +4563,11 @@ mod tests {
 
     #[cfg(feature = "find-hits-warp")]
     #[test]
-    fn warp_find_hits_cutoff_is_fixed_at_sixteen_hits_per_seed() {
-        assert!(!use_warp_find_hits(15, 1));
-        assert!(use_warp_find_hits(16, 1));
-        assert!(!use_warp_find_hits(159, 10));
-        assert!(use_warp_find_hits(160, 10));
+    fn warp_find_hits_cutoff_is_eight_hits_per_seed() {
+        assert!(!use_warp_find_hits(7, 1));
+        assert!(use_warp_find_hits(8, 1));
+        assert!(!use_warp_find_hits(79, 10));
+        assert!(use_warp_find_hits(80, 10));
     }
 
     /// `gate-int-keep`: `total >= keep_threshold(h)` is the gate's f32-rounded
