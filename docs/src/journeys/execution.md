@@ -2,6 +2,8 @@
 
 <!-- @source: src/plan.rs::assign_bins -->
 <!-- @source: src/plan.rs::unit_partition -->
+<!-- @source: src/plan.rs::cost_unit_partition -->
+<!-- @source: src/run.rs::unit_cost_policy -->
 <!-- @source: src/run.rs::partition_policy -->
 <!-- @source: src/run.rs::run_bins -->
 <!-- @source: src/run.rs::seed_and_filter_all -->
@@ -11,7 +13,7 @@
 ## H.1 — Assign whole bins or unit slices
 <!-- @id: h-assign -->
 WHAT GOES IN: Planned reference bins and work units, the worker count, and the class of every device the run uses.
-WHAT HAPPENS: On matching dedicated devices, count quotas give each worker whole bins first, then contiguous query slices; otherwise the longest bins go to the currently lightest worker. Ties break deterministically.
+WHAT HAPPENS: On matching dedicated devices, each unit is weighted by reference bp × query bp; whole bins go to the least-loaded worker while they fit its share, and one stream of query slices is cut so the busiest worker is as light as possible. Unless that models at least 3% lighter, the count quotas run instead (whole bins first, then contiguous query slices of equal unit counts). Otherwise the longest bins go to the currently lightest worker. Ties break deterministically.
 WHAT COMES OUT: One ordered list of visits per worker, each a reference bin and a slice of its query bins.
 INVARIANT: Every WorkUnit has exactly one owner; a bin split across workers costs an extra reference build, never a different unit.
 

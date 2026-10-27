@@ -7,6 +7,7 @@
 <!-- @source: src/gpu/mod.rs::exclusive_scan_hit_totals -->
 <!-- @source: src/gpu/kernels.rs::find_hits_dense -->
 <!-- @source: src/gpu/kernels.rs::find_hits_dense_warp -->
+<!-- @source: src/gpu/mod.rs::use_warp_find_hits -->
 
 ## C.1 — Count each seed's reference occurrences
 <!-- @id: c-count-hits -->
@@ -67,7 +68,7 @@ sequenceDiagram
 ## C.4 — Choose sparse or dense expansion
 <!-- @id: c-mapping -->
 WHAT GOES IN: One chunk's seed count and hit count.
-WHAT HAPPENS: Sparse launches assign one thread per seed; at 16 or more hits per seed, one warp walks a seed bucket coalescently.
+WHAT HAPPENS: Sparse launches assign one thread per seed; at 8 or more hits per seed (16 before 0.0.5), one warp walks a seed bucket coalescently.
 WHAT COMES OUT: The same packed anchors under either execution mapping.
 INVARIANT: Mapping changes memory traffic, not prefix-derived destinations.
 
