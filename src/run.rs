@@ -1668,6 +1668,43 @@ pub(crate) fn single_query_slot_costs(
     }
 }
 
+/// `HSPZ_WORKER_CAP`: how many workers a multi-GPU run may start (opt-in, 2026-10-27).
+///
+/// Unset (or `bins`) keeps at most one worker per reference bin, as before.
+/// `units` allows up to one worker per work unit, so several workers can share a
+/// reference bin, each running its own slice of the bin's query units and each
+/// building its own copy of the bin. It takes effect only under the unit
+/// partition; whole-bin ownership cannot use more workers than bins. Output does
+/// not depend on it: units keep their ordinals and are emitted in ordinal order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkerCap {
+    Bins,
+    Units,
+}
+
+/// Parses `HSPZ_WORKER_CAP`; anything but unset, `bins` or `units` is a startup
+/// error.
+pub(crate) fn worker_cap_policy(env: Option<&str>) -> Result<WorkerCap, String> {
+    match env {
+        None | Some("bins") => Ok(WorkerCap::Bins),
+        Some("units") => Ok(WorkerCap::Units),
+        Some(v) => Err(format!(
+            "HSPZ_WORKER_CAP must be unset, bins or units, got {v:?}"
+        )),
+    }
+}
+
+/// Workers for `gpus` requested over `bins` reference bins and `units` work
+/// units: `min(gpus, bins)` under [`WorkerCap::Bins`], `min(gpus, units)` under
+/// [`WorkerCap::Units`]; always at least 1.
+pub(crate) fn capped_workers(gpus: usize, bins: usize, units: usize, cap: WorkerCap) -> usize {
+    let limit = match cap {
+        WorkerCap::Bins => bins,
+        WorkerCap::Units => units.max(bins),
+    };
+    gpus.max(1).min(limit.max(1))
+}
+
 /// One stderr line recording what the cost model chose (printed only when
 /// `HSPZ_UNIT_COST` is set and the unit partition is active).
 fn note_unit_cost(cost: &UnitCost, cp: &plan::CostPartition) {
@@ -2179,6 +2216,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // `HSPZ_UNIT_COST` is validated here too, so a bad value fails at startup.
     let unit_cost_env = std::env::var("HSPZ_UNIT_COST").ok();
     let unit_cost = unit_cost_policy(unit_cost_env.as_deref())?;
+    let worker_cap = worker_cap_policy(std::env::var("HSPZ_WORKER_CAP").ok().as_deref())?;
     // Round 95: `--index` replaces only the reference-table producer. It needs
     // the planner's bins, so the automatic layout (device-dependent) and the
     // GPU-free path both reject it up front.
@@ -2318,7 +2356,11 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let free = crate::gpu::min_free_bytes(probe)?;
     // `min(gpus, n_records)` overcharges when the plan has fewer bins than records;
     // tighten it only if that is ever measured to reject a run that would have fit.
-    let workers_upper = args.gpus.max(1).min(ref_meta.len().max(1));
+    // HSPZ_WORKER_CAP=units may start up to `--gpus` workers, so the budget assumes that many.
+    let workers_upper = match worker_cap {
+        WorkerCap::Bins => args.gpus.max(1).min(ref_meta.len().max(1)),
+        WorkerCap::Units => args.gpus.max(1),
+    };
     let budget = plan::worker_device_budget(free, workers_upper, devices);
     // `-B 0` is the automatic layout, resolved here before planning. It needs
     // LPT bins, so `--kegalign-bins` (sequential fill) is rejected in every
@@ -2510,7 +2552,13 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // monotone in the bin's own bp — LPT on `total_bp` is the same schedule with
     // less arithmetic (plan::assign_bins). W = 1 always takes today's path.
     let devices = crate::gpu::device_count().max(1);
-    let workers = args.gpus.max(1).min(plan.reference_bins.len().max(1));
+    let bin_workers = capped_workers(args.gpus, plan.reference_bins.len(), 0, WorkerCap::Bins);
+    let mut workers = capped_workers(
+        args.gpus,
+        plan.reference_bins.len(),
+        plan.units.len(),
+        worker_cap,
+    );
     // Round 90b: query each device the run will use (worker `w` maps to
     // `w % devices`, so the used ordinals are `0..min(workers, devices)`) once,
     // before any worker spawns. Only auto needs the profiles; a forced value
@@ -2524,6 +2572,18 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     };
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
+    if !use_units && workers > bin_workers {
+        eprintln!(
+            "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
+             ({bin_workers} worker(s), one per reference bin)"
+        );
+        workers = bin_workers;
+    } else if workers > bin_workers {
+        eprintln!(
+            "note: HSPZ_WORKER_CAP=units: {workers} workers over {} reference bins",
+            plan.reference_bins.len()
+        );
+    }
     if !use_units && workers > 1 && unit_cost_env.is_some() && unit_cost != UnitCost::Count {
         eprintln!(
             "note: HSPZ_UNIT_COST={} has no effect: the whole-bin policy is in use",
@@ -3509,6 +3569,7 @@ fn run_batch(
     // A hits-estimate table describes one plan; a batch has one per job.
     let unit_cost_env = std::env::var("HSPZ_UNIT_COST").ok();
     let unit_cost = unit_cost_policy(unit_cost_env.as_deref())?;
+    let worker_cap = worker_cap_policy(std::env::var("HSPZ_WORKER_CAP").ok().as_deref())?;
     if let UnitCost::Hits(_) = unit_cost {
         return Err(
             "HSPZ_UNIT_COST=hits:PATH needs a single --query (a hits-estimate table \
@@ -3609,7 +3670,10 @@ fn run_batch(
     // insufficient capacity, which never lowers the semantic cap).
     let exec_probe = workers_req.min(devices);
     let exec_free = crate::gpu::min_free_bytes(exec_probe)?;
-    let exec_upper = workers_req.min(ref_meta.len().max(1));
+    let exec_upper = match worker_cap {
+        WorkerCap::Bins => workers_req.min(ref_meta.len().max(1)),
+        WorkerCap::Units => workers_req,
+    };
     let exec_budget = plan::worker_device_budget(exec_free, exec_upper, devices);
     for (j, (p, path)) in plans.iter().zip(&job_paths).enumerate() {
         let meta = record_meta(&qry_records_list[j]);
@@ -3733,7 +3797,8 @@ fn run_batch(
     let total_units: usize = plans.iter().map(|p| p.units.len()).sum();
     let r_bins = plans[0].reference_bins.len();
     debug_assert_eq!(total_units, r_bins.saturating_mul(m_slots));
-    let workers = workers_req.min(r_bins.max(1));
+    let bin_workers = capped_workers(workers_req, r_bins, 0, WorkerCap::Bins);
+    let mut workers = capped_workers(workers_req, r_bins, total_units, worker_cap);
     // Round 90b: query each device the run will use once, before any worker
     // spawns — the same `partition_policy` / `HSPZ_UNIT_PARTITION` decision
     // as single queries (auto on matching dedicated devices, whole-bin
@@ -3747,6 +3812,15 @@ fn run_batch(
     };
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
+    if !use_units && workers > bin_workers {
+        eprintln!(
+            "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
+             ({bin_workers} worker(s), one per reference bin)"
+        );
+        workers = bin_workers;
+    } else if workers > bin_workers {
+        eprintln!("note: HSPZ_WORKER_CAP=units: {workers} workers over {r_bins} reference bins");
+    }
     if !use_units && workers > 1 && unit_cost_env.is_some() && unit_cost != UnitCost::Count {
         eprintln!(
             "note: HSPZ_UNIT_COST={} has no effect: the whole-bin policy is in use",
@@ -5985,8 +6059,45 @@ mod partition_policy_tests {
 /// slot coordinate.
 #[cfg(test)]
 mod unit_cost_tests {
-    use super::{BatchJob, UnitCost, single_query_slot_costs, slot_costs, unit_cost_policy};
+    use super::{
+        BatchJob, UnitCost, WorkerCap, capped_workers, single_query_slot_costs, slot_costs,
+        unit_cost_policy, worker_cap_policy,
+    };
     use crate::plan::{self, Bin, Plan, WorkUnit};
+
+    #[test]
+    fn worker_cap_parses_and_defaults_to_bins() {
+        assert_eq!(worker_cap_policy(None), Ok(WorkerCap::Bins));
+        assert_eq!(worker_cap_policy(Some("bins")), Ok(WorkerCap::Bins));
+        assert_eq!(worker_cap_policy(Some("units")), Ok(WorkerCap::Units));
+        for bad in ["", "Units", "unit", "1", "units "] {
+            assert_eq!(
+                worker_cap_policy(Some(bad)).unwrap_err(),
+                format!("HSPZ_WORKER_CAP must be unset, bins or units, got {bad:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn capped_workers_follow_the_cap() {
+        // (gpus, bins, units) -> (bins cap, units cap)
+        for (gpus, bins, units, by_bins, by_units) in [
+            (8, 3, 177, 3, 8),
+            (8, 2, 6, 2, 6),
+            (2, 1, 8, 1, 2),
+            (4, 7, 42, 4, 4),
+            (8, 2, 2, 2, 2),
+            (1, 5, 25, 1, 1),
+            (0, 3, 9, 1, 1),
+            (3, 0, 0, 1, 1),
+        ] {
+            assert_eq!(capped_workers(gpus, bins, units, WorkerCap::Bins), by_bins);
+            assert_eq!(
+                capped_workers(gpus, bins, units, WorkerCap::Units),
+                by_units
+            );
+        }
+    }
 
     #[test]
     fn unset_is_bp_and_count_restores_the_count_partition() {

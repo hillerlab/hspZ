@@ -182,8 +182,9 @@ pub(crate) struct RunArgs {
     /// The planner will not shrink bins or the hit cap.
     #[arg(long)]
     pub(crate) from_manifest: Option<PathBuf>,
-    /// GPUs to run on; at most one worker per reference bin. With one worker per
-    /// device and every device the same class (SM count, L2, clocks within 10%),
+    /// GPUs to run on; at most one worker per reference bin (per work unit with
+    /// `HSPZ_WORKER_CAP=units`, unit partition only). With one worker per device
+    /// and every device the same class (SM count, L2, clocks within 10%),
     /// the plan's work units are split across workers by estimated cost
     /// (reference bp x query bp per unit), falling back to count quotas unless
     /// that models at least 3% lighter (`HSPZ_UNIT_COST=count` forces count
