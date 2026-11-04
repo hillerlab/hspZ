@@ -2207,6 +2207,9 @@ fn run_bins(
 // run
 
 pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallible<Stats> {
+    if args.paired {
+        return crate::paired::run(args, pre_main_ms, started);
+    }
     // Round 90b gate, read once here and validated before the `--cpu-only`
     // branch returns (a bad value is a startup error there too). The auto arm
     // is resolved with the other scheduling decisions below, where W and the
@@ -4547,7 +4550,7 @@ pub(crate) fn resolve_threads(requested: usize) -> usize {
     std::thread::available_parallelism().map_or(1, |n| n.get())
 }
 
-fn report_counts(stats: &Stats) {
+pub(crate) fn report_counts(stats: &Stats) {
     eprintln!("#seeds: {}", stats.seeds);
     eprintln!("#seed hits: {}", stats.seed_hits);
     eprintln!("#raw HSPs: {}", stats.raw_hsps);

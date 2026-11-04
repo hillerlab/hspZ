@@ -46,6 +46,7 @@ pub(crate) enum Command {
             .required(true)
             .help(None)
             .long_help(None)),
+        mut_arg("paired", |a| a.hide(true)),
         mut_arg("index", |a| a
             .help("Load per-bin reference tables from an on-disk index written by `hspZ index` \
                 instead of rebuilding them. The run still parses the reference and plans as \
@@ -82,6 +83,13 @@ pub(crate) struct RunArgs {
     /// partial per-job outputs (and a truncated `-Z` archive) may remain on disk.
     #[arg(long, conflicts_with = "query")]
     pub(crate) query_list: Option<PathBuf>,
+    /// Compare record i of `-r` only with record i of `-q` (same names, same
+    /// order), plus strand only (`-S plus`, `--step 1`), and write
+    /// `OUT/paired.segments`: for each pair, exactly the bytes a standalone
+    /// `run -S plus` of its two records writes, concatenated in pair order.
+    /// Built for many small independent region pairs (chain gap filling).
+    #[arg(long)]
+    pub(crate) paired: bool,
     /// Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into.
     #[arg(short, long, default_value = ".")]
     pub(crate) output: PathBuf,

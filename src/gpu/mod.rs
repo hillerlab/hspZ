@@ -126,6 +126,20 @@ pub struct FilterOutput {
     /// Entropy-accepted raw HSPs classified by source-seed multiplicity for the
     /// env-gated AL3/AM1 diagnostic. Empty on the production path.
     pub audit: Vec<crate::census::AcceptedHsp>,
+    /// `--paired` only: this call held more than one pair and its hits exceed
+    /// `max_hits`, so it stopped before `find_hits` and produced nothing. The
+    /// driver re-issues it one pair per call (`paired.rs`). Always `false`
+    /// elsewhere.
+    pub oversized: bool,
+}
+
+/// `--paired` only: the device copy of each pair's bounds in the packed batch.
+/// Seed `j` belongs to pair `p = upper_bound(q_start, j) - 1`, and its hits are
+/// the reference positions in `[t_lo[p], t_hi[p])`.
+struct PairedBounds {
+    q_start: DeviceBuffer<u32>,
+    t_lo: DeviceBuffer<u32>,
+    t_hi: DeviceBuffer<u32>,
 }
 
 /// Hits-per-seed distribution for one chunk.
@@ -905,6 +919,15 @@ pub struct Engine {
     hsp_blocks: u32,
     /// Keep the pre-dedup anchors in [`FilterOutput::raw`].
     pub dump_raw: bool,
+    /// `--paired` bounds (see [`set_pairs`](Self::set_pairs)). `None` on every
+    /// other path, which therefore launches exactly the kernels it always did.
+    paired: Option<PairedBounds>,
+    /// `--paired`: set by the driver before each call — whether this call's
+    /// seeds span more than one pair, the only case that may stop as
+    /// [`FilterOutput::oversized`].
+    pub paired_multi: bool,
+    /// `--paired`: each seed's first in-pair position within its bucket.
+    buf_seed_lo: DeviceBuffer<u32>,
     /// Accumulate the hits-per-seed distribution.
     pub collect_hit_stats: bool,
     /// S0 survivor audit (`HSPZ_ANCHOR_CENSUS`). Off the timed path; folds into
@@ -1882,6 +1905,9 @@ impl Engine {
             timing: cfg.timing,
             hsp_blocks,
             dump_raw: false,
+            paired: None,
+            paired_multi: false,
+            buf_seed_lo: unsafe { uninitialized(&stream, 0)? },
             collect_hit_stats: false,
             census: crate::census::SurvivorAudit::enabled()
                 .then(crate::census::SurvivorAudit::default),
@@ -1973,6 +1999,24 @@ impl Engine {
         engine.copy_stream.synchronize()?;
         phases.add("upload ref/query/tables", t.elapsed());
         Ok(engine)
+    }
+
+    /// `--paired`: uploads each pair's packed bounds and switches this engine to
+    /// the pair-restricted hit kernels. `q_start` must be ascending; pair `p`
+    /// owns query positions from `q_start[p]` and reference positions
+    /// `[t_lo[p], t_hi[p])`.
+    pub fn set_pairs(
+        &mut self,
+        q_start: &[u32],
+        t_lo: &[u32],
+        t_hi: &[u32],
+    ) -> Result<(), DriverError> {
+        self.paired = Some(PairedBounds {
+            q_start: DeviceBuffer::from_host(&self.stream, q_start)?,
+            t_lo: DeviceBuffer::from_host(&self.stream, t_lo)?,
+            t_hi: DeviceBuffer::from_host(&self.stream, t_hi)?,
+        });
+        Ok(())
     }
 
     /// Replaces only the query-side device state, keeping this reference bin's
@@ -2450,17 +2494,45 @@ impl Engine {
         }
 
         let stage = self.stage();
-        // SAFETY: grid-stride kernel; `index_table` covers every seed value and
-        // `d_hit_num` has one slot per seed.
-        unsafe {
-            self.module.find_num_hits(
-                &self.stream,
-                elementwise(),
-                num_seeds,
-                &self.index_table,
-                &self.seed_slots[slot],
-                &mut self.buf_hit_num,
-            )?;
+        if let Some(p) = &self.paired {
+            // `--paired`: count only the bucket positions inside the seed's own
+            // pair, and keep where that slice starts for `find_hits_dense_paired`.
+            // SAFETY: grid-stride kernel; `d_seed_lo` is grown to one slot per
+            // seed here and fully written by the kernel before it is read.
+            unsafe {
+                reserve(
+                    &mut self.buf_seed_lo,
+                    &self.stream,
+                    num_seeds as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+                self.module.find_num_hits_paired(
+                    &self.stream,
+                    elementwise(),
+                    num_seeds,
+                    &self.index_table,
+                    &self.pos_table,
+                    &self.seed_slots[slot],
+                    &p.q_start,
+                    &p.t_lo,
+                    &p.t_hi,
+                    &mut self.buf_hit_num,
+                    &mut self.buf_seed_lo,
+                )?;
+            }
+        } else {
+            // SAFETY: grid-stride kernel; `index_table` covers every seed value and
+            // `d_hit_num` has one slot per seed.
+            unsafe {
+                self.module.find_num_hits(
+                    &self.stream,
+                    elementwise(),
+                    num_seeds,
+                    &self.index_table,
+                    &self.seed_slots[slot],
+                    &mut self.buf_hit_num,
+                )?;
+            }
         }
         self.end_stage(stage, "find_num_hits")?;
 
@@ -2509,6 +2581,26 @@ impl Engine {
         // change; this path does not redesign it.
         let mut sums = d_block_sums.to_host_vec(&self.stream)?;
         self.absorb_sync()?;
+        // `--paired`: a call holding several pairs is only exact while it stays
+        // one MAX_HITS sub-chunk (dedup runs per sub-chunk, and a pair's
+        // standalone run has its own walk). Past that, stop here — the stream
+        // is drained and no slot, pinned or autotune state has been touched,
+        // like the `num_hits == 0` return below — and let the driver re-issue
+        // one pair per call, which is exactly the standalone call.
+        if self.paired.is_some() && self.paired_multi {
+            let total: u64 = sums.iter().map(|&s| u64::from(s)).sum();
+            if total > u64::from(self.max_hits) {
+                self.phases.add("block-sum round trip", t.elapsed());
+                return Ok(FilterOutput {
+                    hsps: Vec::new(),
+                    num_hits: 0,
+                    raw_hsps: 0,
+                    raw: Vec::new(),
+                    audit: Vec::new(),
+                    oversized: true,
+                });
+            }
+        }
         let num_hits = exclusive_scan_hit_totals(&mut sums)?;
         let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
         self.pipeline_syncs += 1;
@@ -2537,6 +2629,7 @@ impl Engine {
             raw_hsps: 0,
             raw: Vec::new(),
             audit: Vec::new(),
+            oversized: false,
         };
         if num_hits == 0 {
             if self.collect_hit_stats {
@@ -2691,7 +2784,11 @@ impl Engine {
             self.phases.add("alloc hit buffers", t.elapsed());
 
             let stage = self.stage();
-            let warp_find_hits = use_warp_find_hits(iter_num_hits, iter_num_seeds);
+            // `--paired` always takes the thread kernel: the output does not
+            // depend on the choice, and pair densities sit far below the warp
+            // cutoff anyway.
+            let warp_find_hits =
+                self.paired.is_none() && use_warp_find_hits(iter_num_hits, iter_num_seeds);
             // SAFETY: one thread or warp per seed; every store lands inside
             // `0..iter_num_hits` by construction of the prefix offsets.
             #[cfg(not(feature = "dense-anchors"))]
@@ -2715,18 +2812,20 @@ impl Engine {
                 )?;
             }
             #[cfg(feature = "dense-anchors")]
-            unsafe {
-                #[cfg(feature = "find-hits-warp")]
-                if warp_find_hits {
-                    self.module.find_hits_dense_warp(
+            if self.paired.is_some() {
+                // SAFETY: as `find_hits_dense`; each seed walks only the
+                // `[seed_lo, seed_lo + count)` slice `find_num_hits_paired`
+                // counted, so the prefix offsets bound every store.
+                unsafe {
+                    self.module.find_hits_dense_paired(
                         &self.stream,
                         LaunchConfig {
-                            grid_dim: (iter_num_seeds.div_ceil(NUM_WARPS as u32), 1, 1),
+                            grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
                             block_dim: (BLOCK_SIZE, 1, 1),
                             shared_mem_bytes: 0,
                         },
-                        &self.index_table,
                         &self.pos_table,
+                        &self.buf_seed_lo,
                         &self.seed_slots[slot],
                         self.seed_size,
                         &self.buf_hit_num,
@@ -2735,7 +2834,50 @@ impl Engine {
                         start_hit_val,
                         iter_num_seeds,
                     )?;
-                } else {
+                }
+            }
+            #[cfg(feature = "dense-anchors")]
+            if self.paired.is_none() {
+                unsafe {
+                    #[cfg(feature = "find-hits-warp")]
+                    if warp_find_hits {
+                        self.module.find_hits_dense_warp(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (iter_num_seeds.div_ceil(NUM_WARPS as u32), 1, 1),
+                                block_dim: (BLOCK_SIZE, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &self.index_table,
+                            &self.pos_table,
+                            &self.seed_slots[slot],
+                            self.seed_size,
+                            &self.buf_hit_num,
+                            &mut self.buf_anchor,
+                            start_seed_index,
+                            start_hit_val,
+                            iter_num_seeds,
+                        )?;
+                    } else {
+                        self.module.find_hits_dense(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                                block_dim: (BLOCK_SIZE, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &self.index_table,
+                            &self.pos_table,
+                            &self.seed_slots[slot],
+                            self.seed_size,
+                            &self.buf_hit_num,
+                            &mut self.buf_anchor,
+                            start_seed_index,
+                            start_hit_val,
+                            iter_num_seeds,
+                        )?;
+                    }
+                    #[cfg(not(feature = "find-hits-warp"))]
                     self.module.find_hits_dense(
                         &self.stream,
                         LaunchConfig {
@@ -2754,24 +2896,6 @@ impl Engine {
                         iter_num_seeds,
                     )?;
                 }
-                #[cfg(not(feature = "find-hits-warp"))]
-                self.module.find_hits_dense(
-                    &self.stream,
-                    LaunchConfig {
-                        grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
-                        block_dim: (BLOCK_SIZE, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &self.index_table,
-                    &self.pos_table,
-                    &self.seed_slots[slot],
-                    self.seed_size,
-                    &self.buf_hit_num,
-                    &mut self.buf_anchor,
-                    start_seed_index,
-                    start_hit_val,
-                    iter_num_seeds,
-                )?;
             }
             self.end_stage(
                 stage,

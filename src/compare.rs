@@ -32,6 +32,7 @@ pub(crate) fn compare(args: &CompareArgs) -> Fallible<()> {
         reference: Some(args.reference.clone()),
         query: Some(args.query.clone()),
         query_list: None,
+        paired: false,
         output: rust_dir.clone(),
         strand: "both".into(),
         seed: args.tuning.seed.clone(),
