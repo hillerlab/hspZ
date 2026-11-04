@@ -122,6 +122,73 @@ pub mod device {
         }
     }
 
+    /// First index in `pos[lo..hi]` (half-open) whose value is `>= key`, or `hi`.
+    #[inline(always)]
+    fn lower_bound_in(pos: &[u32], mut lo: u32, mut hi: u32, key: u32) -> u32 {
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if pos[mid as usize] < key {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+
+    /// `--paired` (`paired.rs`): [`find_num_hits`] restricted to the seed's own
+    /// pair. Seed `j` belongs to pair `p = upper_bound(pair_q_start, j) - 1`,
+    /// and its hits are the bucket positions in `[pair_t_lo[p], pair_t_hi[p])`.
+    /// That is one contiguous slice of the bucket, because positions ascend
+    /// within a bucket (`seed.rs`) and pairs are packed in order. Writes the
+    /// slice length (the hit count) and where it starts.
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_num_hits_paired(
+        num_seeds: u32,
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_offsets: &[u64],
+        pair_q_start: &[u32],
+        pair_t_lo: &[u32],
+        pair_t_hi: &[u32],
+        mut seed_hit_num: DisjointSlice<u32>,
+        mut seed_lo: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut id = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+
+        while id < num_seeds {
+            let i = id as usize;
+            let seed_offset = seed_offsets[i];
+            let seed = (seed_offset >> 32) as usize;
+            let j = (seed_offset & 0xFFFF_FFFF) as u32;
+            let end = index_table[seed];
+            let start = if seed > 0 { index_table[seed - 1] } else { 0 };
+
+            // upper_bound(pair_q_start, j) - 1; pair 0 starts at 0 <= j.
+            let (mut a, mut b) = (0u32, pair_q_start.len() as u32);
+            while a < b {
+                let mid = a + (b - a) / 2;
+                if pair_q_start[mid as usize] <= j {
+                    a = mid + 1;
+                } else {
+                    b = mid;
+                }
+            }
+            let p = a.saturating_sub(1) as usize;
+
+            let lo = lower_bound_in(pos_table, start, end, pair_t_lo[p]);
+            let hi = lower_bound_in(pos_table, lo, end, pair_t_hi[p]);
+            // SAFETY: `id < num_seeds <=` both output lengths.
+            unsafe {
+                *seed_hit_num.get_unchecked_mut(i) = hi - lo;
+                *seed_lo.get_unchecked_mut(i) = lo;
+            }
+            id += stride;
+        }
+    }
+
     /// Block-local inclusive scan of the per-seed hit counts, in place, plus
     /// this block's total into `block_sums`.
     ///
@@ -698,6 +765,57 @@ pub mod device {
                 .wrapping_sub(j);
             // SAFETY: the same prefix proof as `find_hits`; every address is
             // in bounds and written exactly once.
+            unsafe {
+                *anchors.get_unchecked_mut(address as usize) =
+                    ref_loc as u64 | ((query_loc as u64) << 32);
+            }
+            j += 1;
+        }
+    }
+
+    /// `--paired`: [`find_hits_dense`] over the in-pair slice
+    /// [`find_num_hits_paired`] found. The count comes from the inclusive
+    /// prefix (`seed_hit_num[i] - seed_hit_num[i-1]`), and the walk visits the
+    /// same positions in the same ascending order a standalone run of the pair
+    /// visits in its whole bucket, so the anchors (and the hit order that fixes
+    /// the `MAX_HITS` walk) match it.
+    #[cfg(feature = "dense-anchors")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_dense_paired(
+        pos_table: &[u32],
+        seed_lo: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_hit_num: &[u32],
+        mut anchors: DisjointSlice<u64>,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) {
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        if seed_slot >= num_seeds {
+            return;
+        }
+
+        let i = (seed_slot + start_seed_index) as usize;
+        let prefix = seed_hit_num[i];
+        let before = if i > 0 { seed_hit_num[i - 1] } else { 0 };
+        let count = prefix - before;
+        if count == 0 {
+            return;
+        }
+
+        let query_loc = (seed_offsets[i] & 0xFFFF_FFFF) as u32 + seed_size;
+        let start = seed_lo[i];
+        let mut j = 0u32;
+        while j < count {
+            let ref_loc = pos_table[(start + j) as usize] + seed_size;
+            let address = prefix
+                .wrapping_sub(1)
+                .wrapping_sub(start_hit_index)
+                .wrapping_sub(j);
+            // SAFETY: the same prefix proof as `find_hits_dense`.
             unsafe {
                 *anchors.get_unchecked_mut(address as usize) =
                     ref_loc as u64 | ((query_loc as u64) << 32);

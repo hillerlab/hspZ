@@ -78,6 +78,7 @@ mod gpu;
 mod hits_estimate;
 mod hsp;
 mod index;
+mod paired;
 mod partition;
 mod plan;
 mod run;

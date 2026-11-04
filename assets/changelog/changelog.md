@@ -36,6 +36,36 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.0.6] — 2026-11-04
+
+- **`run --paired`: record *i* of `-r` against record *i* of `-q` only.** It is built for make_lastz_chains'
+  GPU chain-gap filling. There every gap is one small, independent (target region, query region) pair, and
+  an all-vs-all over unmasked gap regions is dominated by hits between unrelated gaps. On 305 hg38 chr21 ×
+  mm39 chr16 gaps, an all-vs-all run gives 70,809 HSPs against 7,979 in paired mode. `OUT/paired.segments`
+  holds, for every pair, exactly the bytes a standalone `run -S plus` of its two records writes, in pair
+  order (see *Outputs*). Requires `-S plus` and `--step 1`; each query record must be one seed chunk and one
+  LASTZ interval.
+  - **How it works.** Pairs are packed in order, and two new kernels limit each seed's bucket walk to its
+    own pair's reference range. That is one contiguous slice, because positions ascend within a bucket.
+    The default kernels and the warp path are unchanged, and output from every other mode is
+    byte-identical to 0.0.5.
+  - **Matching a standalone run.** Two quirks of a run with a single record pair are reproduced for every
+    record: a table never indexes its first base, and a query exactly one seed long seeds nothing.
+  - **Calls over `--max-hits`.** A call that holds several pairs and goes over `--max-hits` stops before
+    `find_hits` and is re-issued one pair per call. Deduplication runs per `MAX_HITS` sub-chunk, so this is
+    what keeps each pair identical to its standalone run.
+  - **Verified on an RX 6500 XT through ZLUDA and on an NVIDIA L4.** The checks were 300 real chr21 ×
+    chr16 gaps (150 per strand) plus empty, short, one-seed and low-complexity pairs:
+    - **Paired against standalone:** byte-identical with default flags, several batches, small `-C`,
+      re-issued calls at a small `--max-hits`, and the forced bucket pass (`assets/tests/paired-identity.sh`).
+    - **Default path:** 16 runs byte-identical to the 0.0.5 binary.
+    - **Unit tests:** 202 pass.
+  - **Speed.** All 8,676 chr21 × chr16 gap pairs take 1.8 s wall on the L4 (4.1 s on the RX 6500 XT),
+    against 80 s for per-pair LASTZ seeding (`--writesegments`) on one CPU core and 8.1 s on 16. The HSPs
+    match LASTZ's own: 12,223 of LASTZ's 12,224 segments have identical coordinates.
+  - **Caveat.** Unmasked low-complexity pairs cost O(L²) hits, because every hit is extended; `--time`
+    lists the calls with the most hits.
+
 ## [0.0.5] — 2026-10-27
 
 Two exact speed-ups, both on by default, both measured on NVIDIA A100 80GB PCIe GPUs. Every arm produced

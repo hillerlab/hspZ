@@ -52,6 +52,9 @@ pub(crate) fn benchmark(args: &BenchArgs, pre_main_ms: f64) -> Fallible<()> {
     if args.run.index.is_some() {
         return Err("--index is not supported by benchmark".into());
     }
+    if args.run.paired {
+        return Err("--paired is not supported by benchmark".into());
+    }
     // The benchmark always wants CUDA-event durations alongside host time.
     let mut run_args = args.run.clone();
     run_args.time = true;
