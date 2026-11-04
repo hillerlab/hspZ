@@ -21,6 +21,26 @@ With `--query-list`, each job writes this layout into its own directory,
 and `OUT/queries.tsv` lists the jobs once all of them have finished (see
 *GPUs and seeding*).
 
+## Paired mode
+
+`--paired -S plus` compares record *i* of `-r` only with record *i* of `-q`.
+It is meant for many small, independent region pairs, such as chain gaps. The
+two files must hold the same record names in the same order, and each query
+record must fit one seed chunk (`-C`) and one LASTZ interval (`-I`).
+
+The run writes one file, `OUT/paired.segments`, and creates it even when it is
+empty. For every pair, its lines are byte-identical to what a standalone
+`hspZ run -S plus` of that pair's two records writes, with the same scoring,
+seed and `--max-hits` flags. Pairs appear in input order, and coordinates are
+relative to each record. `--step` must be 1. Pass minus-strand pairs with the
+query record already reverse-complemented.
+
+`-D`, `-Z`, `--query-list`, `--index`, manifests, `--dump-plan`,
+`--dump-raw`, `--hit-stats`, `--cpu-only`, `-B 0` and `--gpus` above 1 are
+rejected with `--paired`. `-B` caps the bases per batch on each side; batches
+are also sized to fit the GPU, and the output does not depend on either.
+`assets/tests/paired-identity.sh` checks the per-pair claim.
+
 ## Record format
 
 Each tab-separated line has eight fields:

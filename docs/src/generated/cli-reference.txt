@@ -31,6 +31,8 @@ Options:
           
       --query-list <QUERY_LIST>
           One query FASTA path per line (blank lines and `#` comments ignored). Batch: one reference × many queries, spread over `--gpus` workers by the same unit partition as single queries (a slot position never becomes a query-bin id). All-or-nothing: a failing job aborts the batch, so partial per-job outputs (and a truncated `-Z` archive) may remain on disk
+      --paired
+          Compare record i of `-r` only with record i of `-q` (same names, same order), plus strand only (`-S plus`, `--step 1`), and write `OUT/paired.segments`: for each pair, exactly the bytes a standalone `run -S plus` of its two records writes, concatenated in pair order. Built for many small independent region pairs (chain gap filling)
   -o, --output <OUTPUT>
           Directory to write `tmp<n>.block<q>.r<r>.{plus,minus}.segments` into [default: .]
   -S, --strand <STRAND>
