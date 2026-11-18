@@ -52,12 +52,34 @@ pub const SORT_MAX: u32 = 4096;
 
 const WARP_SIZE: u32 = 32;
 const FULL_MASK: u32 = 0xFFFF_FFFF;
+/// `score_gate`'s sieve modes (`gate-sieve`): score every slot, or bound each
+/// lane's own hit first with every lane loading its own reference groups.
+#[cfg(feature = "dense-anchors")]
+const NO_SIEVE: u32 = 0;
+#[cfg(feature = "gate-sieve")]
+const SIEVE_SCATTER: u32 = 1;
+/// The same bound with the reference groups gathered through shared memory:
+/// six lanes load the six groups of one hit, five hits per round.
+#[cfg(feature = "gate-sieve")]
+const SIEVE_GATHER: u32 = 2;
+/// Shared `u64` slots one warp gathers into: six rows of 32 hits, each row 4
+/// slots longer so that neighbouring rows fall on different banks.
+#[cfg(feature = "gate-sieve")]
+const GATHER_ROW: usize = 36;
+#[cfg(feature = "gate-sieve")]
+const GATHER_SLOTS: usize = 6 * GATHER_ROW;
 /// `parameters.h: NUC`.
 const NUC: usize = 8;
 
 #[cuda_host::cuda_module]
 pub mod device {
+    #[cfg(feature = "dense-anchors")]
+    use super::NO_SIEVE;
     use super::{FULL_MASK, NUC, NUM_WARPS, SCAN_BLOCK, SegmentPair, WARP_SIZE};
+    #[cfg(feature = "gate-sieve")]
+    use super::{GATHER_ROW, GATHER_SLOTS, SIEVE_GATHER, SIEVE_SCATTER};
+    #[cfg(feature = "dense-anchors")]
+    use crate::gpu::sieve;
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, thread, warp};
 
     /// Does nothing. Launched in a loop to price a launch under ZLUDA, where
@@ -427,6 +449,67 @@ pub mod device {
             // allocated survivor range, once each; a set bit implies the gate
             // wrote that slot, so `slot < n` indexes `sorted_idx`.
             unsafe { *survivor_ids.get_unchecked_mut(out as usize) = sorted_idx[slot as usize] };
+            out += 1;
+            m &= m - 1;
+        }
+    }
+
+    /// `gate-sieve`: [`emit_bits`] over a bitmask indexed by raw hit id, as the
+    /// plain sieve kernels write it. A slot is its own id, so the list comes out
+    /// ascending and needs no sort. A copy rather than a shared body: routing
+    /// `emit_bits` through a helper changed its machine code.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    pub fn emit_bits_plain(
+        bits: &[u32],
+        offsets: &[u32],
+        mut survivor_ids: DisjointSlice<u32>,
+        n_words: u32,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let word = if i < n_words { bits[i as usize] } else { 0 };
+        let c = word.count_ones();
+
+        // Inclusive warp scan of the per-word counts: `s - c` is how many
+        // survivors the lower lanes of this warp emit.
+        let mut s = c;
+        let mut off = 1;
+        while off < WARP_SIZE {
+            let up = warp::shuffle_up_sync(FULL_MASK, s, off);
+            if lane >= off {
+                s += up;
+            }
+            off <<= 1;
+        }
+        if lane == WARP_SIZE - 1 {
+            unsafe { WARP_COUNTS[warp_id] = s };
+        }
+        thread::sync_threads();
+
+        if tid == 0 {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_COUNTS[w] };
+                unsafe { WARP_COUNTS[w] = prefix };
+                prefix += count;
+            }
+        }
+        thread::sync_threads();
+
+        let mut out = offsets[bid as usize] + unsafe { WARP_COUNTS[warp_id] } + (s - c);
+        let mut m = word;
+        while m != 0 {
+            let slot = i * WARP_SIZE + m.trailing_zeros();
+            // SAFETY: the block prefixes and per-word ranks cover exactly the
+            // allocated survivor range, once each.
+            unsafe { *survivor_ids.get_unchecked_mut(out as usize) = slot };
             out += 1;
             m &= m - 1;
         }
@@ -1043,6 +1126,16 @@ pub mod device {
             false,
             flags.as_mut_ptr(),
             core::ptr::null_mut(),
+            NO_SIEVE,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
         );
     }
 
@@ -1083,7 +1176,343 @@ pub mod device {
             true,
             core::ptr::null_mut(),
             flags_bits.as_mut_ptr(),
+            NO_SIEVE,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
         );
+    }
+
+    /// [`mark_score_survivors`] behind the lane-local bound of `gpu/sieve.rs`:
+    /// each lane first bounds its own hit from the packed planes, and the warp
+    /// scores only the hits the bound could not reject. `um`, `ua`, `ub` and
+    /// `ubias` are `Classes::kernel_args`; `hspthresh` is `keep_threshold`.
+    /// With `count` set, lane 0 also stores each chunk's candidate mask. The
+    /// flags are one word of keep bits per 32 hits at the raw hit id, read by
+    /// `count_bits` and `emit_bits_plain`.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_SCATTER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered`] behind the same bound.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_SCATTER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// The gather arm of the sieve: the warp's six reference groups per hit,
+    /// loaded coalesced instead of by 32 lanes at 32 unrelated addresses.
+    ///
+    /// Lane `l` loads group `l % 6` of hit `5 * round + l / 6`: six neighbouring
+    /// lanes read the 48 contiguous bytes of one hit, five hits per round, seven
+    /// rounds per chunk (lanes 30 and 31 idle). Each word goes to shared memory
+    /// at row = group, column = hit, and every lane then reads its own column.
+    /// The same six words reach the same arithmetic as in the scatter arm.
+    ///
+    /// # Safety
+    /// As `sieve::bound_at` for every anchor of the chunk: lane `i` holds the
+    /// reference position of hit `i` in `my_lo`.
+    #[cfg(feature = "gate-sieve")]
+    #[inline(always)]
+    unsafe fn sieve_gather(
+        w: usize,
+        lane_id: u32,
+        my_lo: u32,
+        ref_pk: *const u64,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        static mut GROUPS: SharedArray<u64, { NUM_WARPS * GATHER_SLOTS }> = SharedArray::UNINIT;
+
+        let row = (lane_id % 6) as usize;
+        let column = lane_id / 6;
+        let base = w * GATHER_SLOTS;
+        let mut round = 0u32;
+        while round < 7 {
+            let hit = 5 * round + column;
+            let loads = column < 5 && hit < WARP_SIZE;
+            let ref_loc = warp::shuffle_sync(FULL_MASK, my_lo, if loads { hit } else { 0 });
+            if loads {
+                let (first, _, _, _) = sieve::locate(ref_loc, 0);
+                // SAFETY: the six groups of a packed hit; one lane per slot.
+                unsafe {
+                    GROUPS[base + row * GATHER_ROW + hit as usize] =
+                        *ref_pk.add(first as usize + row);
+                }
+            }
+            round += 1;
+        }
+        warp::sync_mask(FULL_MASK);
+        let at = base + lane_id as usize;
+        // SAFETY: column `lane_id` of all six rows was stored above.
+        unsafe {
+            (
+                GROUPS[at],
+                GROUPS[at + GATHER_ROW],
+                GROUPS[at + 2 * GATHER_ROW],
+                GROUPS[at + 3 * GATHER_ROW],
+                GROUPS[at + 4 * GATHER_ROW],
+                GROUPS[at + 5 * GATHER_ROW],
+            )
+        }
+    }
+
+    /// [`mark_score_survivors_sieve`] with the reference groups gathered
+    /// through shared memory ([`sieve_gather`]).
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve_gather(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_GATHER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered_sieve`] with the gathered groups.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve_gather(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_GATHER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// Packs an encoded sequence into the planes the sieve reads
+    /// (`gpu/sieve.rs: pack` is the host mirror): one thread per 32-base group.
+    /// Symbols outside `ACGT` take the code `fill` and a bad bit; everything
+    /// outside the sequence is code 0 and bad. `bad` is written only when
+    /// `want_bad` is set (the reference has no bad plane).
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_planes(
+        seq: &[u8],
+        len: u32,
+        num_groups: u32,
+        fill: u32,
+        want_bad: u32,
+        mut pk: DisjointSlice<u64>,
+        mut bad: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut g = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while g < num_groups {
+            let (mut hi, mut lo, mut bd) = (0u32, 0u32, 0u32);
+            let mut b = 0u32;
+            while b < 32 {
+                // Groups in front of the sequence wrap to a position past `len`.
+                let pos = g.wrapping_sub(sieve::PADG).wrapping_mul(32).wrapping_add(b);
+                if g >= sieve::PADG && pos < len {
+                    // SAFETY: `pos < len == seq.len()`.
+                    let sym = unsafe { *seq.get_unchecked(pos as usize) } as u32;
+                    let code = if sym < 4 {
+                        sym
+                    } else {
+                        bd |= 1 << b;
+                        fill
+                    };
+                    hi |= ((code >> 1) & 1) << b;
+                    lo |= (code & 1) << b;
+                } else {
+                    bd |= 1 << b;
+                }
+                b += 1;
+            }
+            // SAFETY: `g < num_groups`, the length of both planes.
+            unsafe {
+                *pk.get_unchecked_mut(g as usize) = hi as u64 | (lo as u64) << 32;
+                if want_bad != 0 {
+                    *bad.get_unchecked_mut(g as usize) = bd;
+                }
+            }
+            g += stride;
+        }
     }
 
     /// Body of the score gate, shared by the plain and the reordered kernel.
@@ -1110,6 +1539,21 @@ pub mod device {
         // Round 83 round 2: one `u32` of keep bits per 32-slot chunk, written at
         // the chunk's sorted slot. Null and unused unless `reordered`.
         flags_bits: *mut u32,
+        // `gate-sieve` (`gpu/sieve.rs`): with a mode other than `NO_SIEVE` each
+        // lane first bounds its own hit and the slot loop walks only the hits
+        // the bound could not reject. A literal, like `reordered`: with
+        // `NO_SIEVE` everything below folds away and the planes, class constants
+        // and candidate words are never read.
+        sieve_mode: u32,
+        ref_pk: *const u64,
+        qry_pk: *const u64,
+        qry_bad: *const u32,
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        cand_bits: *mut u32,
     ) {
         // The anchor no longer travels through shared memory (round 58): the warp
         // fetches its whole chunk coalesced and broadcasts by shuffle.
@@ -1174,11 +1618,75 @@ pub mod device {
             let my_lo = my_anchor as u32;
             let my_hi = (my_anchor >> 32) as u32;
 
+            // `gate-sieve`: the slots this warp still has to score, as a mask.
+            // Each lane bounds the hit it just loaded; a hit whose bound is
+            // certified below the threshold cannot be kept and is never scored.
+            let mut rem = 0u32;
+            if sieve_mode != NO_SIEVE {
+                // SAFETY: the host packed both planes for these sequences, and a
+                // lane past `num_hits` holds the chunk's first anchor.
+                #[cfg(not(feature = "gate-sieve"))]
+                let bound = unsafe {
+                    sieve::bound_at(
+                        ref_pk, qry_pk, qry_bad, my_lo, my_hi, um, ua, ub, ubias, xdrop,
+                    )
+                };
+                #[cfg(feature = "gate-sieve")]
+                let bound = unsafe {
+                    if sieve_mode == SIEVE_GATHER {
+                        let (r0, r1, r2, r3, r4, r5) = sieve_gather(w, lane_id, my_lo, ref_pk);
+                        let (_, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                        sieve::bound_words(
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            qry_pk.add(qg as usize),
+                            qry_bad.add(qg as usize),
+                            o,
+                            qs,
+                            um,
+                            ua,
+                            ub,
+                            ubias,
+                            xdrop,
+                        )
+                    } else {
+                        sieve::bound_at(
+                            ref_pk, qry_pk, qry_bad, my_lo, my_hi, um, ua, ub, ubias, xdrop,
+                        )
+                    }
+                };
+                rem = warp::ballot_sync(
+                    FULL_MASK,
+                    my_idx < num_hits && sieve::passes(bound, hspthresh),
+                );
+                if count != 0 && lane_id == 0 {
+                    // SAFETY: `base < limit <= num_hits`, one word per chunk.
+                    unsafe { *cand_bits.add((base / CHUNK) as usize) = rem };
+                }
+            }
+            // Every sieve kernel writes its chunk's keep bits as one word, as the
+            // reordered kernel does: a hit the bound rejected is a 0 bit that no
+            // lane has to store.
+            let word_flags = reordered || sieve_mode != NO_SIEVE;
+
             // Keep bits of this chunk, bit `s` for slot `s`; slots past
             // `num_hits` stay 0. Lane 0 owns it and stores it once below.
             let mut chunk_bits = 0u32;
             let mut slot = 0u32;
-            while slot < CHUNK {
+            loop {
+                if sieve_mode != NO_SIEVE {
+                    if rem == 0 {
+                        break;
+                    }
+                    slot = rem.trailing_zeros();
+                    rem &= rem - 1;
+                } else if slot >= CHUNK {
+                    break;
+                }
                 let hid = base + slot;
                 let ref_loc = warp::shuffle_sync(FULL_MASK, my_lo, slot);
                 let query_loc = warp::shuffle_sync(FULL_MASK, my_hi, slot);
@@ -1703,7 +2211,7 @@ pub mod device {
                     // integer compare decides the same, with no FP64 on the gate.
                     #[cfg(feature = "gate-int-keep")]
                     let keep = (total >= hspthresh) as u8;
-                    if reordered {
+                    if word_flags {
                         chunk_bits |= (keep as u32) << slot;
                     } else {
                         // SAFETY: `hid < num_hits`, one thread per flag byte.
@@ -1715,7 +2223,7 @@ pub mod device {
             // One store per chunk. `base` is a multiple of CHUNK == 32 for both
             // traversals, so each word has exactly one owning warp and every
             // word of `ceil(num_hits/32)` is overwritten — no stale bits.
-            if reordered && lane_id == 0 {
+            if word_flags && lane_id == 0 {
                 // SAFETY: `base < limit <= num_hits`, so the word index is
                 // inside the `ceil(num_hits/32)` the host allocated.
                 unsafe { *flags_bits.add((base / CHUNK) as usize) = chunk_bits };

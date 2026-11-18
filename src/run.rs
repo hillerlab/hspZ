@@ -4555,6 +4555,10 @@ pub(crate) fn report_counts(stats: &Stats) {
     eprintln!("#seed hits: {}", stats.seed_hits);
     eprintln!("#raw HSPs: {}", stats.raw_hsps);
     eprintln!("#HSPs: {}", stats.hsps);
+    #[cfg(feature = "gate-sieve")]
+    for line in crate::gpu::sieve_totals::report() {
+        eprintln!("{line}");
+    }
 }
 
 /// Seed and hit counts without a GPU: `find_num_hits` is just a lookup into the

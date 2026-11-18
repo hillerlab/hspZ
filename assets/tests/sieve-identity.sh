@@ -1,0 +1,163 @@
+#!/usr/bin/env bash
+# Identity gate for the score-gate sieve (ZLUDA or NVIDIA, ~8 min on the local box).
+#
+# Claim: with the sieve the binary writes the same bytes as without it, for
+# every option that reaches the score gate, and every lane decides as the host
+# model says. Each arm runs the control (the same binary with
+# HSPZ_GATE_SIEVE=0, its plain gate kernels; or another binary given as H0) and
+# the sieve on one reference/query pair and compares the digests
+# of all segment files; the sieve run carries HSPZ_GATE_SIEVE_CHECK=1, which
+# recomputes every hit on the host and must report zero candidate mismatches,
+# zero flag mismatches, zero kept-but-rejected hits and zero plane mismatches.
+# An arm also states whether the sieve must be on or off there.
+#
+# `--paired` has its own script (assets/tests/paired-identity.sh).
+#
+# The fixture used for the release: hg38 chr20 against mm39
+# chr19:20000000-24000000 (`samtools faidx`, record names as samtools writes
+# them), 192,899,566 seed hits, default-arm digest 70152625c1a75cb3.
+#
+# Usage: FIX=<dir with ref.fa qry.fa> assets/tests/sieve-identity.sh
+#        (H1=binary under test, H0=control binary, W=workdir to override)
+set -uo pipefail
+S=${TMPDIR:-/tmp}
+for _v in CUDA_HOME ZLUDA; do
+  eval "[ \"\${$_v+x}\" ] && _s_$_v=\$$_v"
+done
+_f=${HSPZ_TEST_ENV:-${XDG_CONFIG_HOME:-$HOME/.config}/hspz/test.env}
+[ -f "$_f" ] && . "$_f"
+for _v in CUDA_HOME ZLUDA; do
+  eval "[ \"\${_s_$_v+x}\" ] && $_v=\$_s_$_v"
+done
+ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+FIX=${FIX:?set FIX to a directory holding the chr20 fixture (ref.fa, qry.fa)}
+FIX=$(cd "$FIX" && pwd)
+H1=${H1:-$ROOT/target/release/hspZ}
+H0=${H0:-$H1}
+export CUDA_HOME=${CUDA_HOME:?set CUDA_HOME (CUDA toolkit root) in the environment or ~/.config/hspz/test.env}
+export LD_LIBRARY_PATH=${ZLUDA:+$ZLUDA:}$CUDA_HOME/lib
+W=${W:-$S/hspz-sieve-identity}; rm -rf "$W"; mkdir -p "$W"
+
+digest() { (cd "$1" && cat $(ls *.segments 2>/dev/null | LC_ALL=C sort) | sha256sum | cut -c1-16); }
+fail=0
+printf '%-34s %-5s %-17s %-10s %s\n' arm sieve digest rho check
+
+# arm NAME on|off REF QRY [hspz options...]; environment prefixes go through ENVV.
+arm() {
+  local name=$1 want=$2 ref=$3 qry=$4; shift 4
+  env ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
+    2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
+  env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits 16711680 --time "$@" \
+    2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
+  local d0 d1 state rho check verdict=ok
+  d0=$(digest "$W/$name.0"); d1=$(digest "$W/$name.1")
+  state=$(grep -m1 -o 'gate sieve: o[nf]*' "$W/$name.1.err" | awk '{print $3}')
+  rho=$(grep -m1 '^#sieve candidates' "$W/$name.1.err" | grep -o '([0-9.]*%)' | tr -d '()')
+  check=$(grep -m1 '^#sieve check' "$W/$name.1.err" | sed 's/^#sieve check: //')
+  [ "$d0" = "$d1" ] || verdict="DIGEST $d0 vs $d1"
+  [ "${state:-none}" = "$want" ] || verdict="STATE ${state:-none}, expected $want"
+  if [ "$want" = on ]; then
+    # Every tally after the model's keep count must be zero.
+    echo "$check" | grep -q 'candidate mismatches 0, flag mismatches 0, kept but rejected 0, plane word mismatches 0$' \
+      || verdict="CHECK ${check:-missing}"
+  fi
+  [ "$verdict" = ok ] || fail=$((fail+1))
+  printf '%-34s %-5s %-17s %-10s %s\n' "$name" "${state:-none}" "$d1" "${rho:--}" "$verdict"
+  [ -n "${KEEP:-}" ] || rm -rf "$W/$name.0" "$W/$name.1"
+}
+
+R=$FIX/ref.fa; Q=$FIX/qry.fa
+arm defaults                 on  "$R" "$Q"
+arm hspthresh-2400           on  "$R" "$Q" -H 2400
+arm hspthresh-1500           on  "$R" "$Q" -H 1500
+arm seed-14of22              on  "$R" "$Q" -s 14of22
+arm notransition             on  "$R" "$Q" -n
+arm xdrop-600                on  "$R" "$Q" -x 600
+arm xdrop-999                on  "$R" "$Q" -x 999
+arm xdrop-1200               off "$R" "$Q" -x 1200
+arm ambiguous-n              off "$R" "$Q" -a n
+arm ambiguous-iupac          off "$R" "$Q" -a iupac
+arm strand-plus              on  "$R" "$Q" -S plus
+arm strand-minus             on  "$R" "$Q" -S minus
+arm noentropy                on  "$R" "$Q" -E
+arm small-chunks             on  "$R" "$Q" -C 60000
+ENVV="HSPZ_REF_BUCKETS=1" arm buckets-forced            on  "$R" "$Q"
+ENVV="HSPZ_REF_BUCKETS=1" arm buckets-forced-2400       on  "$R" "$Q" -H 2400
+ENVV="HSPZ_GATE_SIEVE=0"  arm sieve-switched-off        none "$R" "$Q"
+# The gather arm: the same bound with the reference groups read through shared memory.
+ENVV="HSPZ_GATE_SIEVE=gather" arm gather                    on  "$R" "$Q"
+ENVV="HSPZ_GATE_SIEVE=gather" arm gather-2400               on  "$R" "$Q" -H 2400
+ENVV="HSPZ_GATE_SIEVE=gather" arm gather-14of22             on  "$R" "$Q" -s 14of22
+ENVV="HSPZ_GATE_SIEVE=gather HSPZ_REF_BUCKETS=1" arm gather-buckets-forced     on  "$R" "$Q"
+# `auto`: gathered on the plain gate, per lane under the bucket pass.
+ENVV="HSPZ_GATE_SIEVE=auto HSPZ_REF_BUCKETS=0" arm auto-plain                on  "$R" "$Q"
+ENVV="HSPZ_GATE_SIEVE=auto HSPZ_REF_BUCKETS=1" arm auto-buckets-forced       on  "$R" "$Q"
+grep -q 'gathered on the plain gate only' "$W/auto-plain.1.err" || { echo "auto-plain: not the auto arm"; fail=$((fail+1)); }
+for a in gather gather-2400 gather-14of22 gather-buckets-forced; do
+  grep -q 'gathered reference' "$W/$a.1.err" || { echo "$a: the gather kernels did not run"; fail=$((fail+1)); }
+done
+grep -q 'gathered reference' "$W/defaults.1.err" && { echo "defaults: ran the gather kernels"; fail=$((fail+1)); }
+
+# A custom matrix with milder transitions: the class scores must follow the file.
+cat > "$W/mild.q" <<'EOF'
+    A    C    G    T
+A   91 -114  -20 -123
+C -114  100 -125  -20
+G  -20 -125  100 -114
+T -123  -20 -114   91
+EOF
+arm scoring-mild-transitions on  "$R" "$Q" -c "$W/mild.q"
+grep -q 'transition -20' "$W/scoring-mild-transitions.1.err" || { echo "scoring arm: class scores did not follow the matrix"; fail=$((fail+1)); }
+
+# IUPAC codes other than N: in the reference they loosen the transversion class
+# to -100; in the query they are not terminal, so the sieve must switch off.
+python3 - "$R" "$Q" "$W" <<'EOF'
+import sys
+ref, qry, out = sys.argv[1:4]
+def spike(path, dest, every):
+    name, seq = None, []
+    for line in open(path):
+        if line.startswith(">"): name = line
+        else: seq.append(line.rstrip("\n"))
+    s = bytearray("".join(seq).encode())
+    for i in range(every // 2, len(s), every):
+        if s[i] in b"ACGT": s[i] = b"RYKMSW"[(i // every) % 6]
+    with open(dest, "w") as f:
+        f.write(name)
+        for i in range(0, len(s), 60): f.write(s[i:i + 60].decode() + "\n")
+spike(ref, out + "/ref_iupac.fa", 1499)
+spike(qry, out + "/qry_iupac.fa", 5003)
+EOF
+arm iupac-in-reference       on  "$W/ref_iupac.fa" "$Q"
+grep -q 'transversion -100' "$W/iupac-in-reference.1.err" || { echo "iupac arm: transversion class is not -100"; fail=$((fail+1)); }
+arm iupac-in-query           off "$R" "$W/qry_iupac.fa"
+
+# The guard. Two diverged copies of one tandem array: nearly every hit extends, so
+# the bound rejects almost nothing; the guard must see that on its first sample
+# and run the plain gate on the batches after it. Same bytes with and without it.
+python3 - "$W" <<'PY'
+import random, sys
+out = sys.argv[1]
+rng = random.Random(20261118)
+unit = [rng.choice("ACGT") for _ in range(171)]
+def array(copies):
+    seq = []
+    for _ in range(copies):
+        seq += [rng.choice("ACGT") if rng.random() < 0.03 else b for b in unit]
+    return "".join(seq)
+for name, copies in (("sat_ref", 120), ("sat_qry", 40)):
+    s = array(copies)
+    with open(f"{out}/{name}.fa", "w") as f:
+        f.write(f">{name}\n")
+        for i in range(0, len(s), 60): f.write(s[i:i + 60] + "\n")
+PY
+arm satellite-guard          on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q '^#sieve guard: the bound passed more than half' "$W/satellite-guard.1.err" \
+  || { echo "satellite-guard: the guard never held the plain gate"; fail=$((fail+1)); }
+ENVV="HSPZ_GATE_SIEVE_GUARD=0" arm satellite-no-guard        on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q '^#sieve guard' "$W/satellite-no-guard.1.err" && { echo "satellite-no-guard: the guard ran"; fail=$((fail+1)); }
+grep -q '^#sieve guard' "$W/defaults.1.err" && { echo "defaults: the guard held on mouse against human"; fail=$((fail+1)); }
+
+echo
+if [ $fail -eq 0 ]; then echo "sieve-identity: PASS (every arm byte-identical, every check clean)"; else echo "sieve-identity: $fail FAILURE(S); logs in $W"; fi
+exit $fail

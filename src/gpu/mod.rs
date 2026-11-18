@@ -32,6 +32,7 @@
 //! kernel stages also carry their CUDA-event duration (`gpu ms`).
 
 pub mod kernels;
+pub mod sieve;
 
 use crate::hsp::SegmentPair;
 use crate::seed::Shape;
@@ -911,6 +912,10 @@ pub struct Engine {
     /// or with `gate-int-keep` its [`keep_threshold`]. Resolved once here.
     #[cfg_attr(not(feature = "dense-anchors"), allow(dead_code))]
     gate_thresh: i32,
+    /// `gate-sieve`: the packed planes and this unit's class scores for the
+    /// lane-local bound in front of the gate (`gpu/sieve.rs`).
+    #[cfg(feature = "gate-sieve")]
+    sieve: GateSieve,
     noentropy: u32,
     max_hits: u32,
     hit_capacity: u32,
@@ -1897,6 +1902,8 @@ impl Engine {
             } else {
                 cfg.hspthresh
             },
+            #[cfg(feature = "gate-sieve")]
+            sieve: GateSieve::new(&stream, cfg.sub_mat)?,
             noentropy: cfg.noentropy as u32,
             max_hits,
             hit_capacity,
@@ -1995,6 +2002,10 @@ impl Engine {
             engine.copy_ready[s].record(&engine.copy_stream)?;
             engine.compute_done[s].record(&engine.stream)?;
         }
+        #[cfg(feature = "gate-sieve")]
+        let mut engine = engine;
+        #[cfg(feature = "gate-sieve")]
+        engine.sieve_pack_reference(cfg.ref_seq)?;
         engine.stream.synchronize()?;
         engine.copy_stream.synchronize()?;
         phases.add("upload ref/query/tables", t.elapsed());
@@ -2032,10 +2043,16 @@ impl Engine {
     /// `reference_uploads` deliberately does not move here — see
     /// [`reference_uploads`](Self::reference_uploads).
     pub fn swap_query(&mut self, query_seq: &[u8], query_rc_seq: &[u8]) -> Result<(), DriverError> {
+        // The old planes go before the new query arrives, so the swap never
+        // holds more than the three query buffers the plan budgets for.
+        #[cfg(feature = "gate-sieve")]
+        self.sieve.release_query(&self.stream)?;
         self.query_seq = DeviceBuffer::from_host(&self.stream, query_seq)?;
         self.query_rc_seq = DeviceBuffer::from_host(&self.stream, query_rc_seq)?;
         self.query_len = query_seq.len() as u32;
         self.query_swaps += 1;
+        #[cfg(feature = "gate-sieve")]
+        self.sieve_pack_query(query_seq, query_rc_seq)?;
         Ok(())
     }
 
@@ -2780,6 +2797,17 @@ impl Engine {
                     iter_num_hits as usize,
                     &mut self.pipeline_syncs,
                 )?;
+                // One candidate word per 32 hits, written by the batches the
+                // sieve's guard samples and under its count diagnostic.
+                #[cfg(feature = "gate-sieve")]
+                if self.sieve.count || self.sieve.guard.period > 0 {
+                    reserve(
+                        &mut self.sieve.cand_bits,
+                        &self.stream,
+                        iter_num_hits.div_ceil(32) as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
             }
             self.phases.add("alloc hit buffers", t.elapsed());
 
@@ -3275,8 +3303,101 @@ impl Engine {
                         .record(&self.stream)?;
                 }
                 let stage = self.stage();
+                // `gate-sieve`: this unit's class constants when the bound is on;
+                // the same launch then goes to the sieve kernel of its path.
+                // The guard samples the candidate fraction on every `period`th
+                // batch and holds the plain gate while the bound rejects too little.
+                #[cfg(feature = "gate-sieve")]
+                let (sieve_args, sieve_sample) =
+                    match (self.sieve.args, self.sieve.guard.next_batch()) {
+                        (None, _) => (None, false),
+                        (Some(_), GuardStep::Plain) => (None, false),
+                        (args, GuardStep::Sieve) => (args, false),
+                        (args, GuardStep::Sample) => (args, true),
+                    };
+                #[cfg(not(feature = "gate-sieve"))]
+                let sieve_args: Option<(i32, i32, i32, i32)> = None;
+                // The sieve kernels write keep bits, one word per 32 hits, on both
+                // gate paths; the plain gate kernel writes a byte per hit.
+                let bits_pass = bucket_pass || sieve_args.is_some();
+                #[cfg(feature = "gate-sieve")]
+                if let Some((um, ua, ub, ubias)) = sieve_args {
+                    let strand = rev as usize;
+                    let count = (self.sieve.count || sieve_sample) as u32;
+                    if !bucket_pass {
+                        // SAFETY: the gate overwrites every word of the chunk.
+                        unsafe {
+                            reserve(
+                                &mut self.buf_flags_bits,
+                                &self.stream,
+                                flag_words as usize,
+                                &mut self.pipeline_syncs,
+                            )?;
+                        }
+                    }
+                    // One launch, four kernels: plain or bucketed anchors, own or
+                    // gathered reference groups.
+                    macro_rules! launch_sieve {
+                        ($kernel:ident, $anchors:expr, $flags:expr) => {
+                            self.module.$kernel(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (self.hsp_blocks, 1, 1),
+                                    block_dim: (HSP_THREADS, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &self.ref_seq,
+                                query,
+                                self.ref_len,
+                                self.query_len,
+                                &self.sub_mat,
+                                self.xdrop,
+                                self.gate_thresh,
+                                iter_num_hits,
+                                $anchors,
+                                $flags,
+                                &self.sieve.ref_pk,
+                                &self.sieve.qry_pk[strand],
+                                &self.sieve.qry_bad[strand],
+                                um,
+                                ua,
+                                ub,
+                                ubias,
+                                count,
+                                &mut self.sieve.cand_bits,
+                            )?
+                        };
+                    }
+                    // SAFETY: as the two launches below; the planes were packed
+                    // for this reference and this query strand, and the
+                    // candidate words are reserved whenever `count` is set.
+                    unsafe {
+                        match (bucket_pass, self.sieve.gather.unwrap_or(!bucket_pass)) {
+                            (false, false) => launch_sieve!(
+                                mark_score_survivors_sieve,
+                                &self.buf_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (false, true) => launch_sieve!(
+                                mark_score_survivors_sieve_gather,
+                                &self.buf_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (true, false) => launch_sieve!(
+                                mark_score_survivors_reordered_sieve,
+                                &self.buf_sorted_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (true, true) => launch_sieve!(
+                                mark_score_survivors_reordered_sieve_gather,
+                                &self.buf_sorted_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                        }
+                    }
+                }
                 // SAFETY: one warp per raw hit; every active flag is written.
-                if !bucket_pass {
+                if !bucket_pass && sieve_args.is_none() {
                     unsafe {
                         self.module.mark_score_survivors(
                             &self.stream,
@@ -3302,7 +3423,7 @@ impl Engine {
                 // one keep-bit word per 32 sorted slots and `emit_bits` maps
                 // those slots back through `buf_sorted_idx`.
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bucket_pass && sieve_args.is_none() {
                     unsafe {
                         self.module.mark_score_survivors_reordered(
                             &self.stream,
@@ -3325,15 +3446,24 @@ impl Engine {
                     }
                 }
                 self.end_stage(stage, "score_gate")?;
+                #[cfg(feature = "gate-sieve")]
+                if sieve_args.is_some() && (self.sieve.count || sieve_sample) {
+                    let candidates = if self.sieve.count {
+                        self.sieve_audit(rev, iter_num_hits, bucket_pass)?
+                    } else {
+                        self.sieve_count_candidates(iter_num_hits)?
+                    };
+                    if sieve_sample {
+                        self.sieve
+                            .guard
+                            .observe(candidates, u64::from(iter_num_hits));
+                    }
+                }
 
                 // The bitmask packs 32 hits per word, so its scan launches 32x
                 // fewer blocks and its block-sum round trip is 32x smaller.
                 #[cfg(feature = "ref-loc-buckets")]
-                let scan_len = if bucket_pass {
-                    flag_words
-                } else {
-                    iter_num_hits
-                };
+                let scan_len = if bits_pass { flag_words } else { iter_num_hits };
                 #[cfg(not(feature = "ref-loc-buckets"))]
                 let scan_len = iter_num_hits;
                 let blocks = scan_len.div_ceil(SCAN_BLOCK);
@@ -3341,7 +3471,7 @@ impl Engine {
                 // block before the host copy reads it.
                 let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
                 let stage = self.stage();
-                if !bucket_pass {
+                if !bits_pass {
                     unsafe {
                         self.module.count_survivors(
                             &self.stream,
@@ -3357,7 +3487,7 @@ impl Engine {
                     }
                 }
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bits_pass {
                     unsafe {
                         self.module.count_bits(
                             &self.stream,
@@ -3497,7 +3627,7 @@ impl Engine {
                 let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
                 self.pipeline_syncs += 1;
                 let stage = self.stage();
-                if !bucket_pass {
+                if !bits_pass {
                     unsafe {
                         self.module.emit_survivors(
                             &self.stream,
@@ -3510,6 +3640,27 @@ impl Engine {
                             &d_offsets,
                             &mut self.buf_survivors,
                             iter_num_hits,
+                        )?;
+                    }
+                }
+                // The plain sieve kernels index their bitmask by raw hit id: the
+                // set bits are the survivor ids, already ascending.
+                #[cfg(feature = "gate-sieve")]
+                if bits_pass && !bucket_pass {
+                    // SAFETY: the block prefixes partition the `total` survivor
+                    // slots, one per set bit.
+                    unsafe {
+                        self.module.emit_bits_plain(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (blocks, 1, 1),
+                                block_dim: (SCAN_BLOCK, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &self.buf_flags_bits,
+                            &d_offsets,
+                            &mut self.buf_survivors,
+                            flag_words,
                         )?;
                     }
                 }
@@ -4116,6 +4267,503 @@ unsafe fn uninitialized<T>(
     Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx) })
 }
 
+/// What the sieve's guard tells one gate launch to do.
+#[cfg(feature = "gate-sieve")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardStep {
+    /// Run the sieve and count its candidates.
+    Sample,
+    /// Run the sieve.
+    Sieve,
+    /// Run the plain gate: the last sample rejected too little.
+    Plain,
+}
+
+/// Keeps the sieve from costing more than it saves. Where the bound rejects
+/// little (long unmasked satellite arrays, self-alignment) a hit pays the bound
+/// and then exact scoring, and the bound's own time is 11-25% of exact scoring.
+/// Every `period`th gate launch is a sample: it runs the sieve and counts the
+/// candidates. If more than [`SieveGuard::HOLD_ABOVE`] of its hits were
+/// candidates, the launches up to the next sample run the plain gate. Both
+/// gates are exact, so the output never depends on the guard.
+#[cfg(feature = "gate-sieve")]
+struct SieveGuard {
+    /// Launches per sample; 0 switches the guard off (`HSPZ_GATE_SIEVE_GUARD`).
+    period: u32,
+    tick: u32,
+    hold: bool,
+}
+
+#[cfg(feature = "gate-sieve")]
+impl SieveGuard {
+    /// Candidate fraction above which the plain gate is the cheaper one. The
+    /// sieve breaks even where exact scoring of the candidates plus the bound
+    /// equals exact scoring of everything, a fraction of 0.75-0.89 on the cards
+    /// measured; half leaves a margin.
+    const HOLD_ABOVE: f64 = 0.5;
+    /// A sample this small says little about the launches that follow.
+    const MIN_HITS: u64 = 1 << 16;
+
+    fn new(period: u32) -> Self {
+        Self {
+            period,
+            tick: 0,
+            hold: false,
+        }
+    }
+
+    fn next_batch(&mut self) -> GuardStep {
+        if self.period == 0 {
+            return GuardStep::Sieve;
+        }
+        let step = if self.tick == 0 {
+            GuardStep::Sample
+        } else if self.hold {
+            GuardStep::Plain
+        } else {
+            GuardStep::Sieve
+        };
+        self.tick = (self.tick + 1) % self.period;
+        step
+    }
+
+    fn observe(&mut self, candidates: u64, hits: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if hits < Self::MIN_HITS {
+            return;
+        }
+        self.hold = candidates as f64 > Self::HOLD_ABOVE * hits as f64;
+        sieve_totals::GUARD_SAMPLES.fetch_add(1, Relaxed);
+        sieve_totals::GUARD_HOLDS.fetch_add(u64::from(self.hold), Relaxed);
+    }
+}
+
+/// `HSPZ_GATE_SIEVE_GUARD`: gate launches per guard sample (default 32), `0` for
+/// no guard. Read once; anything else is reported and the default used.
+#[cfg(feature = "gate-sieve")]
+fn sieve_guard_period() -> u32 {
+    const DEFAULT: u32 = 32;
+    static PERIOD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| match std::env::var("HSPZ_GATE_SIEVE_GUARD") {
+        Err(_) => DEFAULT,
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            eprintln!("warning: HSPZ_GATE_SIEVE_GUARD={v:?} is not an integer; using {DEFAULT}");
+            DEFAULT
+        }),
+    })
+}
+
+/// `gate-sieve`: what the engine holds for the lane-local bound in front of the
+/// score gate (`gpu/sieve.rs`): the packed planes of the reference and of both
+/// query strands, and this unit's class scores.
+#[cfg(feature = "gate-sieve")]
+struct GateSieve {
+    /// `HSPZ_GATE_SIEVE=0` keeps every launch on the plain gate.
+    requested: bool,
+    /// Which kernels load the reference groups through shared memory instead of
+    /// every lane loading its own: all (`HSPZ_GATE_SIEVE=gather`), none
+    /// (`scatter`, the default), or `None` for `auto` — gathered on the plain
+    /// gate, where the loads miss the L2, and per lane under the bucket pass.
+    gather: Option<bool>,
+    /// `HSPZ_GATE_SIEVE_COUNT=1`: read every batch's candidate words back and
+    /// report the passing fraction. A diagnostic: it waits on every batch.
+    count: bool,
+    sub_mat: Vec<i32>,
+    ref_has_x: bool,
+    ref_pk: DeviceBuffer<u64>,
+    qry_pk: [DeviceBuffer<u64>; 2],
+    qry_bad: [DeviceBuffer<u32>; 2],
+    /// `Classes::kernel_args` for the unit in place; `None` runs the plain gate.
+    args: Option<(i32, i32, i32, i32)>,
+    classes: Option<sieve::Classes>,
+    /// The state last printed under `--time`, so that a run prints it once per
+    /// change rather than once per unit.
+    said: String,
+    cand_bits: DeviceBuffer<u32>,
+    guard: SieveGuard,
+    /// `HSPZ_GATE_SIEVE_CHECK=1`: host copies of both sequences and their
+    /// planes, to recompute every hit on the host — the lane's decision, and the
+    /// exact gate's — and compare both with the device.
+    host: Option<SieveHost>,
+}
+
+#[cfg(feature = "gate-sieve")]
+#[derive(Default)]
+struct SieveHost {
+    ref_enc: Vec<u8>,
+    ref_pk: Vec<u64>,
+    qry_enc: [Vec<u8>; 2],
+    qry_pk: [Vec<u64>; 2],
+    qry_bad: [Vec<u32>; 2],
+}
+
+/// Process-wide tallies of the sieve diagnostics, printed with the run's counts.
+#[cfg(feature = "gate-sieve")]
+pub mod sieve_totals {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) static HITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CANDIDATES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CHECKED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KEPT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CANDIDATE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLAG_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KEPT_BUT_REJECTED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PLANE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GUARD_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GUARD_HOLDS: AtomicU64 = AtomicU64::new(0);
+
+    /// The lines for the run report; empty unless a diagnostic ran or the guard
+    /// held the plain gate.
+    pub fn report() -> Vec<String> {
+        let mut out = Vec::new();
+        let (hits, cands) = (HITS.load(Relaxed), CANDIDATES.load(Relaxed));
+        if hits > 0 {
+            out.push(format!(
+                "#sieve candidates: {cands} of {hits} hits ({:.4}%)",
+                cands as f64 / hits as f64 * 100.0
+            ));
+        }
+        let (samples, holds) = (GUARD_SAMPLES.load(Relaxed), GUARD_HOLDS.load(Relaxed));
+        if holds > 0 {
+            out.push(format!(
+                "#sieve guard: the bound passed more than half of the hits in {holds} of {samples} \
+                 sampled batches; the plain gate ran after each of them"
+            ));
+        }
+        let checked = CHECKED.load(Relaxed);
+        if checked > 0 {
+            out.push(format!(
+                "#sieve check: {checked} hits, {} kept by the exact model; candidate mismatches {}, \
+                 flag mismatches {}, kept but rejected {}, plane word mismatches {}",
+                KEPT.load(Relaxed),
+                CANDIDATE_MISMATCHES.load(Relaxed),
+                FLAG_MISMATCHES.load(Relaxed),
+                KEPT_BUT_REJECTED.load(Relaxed),
+                PLANE_MISMATCHES.load(Relaxed),
+            ));
+        }
+        out
+    }
+}
+
+/// `HSPZ_GATE_SIEVE` as (sieve requested, gathered reference): unset, `1` or
+/// `scatter` run the sieve with every lane loading its own reference groups,
+/// `gather` gathers them through shared memory, `auto` gathers on the plain
+/// gate only, `0` keeps the plain gate. Read once; any other value is reported
+/// and runs the default arm.
+#[cfg(feature = "gate-sieve")]
+fn sieve_request() -> (bool, Option<bool>) {
+    static REQUEST: std::sync::OnceLock<(bool, Option<bool>)> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_GATE_SIEVE").as_deref() {
+        Err(_) | Ok("1") | Ok("scatter") => (true, Some(false)),
+        Ok("gather") => (true, Some(true)),
+        Ok("auto") => (true, None),
+        Ok("0") => (false, Some(false)),
+        Ok(other) => {
+            eprintln!(
+                "warning: HSPZ_GATE_SIEVE={other:?} is not 0, 1, scatter, gather or auto; using scatter"
+            );
+            (true, Some(false))
+        }
+    })
+}
+
+#[cfg(feature = "gate-sieve")]
+impl GateSieve {
+    fn new(stream: &CudaStream, sub_mat: &[i32]) -> Result<Self, DriverError> {
+        let flag = |name: &str| matches!(std::env::var(name).as_deref(), Ok("1"));
+        let check = flag("HSPZ_GATE_SIEVE_CHECK");
+        // SAFETY: empty, or one word no kernel reads; all are replaced before use.
+        unsafe {
+            Ok(Self {
+                requested: sieve_request().0,
+                gather: sieve_request().1,
+                count: check || flag("HSPZ_GATE_SIEVE_COUNT"),
+                sub_mat: sub_mat.to_vec(),
+                ref_has_x: false,
+                ref_pk: uninitialized(stream, 0)?,
+                qry_pk: [uninitialized(stream, 0)?, uninitialized(stream, 0)?],
+                qry_bad: [uninitialized(stream, 0)?, uninitialized(stream, 0)?],
+                args: None,
+                classes: None,
+                said: String::new(),
+                cand_bits: uninitialized(stream, 1)?,
+                guard: SieveGuard::new(sieve_guard_period()),
+                host: check.then(SieveHost::default),
+            })
+        }
+    }
+
+    /// Frees the previous unit's query planes. The pass that read them has
+    /// drained the stream, as it has for the query buffers `swap_query` replaces.
+    fn release_query(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
+        self.args = None;
+        for strand in 0..2 {
+            // SAFETY: empty buffers, never read.
+            unsafe {
+                self.qry_pk[strand] = uninitialized(stream, 0)?;
+                self.qry_bad[strand] = uninitialized(stream, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One thread per packed group, grid-stride.
+#[cfg(feature = "gate-sieve")]
+fn pack_launch(groups: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((groups as u32).div_ceil(SCAN_BLOCK).clamp(1, 1 << 14), 1, 1),
+        block_dim: (SCAN_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+#[cfg(feature = "gate-sieve")]
+impl Engine {
+    /// Packs the resident reference into its planes, on the device.
+    fn sieve_pack_reference(&mut self, ref_enc: &[u8]) -> Result<(), DriverError> {
+        if !self.sieve.requested || ref_enc.is_empty() {
+            return Ok(());
+        }
+        self.sieve.ref_has_x = memchr::memchr(crate::sequence::X_NT, ref_enc).is_some();
+        let groups = sieve::groups(ref_enc.len());
+        // SAFETY: `pack_planes` writes every group before the gate reads one; the
+        // reference has no bad plane, so that argument is never written.
+        unsafe {
+            self.sieve.ref_pk = uninitialized(&self.stream, groups)?;
+            self.module.pack_planes(
+                &self.stream,
+                pack_launch(groups),
+                &self.ref_seq,
+                self.ref_len,
+                groups as u32,
+                sieve::REF_FILL,
+                0,
+                &mut self.sieve.ref_pk,
+                &mut self.sieve.cand_bits,
+            )?;
+        }
+        if let Some(host) = self.sieve.host.as_mut() {
+            host.ref_enc = ref_enc.to_vec();
+            host.ref_pk = sieve::pack(ref_enc, sieve::REF_FILL).0;
+            let device = copy_prefix(&self.sieve.ref_pk, &self.stream, groups)?;
+            let wrong = device
+                .iter()
+                .zip(&host.ref_pk)
+                .filter(|(d, h)| d != h)
+                .count();
+            sieve_totals::PLANE_MISMATCHES
+                .fetch_add(wrong as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Decides whether the bound holds for this unit and packs both query strands.
+    fn sieve_pack_query(&mut self, query: &[u8], query_rc: &[u8]) -> Result<(), DriverError> {
+        if !self.sieve.requested {
+            return Ok(());
+        }
+        let x = crate::sequence::X_NT;
+        let qry_has_x = memchr::memchr(x, query).is_some() || memchr::memchr(x, query_rc).is_some();
+        // Plane positions are 32-bit and carry four groups of padding on each side.
+        let too_long = |len: usize| len > (u32::MAX - 64 * sieve::PADG) as usize;
+        let decision = if query.is_empty() || self.sieve.ref_pk.is_empty() {
+            Err("an empty sequence".to_string())
+        } else if too_long(self.ref_len as usize) || too_long(query.len()) {
+            Err("a sequence too long for 32-bit plane positions".to_string())
+        } else {
+            sieve::classes(
+                &self.sieve.sub_mat,
+                self.xdrop,
+                self.sieve.ref_has_x,
+                qry_has_x,
+            )
+        };
+        let state = match &decision {
+            Ok(c) => format!(
+                "on — match {}, transition {}, transversion {}; {} right + {} left bases{}",
+                c.um,
+                c.uti,
+                c.utv,
+                sieve::RIGHT,
+                sieve::LEFT,
+                match self.sieve.gather {
+                    Some(true) => "; gathered reference",
+                    Some(false) => "",
+                    None => "; reference gathered on the plain gate only",
+                }
+            ),
+            Err(why) => format!("off — {why}"),
+        };
+        if self.timing && state != self.sieve.said {
+            eprintln!("  gate sieve: {state}");
+            self.sieve.said = state;
+        }
+        self.sieve.classes = decision.ok();
+        self.sieve.args = self.sieve.classes.map(|c| c.kernel_args());
+        if self.sieve.args.is_none() {
+            return Ok(());
+        }
+
+        for (strand, enc) in [query, query_rc].into_iter().enumerate() {
+            // `--paired` swaps in the plus strand alone; a strand that is not
+            // there is never gated, and its planes stay empty.
+            if enc.is_empty() {
+                continue;
+            }
+            let groups = sieve::groups(enc.len());
+            let seq = if strand == 0 {
+                &self.query_seq
+            } else {
+                &self.query_rc_seq
+            };
+            // SAFETY: `pack_planes` writes every group of both planes before
+            // the gate reads one.
+            unsafe {
+                self.sieve.qry_pk[strand] = uninitialized(&self.stream, groups)?;
+                self.sieve.qry_bad[strand] = uninitialized(&self.stream, groups)?;
+                self.module.pack_planes(
+                    &self.stream,
+                    pack_launch(groups),
+                    seq,
+                    enc.len() as u32,
+                    groups as u32,
+                    sieve::REF_FILL,
+                    1,
+                    &mut self.sieve.qry_pk[strand],
+                    &mut self.sieve.qry_bad[strand],
+                )?;
+            }
+            if let Some(host) = self.sieve.host.as_mut() {
+                let (pk, bad) = sieve::pack(enc, sieve::REF_FILL);
+                let d_pk = copy_prefix(&self.sieve.qry_pk[strand], &self.stream, groups)?;
+                let d_bad = copy_prefix(&self.sieve.qry_bad[strand], &self.stream, groups)?;
+                let wrong = d_pk.iter().zip(&pk).filter(|(d, h)| d != h).count()
+                    + d_bad.iter().zip(&bad).filter(|(d, h)| d != h).count();
+                sieve_totals::PLANE_MISMATCHES
+                    .fetch_add(wrong as u64, std::sync::atomic::Ordering::Relaxed);
+                host.qry_enc[strand] = enc.to_vec();
+                host.qry_pk[strand] = pk;
+                host.qry_bad[strand] = bad;
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard's sample of one gate launch: how many of its `n` hits the bound
+    /// passed to the exact gate. Block sums on the device, one small copy.
+    fn sieve_count_candidates(&mut self, n: u32) -> Result<u64, DriverError> {
+        let words = n.div_ceil(32);
+        let blocks = words.div_ceil(SCAN_BLOCK);
+        // SAFETY: `count_bits` writes one sum per launched block before the copy.
+        let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
+        unsafe {
+            self.module.count_bits(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (SCAN_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &self.sieve.cand_bits,
+                &mut d_sums,
+                words,
+            )?;
+        }
+        let sums = d_sums.to_host_vec(&self.stream)?;
+        self.absorb_sync()?;
+        Ok(sums.iter().map(|&c| u64::from(c)).sum())
+    }
+
+    /// The count and check diagnostics for one gate launch: reads the candidate
+    /// words back and, under `check`, replays every hit on the host. Returns the
+    /// candidate count.
+    fn sieve_audit(&mut self, rev: bool, n: u32, bucket_pass: bool) -> Result<u64, DriverError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let words = n.div_ceil(32) as usize;
+        let cand = copy_prefix(&self.sieve.cand_bits, &self.stream, words)?;
+        self.absorb_sync()?;
+        let candidates: u64 = cand.iter().map(|w| u64::from(w.count_ones())).sum();
+        sieve_totals::HITS.fetch_add(u64::from(n), Relaxed);
+        sieve_totals::CANDIDATES.fetch_add(candidates, Relaxed);
+        let (Some(host), Some(classes)) = (self.sieve.host.as_ref(), self.sieve.classes) else {
+            return Ok(candidates);
+        };
+
+        // The anchors the gate read and the keep bits it wrote, in the gate's
+        // order: sorted slots under the bucket pass, raw hits otherwise.
+        let anchors = if bucket_pass {
+            copy_prefix(&self.buf_sorted_anchor, &self.stream, n as usize)?
+        } else {
+            copy_prefix(&self.buf_anchor, &self.stream, n as usize)?
+        };
+        let keep_bits = copy_prefix(&self.buf_flags_bits, &self.stream, words)?;
+        let bit = |bits: &[u32], i: usize| bits[i / 32] >> (i % 32) & 1 != 0;
+        let device_keep = |i: usize| bit(&keep_bits, i);
+
+        let strand = rev as usize;
+        let (xdrop, t_min, sub_mat) = (self.xdrop, self.gate_thresh, &self.sieve.sub_mat);
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |t| t.get())
+            .min(16);
+        let per = (n as usize).div_ceil(threads).max(1);
+        let tallies: Vec<[u64; 4]> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..n as usize)
+                .step_by(per)
+                .map(|start| {
+                    let (anchors, cand, device_keep) = (&anchors, &cand, &device_keep);
+                    scope.spawn(move || {
+                        // kept, candidate mismatches, flag mismatches, kept but rejected
+                        let mut t = [0u64; 4];
+                        let end = (start + per).min(n as usize);
+                        for (i, &anchor) in anchors.iter().enumerate().take(end).skip(start) {
+                            let (rl, ql) = (anchor as u32, (anchor >> 32) as u32);
+                            let model_cand = sieve::candidate(
+                                &host.ref_pk,
+                                &host.qry_pk[strand],
+                                &host.qry_bad[strand],
+                                rl,
+                                ql,
+                                &classes,
+                                xdrop,
+                                t_min,
+                            );
+                            let (right, left) = sieve::exact_sides(
+                                &host.ref_enc,
+                                &host.qry_enc[strand],
+                                rl,
+                                ql,
+                                sub_mat,
+                                xdrop,
+                            );
+                            let keep = right.wrapping_add(left) >= t_min;
+                            let device_cand = bit(cand, i);
+                            t[0] += keep as u64;
+                            t[1] += (model_cand != device_cand) as u64;
+                            t[2] += (keep != device_keep(i)) as u64;
+                            t[3] += (keep && !device_cand) as u64;
+                        }
+                        t
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("sieve check worker"))
+                .collect()
+        });
+        let sum = |k: usize| tallies.iter().map(|t| t[k]).sum::<u64>();
+        sieve_totals::CHECKED.fetch_add(u64::from(n), Relaxed);
+        sieve_totals::KEPT.fetch_add(sum(0), Relaxed);
+        sieve_totals::CANDIDATE_MISMATCHES.fetch_add(sum(1), Relaxed);
+        sieve_totals::FLAG_MISMATCHES.fetch_add(sum(2), Relaxed);
+        sieve_totals::KEPT_BUT_REJECTED.fetch_add(sum(3), Relaxed);
+        Ok(candidates)
+    }
+}
+
 /// `MAX_BLOCKS x MAX_THREADS`, the geometry KegAlign uses for its two
 /// grid-stride elementwise kernels.
 fn elementwise() -> LaunchConfig {
@@ -4676,6 +5324,34 @@ impl Stage {
 
 #[cfg(test)]
 mod tests {
+    /// The sieve's guard: a sample every `period` launches, the plain gate
+    /// after a sample that passed more than half of its hits, the sieve again
+    /// after one that did not; a tiny sample decides nothing and period 0
+    /// never samples.
+    #[cfg(feature = "gate-sieve")]
+    #[test]
+    fn sieve_guard_samples_holds_and_releases() {
+        use super::{GuardStep, SieveGuard};
+        let run = |g: &mut SieveGuard, n: usize| -> Vec<GuardStep> {
+            (0..n).map(|_| g.next_batch()).collect()
+        };
+        let (sample, sieve, plain) = (GuardStep::Sample, GuardStep::Sieve, GuardStep::Plain);
+
+        let mut g = SieveGuard::new(4);
+        assert_eq!(run(&mut g, 5), [sample, sieve, sieve, sieve, sample]);
+        g.observe(600_000, 1_000_000);
+        assert_eq!(run(&mut g, 4), [plain, plain, plain, sample]);
+        // Exactly half does not hold, and a sample below the minimum is ignored.
+        g.observe(500_000, 1_000_000);
+        assert_eq!(run(&mut g, 4), [sieve, sieve, sieve, sample]);
+        g.observe(60_000, 60_000);
+        assert_eq!(run(&mut g, 3), [sieve, sieve, sieve]);
+
+        let mut off = SieveGuard::new(0);
+        off.observe(1_000_000, 1_000_000);
+        assert_eq!(run(&mut off, 3), [sieve, sieve, sieve]);
+    }
+
     #[cfg(feature = "ref-loc-buckets")]
     use super::ref_bucket_policy;
     #[cfg(feature = "find-hits-warp")]

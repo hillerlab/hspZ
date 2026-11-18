@@ -1054,6 +1054,11 @@ fn max_packed(bins: &[Bin]) -> Result<u64, String> {
 ///   `4*32*ceil(H/256) + 8*ceil(32*ceil(H/256)/256)` for the bucket histogram
 ///   and its block sums; zero otherwise. The survivor sort needs no device
 ///   scratch — it is one block of shared memory, or a host round trip.
+/// - sieve: under `gate-sieve` add the packed planes — `8` bytes per 32
+///   reference bases and `12` per 32 query bases on each strand, each with 9
+///   groups of padding — and `ceil(H/8)` for the candidate words of its count
+///   diagnostic; zero otherwise. The query planes are freed before a swap
+///   uploads the next query, so they add nothing to the swap overlap.
 /// - 64 MiB unmodelled headroom
 ///
 /// `C = wga_chunk_size`, `S = C * (1+k if transitions else 1)`, `H = max_hits`.
@@ -1128,6 +1133,14 @@ pub fn unit_device_bytes(
         0
     };
 
+    // `gate-sieve`: 2-bit planes of the reference, 2-bit planes plus a bad
+    // plane of both query strands, and the count diagnostic's candidate words.
+    let sieve_b: u128 = if cfg!(feature = "gate-sieve") {
+        8 * (u128::from(ref_bp) / 32 + 9) + 2 * 12 * (u128::from(query_bp) / 32 + 9) + h.div_ceil(8)
+    } else {
+        0
+    };
+
     // The largest term is below 2^66 and the full sum below 2^67;
     // only the final conversion to u64 can overflow.
     let total = u128::from(ref_bp).div_ceil(u128::from(step)) * 4
@@ -1139,6 +1152,7 @@ pub fn unit_device_bytes(
         + h * bucket_b
         + bucket_scan_b
         + bucket_bits_b
+        + sieve_b
         + 16 * s
         + 8 * s
         + 4 * c
@@ -3298,13 +3312,11 @@ mod tests {
                 0
             }
         };
-        // Round 2 sorted bitmask flags: 1 bit per hit, so it steps once per 8.
+        // Round 2 sorted bitmask flags and the sieve's candidate words: 1 bit per
+        // hit each, so each steps once per 8.
         let bmask = |h: u32| {
-            if cfg!(feature = "ref-loc-buckets") {
-                u64::from(h).div_ceil(8)
-            } else {
-                0
-            }
+            u64::from(h).div_ceil(8)
+                * (cfg!(feature = "ref-loc-buckets") as u64 + cfg!(feature = "gate-sieve") as u64)
         };
         assert_eq!(
             delta(255, 256),
