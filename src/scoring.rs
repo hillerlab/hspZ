@@ -109,12 +109,21 @@ pub fn build_sub_mat(
         m[x * NUC + x] = FILL;
     }
 
-    // The separator must break any extension that reaches it.
+    // The separator must break any extension that reaches it. Past this range the
+    // product wraps in release builds, a separator scores near zero and an
+    // extension runs across records, so such an `--xdrop` is refused.
+    let separator = xdrop.checked_mul(-10).ok_or_else(|| {
+        format!(
+            "--xdrop {xdrop} is out of range: the record separator scores -10 x xdrop, \
+             which must fit 32 bits (at most {})",
+            i32::MAX / 10
+        )
+    })?;
     for i in 0..e {
-        m[i * NUC + e] = -10 * xdrop;
-        m[e * NUC + i] = -10 * xdrop;
+        m[i * NUC + e] = separator;
+        m[e * NUC + i] = separator;
     }
-    m[e * NUC + e] = -10 * xdrop;
+    m[e * NUC + e] = separator;
 
     Ok(m)
 }
@@ -303,6 +312,16 @@ mod tests {
         assert_eq!(m[6 * NUC + 6], -100, "X/X fill score");
         assert_eq!(m[7 * NUC + 7], -9100, "separator = -10 * xdrop");
         assert_eq!(m[7], -9100, "any base against a separator");
+    }
+
+    #[test]
+    fn an_xdrop_whose_separator_score_would_wrap_is_refused() {
+        assert!(build_sub_mat("", i32::MAX / 10, None).is_ok());
+        let err = build_sub_mat("", i32::MAX / 10 + 1, None).unwrap_err();
+        assert!(
+            err.contains("--xdrop") && err.contains("out of range"),
+            "{err}"
+        );
     }
 
     #[test]
