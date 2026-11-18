@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Identity gate for the score-gate sieve (ZLUDA or NVIDIA, ~8 min on the local box).
+# Identity gate for the score-gate sieve (ZLUDA or NVIDIA, ~9 min on the local box).
 #
 # Claim: with the sieve the binary writes the same bytes as without it, for
 # every option that reaches the score gate, and every lane decides as the host
@@ -157,6 +157,14 @@ grep -q '^#sieve guard: the bound passed more than half' "$W/satellite-guard.1.e
 ENVV="HSPZ_GATE_SIEVE_GUARD=0" arm satellite-no-guard        on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 grep -q '^#sieve guard' "$W/satellite-no-guard.1.err" && { echo "satellite-no-guard: the guard ran"; fail=$((fail+1)); }
 grep -q '^#sieve guard' "$W/defaults.1.err" && { echo "defaults: the guard held on mouse against human"; fail=$((fail+1)); }
+
+# Bucket pass with a window sized for the packed planes: a chunk the sieve does
+# not gate skips the pass. Forced on here (the local card's L2 is too small for
+# the rule to choose it): a query with IUPAC codes switches the sieve off for
+# the unit, and on the tandem array the guard holds the plain gate.
+ENVV="HSPZ_REF_BUCKETS=1" arm buckets-iupac-in-query    off "$R" "$W/qry_iupac.fa"
+ENVV="HSPZ_REF_BUCKETS=1" arm buckets-satellite-guard   on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q 'of packed planes' "$W/buckets-forced.1.err" || { echo "buckets-forced: the window is not plane-sized"; fail=$((fail+1)); }
 
 echo
 if [ $fail -eq 0 ]; then echo "sieve-identity: PASS (every arm byte-identical, every check clean)"; else echo "sieve-identity: $fail FAILURE(S); logs in $W"; fi

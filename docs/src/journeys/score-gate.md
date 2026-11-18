@@ -117,8 +117,8 @@ sequenceDiagram
 
 ## D.6 — Optionally gate anchors by reference window
 <!-- @id: d-ref-buckets -->
-WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`, default `auto`).
-WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, each a window that fits three quarters of the L2, so consecutive warps gather from one cached window; the gate then writes one keep bit per anchor.
+WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`).
+WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, so consecutive warps gather from one cached window; the gate then writes one keep bit per anchor. With the bound of D.2 on, a window is as long as its packed planes fit half of the L2 (64 Mbp on an A100), and the pass runs whenever such a window exists; without the bound the window is its bytes against three quarters of the L2, and `auto` times both paths before it chooses.
 WHAT COMES OUT: Survivor IDs mapped back through each anchor's raw index and sorted into ascending raw hit order.
 INVARIANT: The materializer sees the same survivors in the same order as without bucketing, so the HSP set and file bytes are unchanged.
 

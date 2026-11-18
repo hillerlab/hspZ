@@ -98,7 +98,8 @@ gate-payload-ballot = ["simd-prelude"]
 # output is byte-identical. Default since 0.1.0. Unit 0 of hg38 x mm39 at W=1,
 # reversed arms, output digest unchanged: A100 score gate 71.0 -> 16.0 s and
 # wall 85.4 -> 28.8 s; L4 score gate 120.8 -> 14.9 s and wall 156.2 -> 51.7 s.
-# Whole hg38 x mm39 on one A100: 3,492 -> 924 s, the same bytes.
+# Whole hg38 x mm39 on one A100: 3,492 -> 773 s, the same bytes (with the
+# bucket pass sized for the packed planes, see `ref-loc-buckets`).
 # At runtime `HSPZ_GATE_SIEVE=0` keeps the plain gate kernels, and `=gather` or
 # `=auto` load the reference groups through shared memory, which is faster where
 # memory bandwidth binds (an L4 without its bucket pass).

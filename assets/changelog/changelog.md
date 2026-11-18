@@ -38,11 +38,11 @@ All notable changes to `hspZ` are documented here, newest first.
 
 ## [0.1.0] — 2026-11-18
 
-One exact speed-up, on by default. A whole genome takes about a quarter of the time and every byte of the output
-is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
-schedules planned on 0.0.x numbers no longer hold.
+One exact speed-up, on by default. A whole genome takes between a fifth and a quarter of the time and every byte
+of the output is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour
+budgets and schedules planned on 0.0.x numbers no longer hold.
 
-- **The score-gate sieve: hg38 × mm39 on one A100 in 924 s instead of 3,492 s.** The score gate was 89% of that
+- **The score-gate sieve: hg38 × mm39 on one A100 in 773 s instead of 3,492 s.** The score gate was 89% of that
   run. It scores every seed hit exactly, one hit per warp, and rejects all but about 0.01% of them. Now each lane
   first bounds the score of *its own* hit from 2-bit packed bases, and the warp scores exactly only the hits whose
   bound reaches the threshold or could not be certified: about 1.5% of them between human and mouse. A hit is
@@ -57,26 +57,46 @@ schedules planned on 0.0.x numbers no longer hold.
     exact extension too. If both sides are certified and their bounds sum below the threshold, the hit is
     rejected without being scored. The bound is one branch-free block of 407 instructions for 32 hits; exact
     scoring costs about 229 per hit.
+  - **The bucket pass is sized for the packed bases.** The reference-locality pass in front of the gate (0.0.4)
+    sorts a batch's hits into reference windows that fit the L2. The sieve reads a quarter of a byte per base,
+    so its windows are four times longer in bases (64 Mbp on an A100 or an L4), the pass needs fewer buckets, and
+    an A100, which could not use the pass at its batch size before, now does: in L2 the sieve itself is 2.4×
+    faster. With the sieve on, the pass runs whenever such a window fits half of the L2, without the timed trial
+    of 0.0.4; a batch the sieve does not gate skips it. `HSPZ_REF_BUCKETS=0` turns the pass off and `auto` runs
+    the trial.
   - **When it switches itself off.** The class scores are derived from the matrix in use, and the sieve runs
     only if every query base outside ACGT ends an extension (its scores are below `-xdrop`) and mismatches drift
     downward. So it is off, and `--time` prints the reason, with `--ambiguous n` or `iupac`, with `--xdrop` at
     1000 or above under default scoring, with IUPAC codes other than N in the query, and with matrices that do
     not meet those conditions. IUPAC codes in the reference only loosen the bound.
-  - **Measured.** All on unit 0 of hg38 × mm39 (125.6 billion hits) at one GPU, in reversed pairs, each arm
-    byte-identical to the recorded digest of that unit:
+  - **Measured.** hg38 × mm39, production defaults, the inputs of the 0.0.5 runs, every output byte-identical
+    to that run's:
+
+    | A100 80GB cards | 0.0.5 | 0.1.0 | |
+    | ---: | ---: | ---: | --- |
+    | 1 | 3,491.8 s | **772.9 s** | 4.5× |
+    | 2 | 1,771.8 s | 380.0 s | 4.7× |
+    | 4 | 942.9 s | 218.1 s | 4.3× |
+    | 6 | 648.0 s | 149.4 s | 4.3× |
+    | 8 | 576.9 s | 136.9 s | 4.2× |
+
+    The one-card run writes the same 3,864 files, 865,049,792 bytes and 15,917,736 HSPs. In the same session and
+    on the same node the default build of 0.0.6 took 3,546.6 s. At `--hspthresh 2400`, the make_lastz_chains
+    setting, one card took 933.8 s before the plane-sized bucket pass against 3,524.1 s, with the same
+    29,001,375 HSPs. What remains of the 772.9 s is the score gate (307 s), its bucket pass (156 s), `find_hits`
+    (135 s) and about 145 s outside the GPU.
+
+    Unit 0 of that pair (125.6 billion hits) in reversed pairs, each arm byte-identical to the digest recorded
+    for the unit:
 
     | GPU | setting | score gate | wall |
     | --- | --- | --- | --- |
-    | A100 80GB | production defaults | 63.9 → 12.8 s (5.0×) | 78.0 → 24.5 s (3.2×) |
-    | A100 80GB | `--max-hits 16711680`, device seeder | 71.0 → 16.0 s (4.4×) | 85.4 → 28.8 s (3.0×) |
-    | A100 80GB | the same with `--hspthresh 2400` | 71.0 → 16.5 s (4.3×) | 85.7 → 29.6 s (2.9×) |
-    | L4 | production defaults | 120.0 → 19.1 s (6.3×) | 157.5 → 56.5 s (2.8×) |
-    | L4 | `--max-hits 16711680`, device seeder, bucket pass forced on | 120.8 → 14.9 s (8.1×) | 156.2 → 51.7 s (3.0×) |
+    | A100 80GB | production defaults | 63.9 → 6.2 s, plus a 3.0 s bucket pass | 78.0 → 21.3 s (3.7×) |
+    | A100 80GB | bucket pass off | 63.9 → 12.8 s (5.0×) | 78.0 → 24.5 s (3.2×) |
+    | L4 | production defaults, 16 Mbp windows | 120.0 → 19.1 s (6.3×) | 157.5 → 56.5 s (2.8×) |
 
-    Whole hg38 × mm39 on one A100 with production defaults: 923.8 s, against 3,491.8 s for 0.0.5 on the same
-    inputs, and the same 3,864 files, 865,049,792 bytes and 15,917,736 HSPs. What remains of that run is the
-    score gate (628 s), `find_hits` (134 s) and about 130 s of host work. Other pairs, more than one GPU and
-    other GPU classes were not measured for this release.
+    The L4 row was measured before the windows grew to 64 Mbp and has not been repeated. Other pairs and other
+    GPU classes were not measured for this release.
   - **Runtime switch.** `HSPZ_GATE_SIEVE=0` scores every hit exactly, as 0.0.6 did. `HSPZ_GATE_SIEVE=gather`
     loads the bound's reference words through shared memory instead of once per lane; that is faster where
     memory bandwidth binds (L4 with its bucket pass off: 30.5 s against 41.0 s) and slower on an A100 (19.0 s
@@ -93,7 +113,7 @@ schedules planned on 0.0.x numbers no longer hold.
     and `0` removes the guard; a run where the guard acted prints a `#sieve guard:` line.
   - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
     IUPAC codes, both sequence ends, five X-drops, two matrices) finds no certified bound below the exact score
-    and no kept hit rejected, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 28
+    and no kept hit rejected, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 30
     option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
     `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
     exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`

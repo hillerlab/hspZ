@@ -983,6 +983,12 @@ pub struct Engine {
     /// Window size (`1 << bucket_shift` bytes) and bucket count, fixed for the
     /// engine's reference. `n_buckets <= 32` is a hard invariant of the ballot
     /// loop in `bucket_count`/`bucket_scatter`.
+    /// The bucket window is sized for the sieve's packed planes (a quarter of
+    /// a byte per base), not for the byte reference: a chunk the sieve does not
+    /// gate (the unit switched it off, or its guard holds the plain gate) then
+    /// skips the bucket pass, whose window would not fit the L2 as bytes.
+    #[cfg(feature = "ref-loc-buckets")]
+    bucket_planes: bool,
     #[cfg(feature = "ref-loc-buckets")]
     bucket_shift: u32,
     #[cfg(feature = "ref-loc-buckets")]
@@ -1254,17 +1260,29 @@ const BUCKET_STREAM_BYTES: u64 = 1 << 20;
 /// path: the third element is `false` and the returned shift/count are still
 /// the smallest legal ones, so a caller that forces the pass on anyway has
 /// somewhere sane to run.
+///
+/// `planes` (round 106): under the score-gate sieve the gate's random reads go
+/// to the 2-bit planes, a quarter of a byte per base, and its keep bits are
+/// written in order. A window of `2^s` bases then costs `2^s / 4` bytes and the
+/// `max_hits/8` term drops out, so the window can be four times longer in bases:
+/// fewer buckets and a cheaper pass. The budget is half of the L2 rather than
+/// three quarters: on an A100 (40 MiB) 16 MiB of planes measured 3% less GPU
+/// busy than 32 MiB. That A100's byte rule switched the pass off altogether at
+/// production batch sizes; with this one it takes unit 0's sieve gate from
+/// 16.0 to 6.8 s for a 3.6 s pass.
 #[cfg(feature = "ref-loc-buckets")]
-fn ref_bucket_policy(ref_len: u32, max_hits: u32, l2_bytes: u64) -> (u32, u32, bool) {
+fn ref_bucket_policy(ref_len: u32, max_hits: u32, l2_bytes: u64, planes: bool) -> (u32, u32, bool) {
     let buckets = |s: u32| (ref_len >> s) + 1;
     // `ref_len` is a u32, so `ref_len >> 31 <= 1` and this always lands.
     let min_shift = (16..=31).find(|&s| buckets(s) <= 32).unwrap_or(31);
-    let budget = (l2_bytes / 4) * 3;
-    let overhead = u64::from(max_hits) / 8 + BUCKET_STREAM_BYTES;
-    match (min_shift..=31)
-        .rev()
-        .find(|&s| l2_bytes > 0 && (1u64 << s) + overhead <= budget)
-    {
+    let fits = |s: u32| {
+        if planes {
+            (1u64 << s) / 4 + BUCKET_STREAM_BYTES <= l2_bytes / 2
+        } else {
+            (1u64 << s) + u64::from(max_hits) / 8 + BUCKET_STREAM_BYTES <= (l2_bytes / 4) * 3
+        }
+    };
+    match (min_shift..=31).rev().find(|&s| l2_bytes > 0 && fits(s)) {
         Some(shift) => (shift, buckets(shift), true),
         None => (min_shift, buckets(min_shift), false),
     }
@@ -1279,6 +1297,7 @@ fn ref_bucket_geometry(
     ref_len: u32,
     max_hits: u32,
     l2_bytes: u64,
+    planes: bool,
 ) -> Result<(u32, u32, bool), String> {
     let buckets = |s: u32| (ref_len >> s) + 1;
     // `ref_len` is a u32, so `ref_len >> 31 <= 1` and this always lands.
@@ -1302,7 +1321,7 @@ the ballot loop allows at most 32 (use shift >= {min_shift})",
         }
         return Ok((shift, buckets(shift), true));
     }
-    let (shift, n_buckets, fits) = ref_bucket_policy(ref_len, max_hits, l2_bytes);
+    let (shift, n_buckets, fits) = ref_bucket_policy(ref_len, max_hits, l2_bytes, planes);
     assert!(
         n_buckets <= 32,
         "ref bucket count {n_buckets} exceeds the 32-wide ballot loop"
@@ -1823,10 +1842,19 @@ impl Engine {
         // forces the pass on). `HSPZ_REF_BUCKETS_TRIAL_ANYWAY=1` (debug-only)
         // lifts the geometry auto-off under `auto` so the blocks can be
         // exercised where the window does not fit.
+        // Under the sieve the bucket window is sized for the packed planes.
+        // Whether the sieve runs is settled per unit (IUPAC codes in a query
+        // switch it off); what can be known here is whether the scoring allows it.
+        #[cfg(feature = "gate-sieve")]
+        let bucket_planes =
+            sieve_request().0 && sieve::classes(cfg.sub_mat, cfg.xdrop, false, false).is_ok();
+        #[cfg(all(feature = "ref-loc-buckets", not(feature = "gate-sieve")))]
+        let bucket_planes = false;
         #[cfg(feature = "ref-loc-buckets")]
         let (bucket_shift, n_buckets, bucket_mode) = {
             let l2 = l2_cache_bytes();
-            let (shift, n, fits) = ref_bucket_geometry(cfg.ref_seq.len() as u32, max_hits, l2)?;
+            let (shift, n, fits) =
+                ref_bucket_geometry(cfg.ref_seq.len() as u32, max_hits, l2, bucket_planes)?;
             let req = parse_bucket_env().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             // A pinned shift is an explicit request: force ON under `auto`.
             // Geometry auto-off still wins over everything (a pinned shift
@@ -1840,6 +1868,17 @@ impl Engine {
                 // debug escape lifts it only for `auto` trials.
                 BucketRequest::Auto if !fits && !anyway => BucketMode::Forced(false),
                 BucketRequest::Auto if pinned && !anyway => BucketMode::Forced(true),
+                // Under the sieve a plane-sized window that fits is simply on,
+                // unless `auto` was asked for by name. The trial needs 18 s of
+                // gate per engine, a quarter of a reference bin's gate at sieve
+                // speed, and only counts chunks of at least a quarter of
+                // `max_hits`, which an 80 GB card's production batches never
+                // reach: there it would stay on the plain path for ever.
+                BucketRequest::Auto
+                    if bucket_planes && !anyway && std::env::var("HSPZ_REF_BUCKETS").is_err() =>
+                {
+                    BucketMode::Forced(true)
+                }
                 BucketRequest::Auto => BucketMode::Auto {
                     phase: AutoPhase::Warm { n: 0 },
                     blocks: Vec::new(),
@@ -1853,9 +1892,14 @@ impl Engine {
             if cfg.timing {
                 if on {
                     eprintln!(
-                        "  ref buckets: on — shift {} ({} window), {} buckets, L2 {} MiB ({})",
+                        "  ref buckets: on — shift {} ({} window{}), {} buckets, L2 {} MiB ({})",
                         shift,
                         window_desc(shift),
+                        if bucket_planes {
+                            format!(", {} of packed planes", window_desc(shift - 2))
+                        } else {
+                            String::new()
+                        },
                         n,
                         l2 >> 20,
                         if l2 > 0 { "device attr" } else { "unavailable" },
@@ -1870,8 +1914,13 @@ impl Engine {
                         "L2 attribute unavailable".to_string()
                     } else {
                         format!(
-                            "{} smallest legal window exceeds the 3/4-L2 budget (L2 {} MiB)",
+                            "{} smallest legal window exceeds the {} budget (L2 {} MiB)",
                             window_desc(shift),
+                            if bucket_planes {
+                                "half-L2 packed-plane"
+                            } else {
+                                "3/4-L2"
+                            },
                             l2 >> 20,
                         )
                     };
@@ -1943,6 +1992,8 @@ impl Engine {
             buf_bucket_counts: unsafe { uninitialized(&stream, 0)? },
             #[cfg(feature = "ref-loc-buckets")]
             buf_flags_bits: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "ref-loc-buckets")]
+            bucket_planes,
             #[cfg(feature = "ref-loc-buckets")]
             bucket_shift,
             #[cfg(feature = "ref-loc-buckets")]
@@ -2753,8 +2804,25 @@ impl Engine {
             // path; timed chunks feed the block accounting at the
             // survivor-total sync below. Warm chunks and Forced/Decided
             // chunks never time.
+            // `gate-sieve`: this unit's class constants when the bound is on.
+            // The guard samples the candidate fraction on every `period`th
+            // chunk and holds the plain gate while the bound rejects too little.
+            #[cfg(feature = "gate-sieve")]
+            let (sieve_args, sieve_sample) = match (self.sieve.args, self.sieve.guard.next_batch())
+            {
+                (None, _) => (None, false),
+                (Some(_), GuardStep::Plain) => (None, false),
+                (args, GuardStep::Sieve) => (args, false),
+                (args, GuardStep::Sample) => (args, true),
+            };
+            #[cfg(not(feature = "gate-sieve"))]
+            #[cfg_attr(not(feature = "dense-anchors"), allow(unused_variables))]
+            let sieve_args: Option<(i32, i32, i32, i32)> = None;
             #[cfg(feature = "ref-loc-buckets")]
-            let (bucket_pass, time_span) = {
+            let (bucket_pass, time_span) = if self.bucket_planes && sieve_args.is_none() {
+                // A plane-sized window does nothing for the plain gate.
+                (false, false)
+            } else {
                 let max_hits = self.max_hits;
                 let timed = self.bucket_mode.auto_chunk(iter_num_hits, max_hits);
                 if timed {
@@ -3303,20 +3371,7 @@ impl Engine {
                         .record(&self.stream)?;
                 }
                 let stage = self.stage();
-                // `gate-sieve`: this unit's class constants when the bound is on;
-                // the same launch then goes to the sieve kernel of its path.
-                // The guard samples the candidate fraction on every `period`th
-                // batch and holds the plain gate while the bound rejects too little.
-                #[cfg(feature = "gate-sieve")]
-                let (sieve_args, sieve_sample) =
-                    match (self.sieve.args, self.sieve.guard.next_batch()) {
-                        (None, _) => (None, false),
-                        (Some(_), GuardStep::Plain) => (None, false),
-                        (args, GuardStep::Sieve) => (args, false),
-                        (args, GuardStep::Sample) => (args, true),
-                    };
-                #[cfg(not(feature = "gate-sieve"))]
-                let sieve_args: Option<(i32, i32, i32, i32)> = None;
+                // With `sieve_args` the launch goes to the sieve kernel of its path.
                 // The sieve kernels write keep bits, one word per 32 hits, on both
                 // gate paths; the plain gate kernel writes a byte per hit.
                 let bits_pass = bucket_pass || sieve_args.is_some();
@@ -5449,28 +5504,28 @@ mod tests {
 
         // L4-like: 48 MiB L2 -> 36 MiB budget. Window 25 (32 MiB) plus the
         // ~3 MiB overhead fits; window 26 (64 MiB) does not.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 48 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 48 << 20, false);
         assert!(on, "L4-like L2 must fit a legal window");
         assert_eq!(shift, 25, "L4-like L2 must land on the 32 MiB window");
 
         // A 40 MiB L2 (A100-like) -> 30 MiB budget: 32 MiB + overhead misses,
         // so it settles on 16 MiB.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 40 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 40 << 20, false);
         assert!(on, "40 MiB L2 must fit a legal window");
         assert_eq!(shift, 24, "40 MiB L2 must land on shift 24");
 
         // RTX-4090-like: 72 MiB L2 -> 54 MiB budget: 32 MiB fits, 64 MiB does not.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 72 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 72 << 20, false);
         assert!(on, "4090-like L2 must fit a legal window");
         assert_eq!(shift, 25, "4090-like L2 must land on the 32 MiB window");
 
         // T4-like: 4 MiB L2 cannot fit even the smallest legal (16 MiB) window.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 4 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 4 << 20, false);
         assert!(!on, "T4-like L2 must auto-off");
         assert_eq!(shift, 24, "off still reports the smallest legal shift");
 
         // L2 attribute unavailable (0): off regardless of the arithmetic.
-        let (_shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 0);
+        let (_shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 0, false);
         assert!(!on, "an unavailable L2 attribute must auto-off");
 
         // Boundary: an L2 sized so the 16 MiB window plus overhead lands on the
@@ -5479,9 +5534,40 @@ mod tests {
         let exact_budget = (1u64 << 24) + overhead;
         let l2_bytes = exact_budget / 2 * 3;
         assert_eq!((l2_bytes / 3) * 2, exact_budget, "budget must hit exactly");
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, l2_bytes);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, l2_bytes, false);
         assert!(on, "an exact-boundary budget must count as a fit");
         assert_eq!(shift, 24, "boundary case still picks the 16 MiB window");
+    }
+
+    /// Round 106: under the sieve the window is sized for the packed planes, a
+    /// quarter of a byte per base, against half of the L2, and the batch size no
+    /// longer enters. An A100 (40 MiB), whose byte rule cannot fit any window at
+    /// its production batch size, lands on 64 Mbp windows (16 MiB of planes, 7
+    /// buckets for a 427 Mbp bin), the measured optimum; so does the L4; the
+    /// 4090 takes 128 Mbp; a T4 stays off.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn ref_bucket_policy_sizes_the_window_for_packed_planes() {
+        const REF_LEN: u32 = 427_000_000;
+        const A100_HITS: u32 = 332_401_664;
+
+        let (_, _, on) = ref_bucket_policy(REF_LEN, A100_HITS, 40 << 20, false);
+        assert!(
+            !on,
+            "the byte rule has no window for an A100 at production batches"
+        );
+        for (l2, shift, buckets) in [(40u64 << 20, 26, 7), (48 << 20, 26, 7), (72 << 20, 27, 4)] {
+            let got = ref_bucket_policy(REF_LEN, A100_HITS, l2, true);
+            assert_eq!(got, (shift, buckets, true), "L2 {} MiB", l2 >> 20);
+        }
+        // T4-like: half of 4 MiB holds no legal window even as planes.
+        let (shift, _, on) = ref_bucket_policy(REF_LEN, A100_HITS, 4 << 20, true);
+        assert!(!on && shift == 24);
+        // The batch size does not enter the plane rule.
+        assert_eq!(
+            ref_bucket_policy(REF_LEN, 16_711_680, 40 << 20, true),
+            ref_bucket_policy(REF_LEN, A100_HITS, 40 << 20, true)
+        );
     }
 
     /// Round 87 (blocks): the autotune decision rule on synthetic settled
