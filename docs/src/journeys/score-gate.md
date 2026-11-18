@@ -8,6 +8,12 @@
 <!-- @source: src/gpu/kernels.rs::bucket_scatter -->
 <!-- @source: src/gpu/kernels.rs::mark_score_survivors_reordered -->
 <!-- @source: src/gpu/kernels.rs::sort_survivors -->
+<!-- @source: src/gpu/sieve.rs::classes -->
+<!-- @source: src/gpu/sieve.rs::bound_words -->
+<!-- @source: src/gpu/kernels.rs::pack_planes -->
+<!-- @source: src/gpu/kernels.rs::mark_score_survivors_sieve -->
+<!-- @source: src/gpu/kernels.rs::count_bits -->
+<!-- @source: src/gpu/kernels.rs::emit_bits_plain -->
 
 ## D.1 — Feed coalesced anchor chunks to a warp
 <!-- @id: d-coalesced-anchors -->
@@ -27,7 +33,28 @@ sequenceDiagram
     W-->>S: one anchor at a time
 ```
 
-## D.2 — Compute a score-only X-drop bound
+## D.2 — Bound each anchor from packed bases first
+<!-- @id: d-sieve -->
+WHAT GOES IN: The warp's 32 anchors, 2-bit packed planes of the reference and of the query strand, and three class scores taken from the substitution matrix.
+WHAT HAPPENS: Each lane bounds its own anchor: over blocks of eight bases it counts matches and transitions across 64 bases to the right and 96 to the left, stops at the first query base that is not an uppercase A, C, G or T, and checks whether the bound has fallen by more than X-drop. An anchor whose two sides are certified and sum below the keep threshold is rejected, and one ballot collects the rest.
+WHAT COMES OUT: A 32-bit candidate mask per warp, about 1.5% of the anchors between human and mouse: the only ones the exact scorer of D.3 still walks.
+INVARIANT: The bound never undercuts the exact score, so a rejected anchor would have failed the exact comparison too and the keep bits are unchanged; when a scoring matrix or X-drop breaks that guarantee, the host switches the bound off for the run and says why.
+
+```mermaid
+sequenceDiagram
+    participant H as Host
+    participant P as Packed planes
+    participant L as Lane bound
+    participant W as Warp ballot
+    participant S as Exact scorer
+    H->>P: pack reference and query on the device
+    H->>L: class scores from the matrix, or off
+    P->>L: six reference and seven query groups
+    L-->>W: certified below threshold, or candidate
+    W-->>S: candidates only
+```
+
+## D.3 — Compute a score-only X-drop bound
 <!-- @id: d-score-only -->
 WHAT GOES IN: One anchor, encoded sequences, substitution matrix, X-drop, and the keep threshold the host precomputed from K.
 WHAT HAPPENS: Lanes score right and left prefixes four bases per lane and stop on the first X-drop or edge: one ballot marks the lanes with any drop, and each side reads the maximum before its first drop from its first dropping lane (from its last lane when nothing drops). Only the best total score is kept.
@@ -49,17 +76,17 @@ sequenceDiagram
     G->>G: integer total vs keep threshold
 ```
 
-## D.3 — Write one byte per decision
+## D.4 — Write one keep bit per decision
 <!-- @id: d-flags -->
-WHAT GOES IN: The score-only total and the keep threshold for hsp threshold K.
-WHAT HAPPENS: The common reject path writes zero; plausible anchors write a one-byte survivor flag.
-WHAT COMES OUT: A dense flag vector aligned with the original anchor array.
-INVARIANT: Rejection creates no HSP record, while every active flag slot is overwritten before reuse.
+WHAT GOES IN: The score-only total and the keep threshold for hsp threshold K, for each candidate of the chunk.
+WHAT HAPPENS: Lane 0 collects the chunk's decisions as bits and stores one 32-bit word per 32 anchors; an anchor the bound rejected is a zero bit that nothing has to store. With the bound off, the plain kernel writes one byte per anchor instead.
+WHAT COMES OUT: A dense bitmask aligned with the anchor array the gate read.
+INVARIANT: Rejection creates no HSP record, while every active word is overwritten before reuse.
 
 ```mermaid
 sequenceDiagram
     participant G as Threshold gate
-    participant F as Byte flags
+    participant F as Keep bits
     participant R as Reject path
     participant K as Keep path
     G->>R: total below the keep threshold
@@ -68,27 +95,27 @@ sequenceDiagram
     K-->>F: 1
 ```
 
-## D.4 — Compact survivors without reordering
+## D.5 — Compact survivors without reordering
 <!-- @id: d-compact -->
-WHAT GOES IN: One byte flag per raw anchor.
-WHAT HAPPENS: Device blocks count flags, the host scans only block sums, and stable local ranks emit original anchor IDs.
+WHAT GOES IN: One keep bit per raw anchor (one byte with the bound off).
+WHAT HAPPENS: Device blocks count the set bits, the host scans only block sums, and stable local ranks emit original anchor IDs.
 WHAT COMES OUT: A small, increasing list of survivor IDs for full materialization.
 INVARIANT: Stable compaction preserves raw hit order exactly, including under forced MAX_HITS chunking.
 
 ```mermaid
 sequenceDiagram
-    participant F as Byte flags
+    participant F as Keep bits
     participant C as Block counts
     participant H as Host prefix
     participant E as Stable emitter
     participant S as Survivor IDs
-    F->>C: ballots of kept flags
+    F->>C: population counts of keep words
     C-->>H: one count per block
     H-->>E: exclusive block offsets
     E-->>S: original IDs in order
 ```
 
-## D.5 — Optionally gate anchors by reference window
+## D.6 — Optionally gate anchors by reference window
 <!-- @id: d-ref-buckets -->
 WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`, default `auto`).
 WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, each a window that fits three quarters of the L2, so consecutive warps gather from one cached window; the gate then writes one keep bit per anchor.

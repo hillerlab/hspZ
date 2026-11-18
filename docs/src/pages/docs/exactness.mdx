@@ -17,6 +17,14 @@ The error names the work unit and the remedies: soft-mask repeats, or choose a
 smaller `-B`, `-C` or `-I`, which is a new layout. A changed layout gets a
 new frozen digest; it is not compared against a digest from another layout.
 
+The score-gate sieve of 0.1.0 is not a knob in this sense: it rejects an anchor
+only when an upper bound on its score is below the threshold, so the bytes are
+those of 0.0.6 (whole hg38 × mm39 on an A100: the same 3,864 files). It switches
+itself off, and `--time` says why, whenever the bound would not hold: `--ambiguous
+n` or `iupac`, an `--xdrop` of 1000 or more with default scoring, IUPAC codes
+other than N in the query, or a custom matrix whose mismatches do not drift
+downward. `HSPZ_GATE_SIEVE=0` scores every anchor exactly.
+
 | knob | default | why the HSP set can move |
 | --- | --- | --- |
 | `-B`, `--seq-block-size` | 500,000,000 | changes reference bins and, unless overridden, query bins |

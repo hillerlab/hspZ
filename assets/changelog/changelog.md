@@ -36,6 +36,73 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.1.0] — 2026-11-18
+
+One exact speed-up, on by default. A whole genome takes about a quarter of the time and every byte of the output
+is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
+schedules planned on 0.0.x numbers no longer hold.
+
+- **The score-gate sieve: hg38 × mm39 on one A100 in 924 s instead of 3,492 s.** The score gate was 89% of that
+  run. It scores every seed hit exactly, one hit per warp, and rejects all but about 0.01% of them. Now each lane
+  first bounds the score of *its own* hit from 2-bit packed bases, and the warp scores exactly only the hits whose
+  bound reaches the threshold or could not be certified: about 1.5% of them between human and mouse. A hit is
+  rejected only when an upper bound on its score is below the threshold, so the keep decisions, the HSP set and
+  the files do not change.
+  - **How it works.** The reference and both query strands are packed on the device into two bit planes, plus
+    one plane marking query bases that are not an uppercase A, C, G or T. For its own hit a lane reads six
+    reference and seven query words, aligns them on the hit's diagonal, and walks 64 bases to the right and 96
+    to the left in blocks of eight: two population counts per block give the matches and transitions, and three
+    class scores taken from the substitution matrix (match, transition, transversion; 100, −31, −114 by default)
+    turn them into an upper bound on the X-drop extension. The walk stops at a marked query base, which ends the
+    exact extension too. If both sides are certified and their bounds sum below the threshold, the hit is
+    rejected without being scored. The bound is one branch-free block of 407 instructions for 32 hits; exact
+    scoring costs about 229 per hit.
+  - **When it switches itself off.** The class scores are derived from the matrix in use, and the sieve runs
+    only if every query base outside ACGT ends an extension (its scores are below `-xdrop`) and mismatches drift
+    downward. So it is off, and `--time` prints the reason, with `--ambiguous n` or `iupac`, with `--xdrop` at
+    1000 or above under default scoring, with IUPAC codes other than N in the query, and with matrices that do
+    not meet those conditions. IUPAC codes in the reference only loosen the bound.
+  - **Measured.** All on unit 0 of hg38 × mm39 (125.6 billion hits) at one GPU, in reversed pairs, each arm
+    byte-identical to the recorded digest of that unit:
+
+    | GPU | setting | score gate | wall |
+    | --- | --- | --- | --- |
+    | A100 80GB | production defaults | 63.9 → 12.8 s (5.0×) | 78.0 → 24.5 s (3.2×) |
+    | A100 80GB | `--max-hits 16711680`, device seeder | 71.0 → 16.0 s (4.4×) | 85.4 → 28.8 s (3.0×) |
+    | A100 80GB | the same with `--hspthresh 2400` | 71.0 → 16.5 s (4.3×) | 85.7 → 29.6 s (2.9×) |
+    | L4 | production defaults | 120.0 → 19.1 s (6.3×) | 157.5 → 56.5 s (2.8×) |
+    | L4 | `--max-hits 16711680`, device seeder, bucket pass forced on | 120.8 → 14.9 s (8.1×) | 156.2 → 51.7 s (3.0×) |
+
+    Whole hg38 × mm39 on one A100 with production defaults: 923.8 s, against 3,491.8 s for 0.0.5 on the same
+    inputs, and the same 3,864 files, 865,049,792 bytes and 15,917,736 HSPs. What remains of that run is the
+    score gate (628 s), `find_hits` (134 s) and about 130 s of host work. Other pairs, more than one GPU and
+    other GPU classes were not measured for this release.
+  - **Runtime switch.** `HSPZ_GATE_SIEVE=0` scores every hit exactly, as 0.0.6 did. `HSPZ_GATE_SIEVE=gather`
+    loads the bound's reference words through shared memory instead of once per lane; that is faster where
+    memory bandwidth binds (L4 with its bucket pass off: 30.5 s against 41.0 s) and slower on an A100 (19.0 s
+    against 16.0 s), so per-lane loads are the default. `auto` gathers only when the bucket pass is off.
+  - **Costs.** Device memory grows by a quarter of a byte per reference base and three quarters per query base
+    (under 0.5 GB for 500 Mbp bins). The first run on a machine compiles a larger kernel module (2.6 s against
+    0.8 s on an L4, then cached).
+  - **Guard.** Where the bound rejects little, such as long unmasked satellite arrays, a hit would pay the
+    bound on top of exact scoring, and the bound's own time per hit is about 20% of exact scoring on an A100
+    and 11–25% on an L4. So every 32nd score-gate launch counts the hits the bound passed, and when that is
+    more than half of them the launches up to the next count run the exact gate alone. On two diverged copies
+    of one tandem array, where the bound passes every hit, the score gate takes +8% with the guard and +33%
+    without it (RX 6500 XT); the output is the same either way. `HSPZ_GATE_SIEVE_GUARD=<n>` sets the interval
+    and `0` removes the guard; a run where the guard acted prints a `#sieve guard:` line.
+  - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
+    IUPAC codes, both sequence ends, five X-drops, two matrices) finds no certified bound below the exact score
+    and no kept hit rejected, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 28
+    option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
+    `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
+    exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`
+    keep the machine code of 0.0.6.
+- **Survivor flags are bits.** With the sieve on, the gate writes one keep bit per hit instead of one byte, and
+  the survivor count and emit kernels read 32 hits per word: 52.7 s → 3.6 s over the whole-genome run above.
+- **`--xdrop` above 214,748,364 is refused.** The record separator scores `-10 × xdrop`; past that value the
+  product wrapped, a separator scored near zero and an extension could run across records.
+
 ## [0.0.6] — 2026-11-04
 
 - **`run --paired`: record *i* of `-r` against record *i* of `-q` only.** It is built for make_lastz_chains'
