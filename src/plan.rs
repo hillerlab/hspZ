@@ -1059,6 +1059,12 @@ fn max_packed(bins: &[Bin]) -> Result<u64, String> {
 ///   groups of padding — and `ceil(H/8)` for the candidate words of its count
 ///   diagnostic; zero otherwise. The query planes are freed before a swap
 ///   uploads the next query, so they add nothing to the swap overlap.
+/// - group line: under `find-hits-groups` + `ref-loc-buckets` + `gate-sieve`,
+///   and for `k <= 12` (the engine builds the tables for no longer seed),
+///   add `4 * 4^k` for the counts per k-mer, `max(64 MiB, ref_bp / 4)` for the
+///   rows of the k-mers whose counts do not fit (the engine keeps the count and
+///   the scatter for a reference that would need more), `4S` for the seeds'
+///   words and `4 * 8 * ceil(S/32)` plus its block sums for the runs' histogram.
 /// - 64 MiB unmodelled headroom
 ///
 /// `C = wga_chunk_size`, `S = C * (1+k if transitions else 1)`, `H = max_hits`.
@@ -1145,6 +1151,24 @@ pub fn unit_device_bytes(
         0
     };
 
+    // The group line (round 119): the counts per k-mer, the allowance for the
+    // rows of edges, a word per seed and the runs' histogram with its block sums.
+    let group_line_b: u128 = if cfg!(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )) && kmer_size <= 12
+    {
+        let runs = 8 * s.div_ceil(32);
+        (1u128 << (2 * kmer_size)) * 4
+            + (u128::from(ref_bp) / 4).max(64 << 20)
+            + 4 * s
+            + 4 * runs
+            + 8 * runs.div_ceil(256)
+    } else {
+        0
+    };
+
     // The largest term is below 2^66 and the full sum below 2^67;
     // only the final conversion to u64 can overflow.
     let total = u128::from(ref_bp).div_ceil(u128::from(step)) * 4
@@ -1157,6 +1181,7 @@ pub fn unit_device_bytes(
         + bucket_scan_b
         + bucket_bits_b
         + sieve_b
+        + group_line_b
         + 16 * s
         + 8 * s
         + 4 * c

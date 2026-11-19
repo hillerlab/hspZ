@@ -234,6 +234,31 @@ ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-iupac-query    off "$R" "$W/qry_iup
 ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-satellite      on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 grep -q 'query without a mask plane' "$W/defaults.1.err" || { echo "defaults: the query still has its mask plane"; fail=$((fail+1)); }
 grep -q 'query without a mask plane' "$W/mask-plane.1.err" && { echo "mask-plane: the plane was dropped"; fail=$((fail+1)); }
+
+# Round 119: a bucketed chunk's anchors are written in bucket order from its seeds, with no raw pass, no count over
+# anchors and no scatter; it is on wherever survivors go by sorted slot, so the bucketed arms above already run it.
+# The control has the group kernels off and keeps the count and the scatter. `check` runs both on every chunk and
+# compares each bucket's anchors on the host; `=0` is the count and the scatter with everything else on.
+for shift in 25 24 23; do
+  ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=$shift HSPZ_HITS_BUCKETED=check" arm hits-bucketed-check-$shift on "$R" "$Q"
+done
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=24 HSPZ_HITS_BUCKETED=check" arm hits-bucketed-small-chunks on "$R" "$Q" -C 60000
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23" arm hits-bucketed-2400        on  "$R" "$Q" -H 2400
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23" arm hits-bucketed-iupac       on  "$W/ref_iupac.fa" "$W/qry_iupac.fa"
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23 HSPZ_HITS_BUCKETED=0" arm hits-bucketed-off on "$R" "$Q"
+# The group kernels' own check compares raw anchors, so under it the anchors must still be written raw.
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23 HSPZ_FIND_HITS_GROUPS=check" arm hits-bucketed-groups-check on "$R" "$Q"
+for a in hits-bucketed-check-25 hits-bucketed-check-24 hits-bucketed-check-23 hits-bucketed-small-chunks; do
+  grep -q '^bucket order from the seeds check: .* every bucket the same anchors' "$W/$a.1.err" \
+    || { echo "$a: the check did not run"; fail=$((fail+1)); }
+done
+for a in hits-bucketed-2400 hits-bucketed-iupac survivors-slots-chunks; do
+  grep -q '^bucket order from the seeds: [0-9]* chunks' "$W/$a.1.err" || { echo "$a: the anchors were not written from the seeds"; fail=$((fail+1)); }
+done
+grep -q '^bucket order from the seeds' "$W/hits-bucketed-off.1.err" && { echo "hits-bucketed-off: the anchors were written from the seeds"; fail=$((fail+1)); }
+grep -q '^  ref_bucket_scatter' "$W/hits-bucketed-off.1.err" || { echo "hits-bucketed-off: the scatter did not run"; fail=$((fail+1)); }
+grep -q '^bucket order from the seeds' "$W/hits-bucketed-groups-check.1.err" && { echo "hits-bucketed-groups-check: the anchors were written from the seeds"; fail=$((fail+1)); }
+grep -q '^find_hits by groups check: .* every anchor equal' "$W/hits-bucketed-groups-check.1.err" || { echo "hits-bucketed-groups-check: the check did not run"; fail=$((fail+1)); }
 grep -q 'query without a mask plane' "$W/gather.1.err" && { echo "gather: the gathered arm lost its mask plane"; fail=$((fail+1)); }
 
 echo

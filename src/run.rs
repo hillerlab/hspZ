@@ -4816,6 +4816,36 @@ pub(crate) fn report_counts(stats: &Stats) {
     for line in crate::gpu::sieve_totals::report() {
         eprintln!("{line}");
     }
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    {
+        use crate::gpu::hits_bucketed_totals as t;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
+        if chunks > 0 {
+            eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        let (chunks, hits) = (
+            t::CHECKED_CHUNKS.load(Relaxed),
+            t::CHECKED_HITS.load(Relaxed),
+        );
+        if chunks > 0 {
+            eprintln!(
+                "bucket order from the seeds check: {chunks} chunks, {hits} hits, every bucket the same anchors as the scatter's"
+            );
+            let (seeds, saturated) = (
+                t::CHECKED_SEEDS.load(Relaxed),
+                t::SATURATED_SEEDS.load(Relaxed),
+            );
+            eprintln!(
+                "bucket order from the seeds check: {saturated} of {seeds} seeds read a row of the table ({:.3}%)",
+                100.0 * saturated as f64 / seeds.max(1) as f64
+            );
+        }
+    }
     #[cfg(feature = "find-hits-groups")]
     {
         use crate::gpu::find_hits_groups_totals as t;

@@ -1113,6 +1113,431 @@ pub mod device {
         (v, before_v)
     }
 
+    /// [`run_owner`] without the owner's `before`: the last lane whose `before`
+    /// is at most `h`. With a lane's first position index less its `before`
+    /// shuffled from the owner, the index of hit `h` is that value plus `h`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn run_owner_lane(before: u32, h: u32) -> u32 {
+        let mut v = 0u32;
+        let mut step = 16u32;
+        while step > 0 {
+            if warp::shuffle_sync(FULL_MASK, before, v + step) <= h {
+                v += step;
+            }
+            step >>= 1;
+        }
+        v
+    }
+
+    /// Edge `w` of a k-mer whose positions are `pos_table[start..end]`: the
+    /// index of its first position whose anchor falls in bucket `w` or a later
+    /// one, so `edge(w)..edge(w + 1)` is the k-mer's slice of bucket `w`.
+    /// Positions ascend within a k-mer (`seed.rs`), which is what makes each
+    /// slice contiguous. The bucket is the bucket pass's:
+    /// `min((pos + seed_size) >> shift, n_buckets - 1)`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn bucket_edge(
+        pos_table: &[u32],
+        start: u32,
+        end: u32,
+        w: u32,
+        shift: u32,
+        seed_size: u32,
+        n_buckets: u32,
+    ) -> u32 {
+        if w == 0 {
+            start
+        } else if w >= n_buckets {
+            end
+        } else {
+            lower_bound_in(
+                pos_table,
+                start,
+                end,
+                (w << shift).saturating_sub(seed_size),
+            )
+        }
+    }
+
+    /// Whether a k-mer's word of [`bucket_nibbles`] points at a row of edges
+    /// instead of holding the counts.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn nibble_escapes(w: u32) -> bool {
+        w & 0xFF == 0xFF
+    }
+
+    /// Round 119: a k-mer's hits per bucket in four bits each, for at most
+    /// eight buckets. A table of every k-mer's bucket edges would be eight or
+    /// sixteen times the index table, and one random row of it per seed costs
+    /// three times what `find_num_hits` pays per seed on an A100, whose L2 holds
+    /// most of the index table and little of that; this one is the size of the
+    /// index table.
+    ///
+    /// A count above 14 does not fit: such a k-mer's word is `0xFF` (no word of
+    /// counts has two nibbles of 15) and `sat[k]` is 1, for
+    /// [`bucket_overflow_rows`] to give it a row of edges.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_nibbles(
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_size: u32,
+        shift: u32,
+        n_buckets: u32,
+        n_kmers: u32,
+        mut nibbles: DisjointSlice<u32>,
+        mut sat: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let end = index_table[k as usize];
+            let start = if k > 0 {
+                index_table[(k - 1) as usize]
+            } else {
+                0
+            };
+            let (mut w, mut over) = (0u32, 0u32);
+            let mut lo = start;
+            let mut b = 0u32;
+            while b < n_buckets {
+                let hi = bucket_edge(pos_table, start, end, b + 1, shift, seed_size, n_buckets);
+                let c = hi - lo;
+                if c > 14 {
+                    over = 1;
+                }
+                w |= c.min(14) << (4 * b);
+                lo = hi;
+                b += 1;
+            }
+            // SAFETY: `k < n_kmers`, the length of both.
+            unsafe {
+                *nibbles.get_unchecked_mut(k as usize) = if over != 0 { 0xFF } else { w };
+                *sat.get_unchecked_mut(k as usize) = over;
+            }
+            k += stride;
+        }
+    }
+
+    /// Round 119: the rows of the k-mers [`bucket_nibbles`] could not hold.
+    /// `sat_incl` is the inclusive scan of its `sat`, so a k-mer whose value
+    /// differs from the one before it is the `sat_incl[k] - 1`-th of them: its
+    /// `1 << row_shift` edges go to that row (the words past edge `n_buckets`
+    /// repeat the last edge) and its word becomes `0xFF | row << 8`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_overflow_rows(
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_size: u32,
+        shift: u32,
+        n_buckets: u32,
+        row_shift: u32,
+        n_kmers: u32,
+        sat_incl: &[u32],
+        mut nibbles: DisjointSlice<u32>,
+        mut rows: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let here = sat_incl[k as usize];
+            let before = if k > 0 { sat_incl[(k - 1) as usize] } else { 0 };
+            if here != before {
+                let row = here - 1;
+                let end = index_table[k as usize];
+                let start = if k > 0 {
+                    index_table[(k - 1) as usize]
+                } else {
+                    0
+                };
+                let mut w = 0u32;
+                while w < 1 << row_shift {
+                    let edge = bucket_edge(pos_table, start, end, w, shift, seed_size, n_buckets);
+                    // SAFETY: row `row` is below the number of saturated
+                    // k-mers, which sized `rows`; this k-mer owns it.
+                    unsafe { *rows.get_unchecked_mut(((row << row_shift) + w) as usize) = edge };
+                    w += 1;
+                }
+                // SAFETY: `k < n_kmers`.
+                unsafe { *nibbles.get_unchecked_mut(k as usize) = 0xFF | row << 8 };
+            }
+            k += stride;
+        }
+    }
+
+    /// Round 119: how many hits each run of 32 seeds of a chunk
+    /// has in each bucket, from the seeds' words of [`bucket_nibbles`]: one
+    /// thread per seed, one warp per run (the runs of
+    /// [`find_hits_groups_bucketed`]), no anchor read. Bucket-major and
+    /// run-minor, so one inclusive scan gives every run the end of its slice of
+    /// every bucket. Each seed's word is kept in `seed_nib` for the group
+    /// kernel, which then reads no table for a seed whose counts fit; a seed
+    /// whose word points at a row reads its edges there.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_bucket_counts(
+        seed_offsets: &[u64],
+        nibbles: &[u32],
+        bounds: &[u32],
+        start_seed_index: u32,
+        num_seeds: u32,
+        n_buckets: u32,
+        row_shift: u32,
+        num_runs: u32,
+        mut counts: DisjointSlice<u32>,
+        mut seed_nib: DisjointSlice<u32>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
+        let run = seed_slot / WARP_SIZE;
+        let live = seed_slot < num_seeds;
+        // The live lanes of a warp are its first ones: a warp with one has
+        // lane 0, and `run < num_runs`.
+        if warp::ballot_sync(FULL_MASK, live) == 0 {
+            return;
+        }
+        let (mut w, mut row, mut lo, mut esc) = (0u32, 0usize, 0u32, false);
+        if live {
+            // SAFETY: a seed of this chunk; its k-mer indexes the words, a
+            // word that escapes names a row, and the seed owns slot
+            // `seed_slot` of `seed_nib`.
+            unsafe {
+                let at = (seed_slot + start_seed_index) as usize;
+                let k = (*seed_offsets.get_unchecked(at) >> 32) as u32;
+                w = *nibbles.get_unchecked(k as usize);
+                *seed_nib.get_unchecked_mut(seed_slot as usize) = w;
+                esc = nibble_escapes(w);
+                if esc {
+                    row = ((w >> 8) << row_shift) as usize;
+                    lo = *bounds.get_unchecked(row);
+                }
+            }
+        }
+        let mut b = 0u32;
+        while b < n_buckets {
+            let mut c = (w >> (4 * b)) & 15;
+            if esc {
+                // SAFETY: edge `b + 1 <= n_buckets` of the k-mer's row.
+                let hi = unsafe { *bounds.get_unchecked(row + b as usize + 1) };
+                c = hi - lo;
+                lo = hi;
+            }
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 16);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 8);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 4);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 2);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 1);
+            if lane == 0 {
+                // SAFETY: lane 0 of run `run < num_runs` owns this slot.
+                unsafe { *counts.get_unchecked_mut((b * num_runs + run) as usize) = c };
+            }
+            b += 1;
+        }
+    }
+
+    /// Round 119: [`find_hits_groups`] and the bucket pass in one.
+    /// A warp expands a run of 32 seeds as there, and stores each anchor
+    /// straight at its place in bucket order instead of at its raw address.
+    ///
+    /// `incl` is the inclusive scan of [`run_bucket_counts`], so the word before
+    /// a run's own is where its slice of that bucket starts. A seed's hits of
+    /// one bucket are one contiguous slice of `pos_table`, `e[b]..e[b + 1]`: its
+    /// start and the counts in its word of `seed_nib`, or the row of edges that
+    /// word names when a count does not fit four bits.
+    ///
+    /// The run's hits are taken bucket by bucket. Inside bucket `b` they are
+    /// numbered `g = 0..total` in seed order, a prefix sum across the warp says
+    /// how many come before each seed, and lane `l` of a round takes hit
+    /// `round + l`: it finds the seed that holds it with five shuffles, loads
+    /// one position and stores at `start + g`. So one store instruction writes
+    /// 32 consecutive slots, as the raw kernel does. (Taking the hits seed by
+    /// seed and looking each one's place up stored about three slots of a
+    /// bucket at a time, parts of 32-byte sectors, and the kernel was 100 ms of
+    /// unit 0 slower per bucket.) The order inside a bucket is not the raw
+    /// order, and since round 116 nothing needs it to be.
+    ///
+    /// At most eight buckets (the host falls back above that).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_groups_bucketed(
+        pos_table: &[u32],
+        bounds: &[u32],
+        seed_nib: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_lo: &[u32],
+        incl: &[u32],
+        n_buckets: u32,
+        row_shift: u32,
+        num_runs: u32,
+        start_seed_index: u32,
+        num_seeds: u32,
+        mut sorted_anchor: DisjointSlice<u64>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
+        let run = seed_slot / WARP_SIZE;
+        let live = seed_slot < num_seeds;
+        let mut query_loc = 0u32;
+        let (mut w, mut row, mut lo, mut esc) = (0u32, 0usize, 0u32, false);
+        if live {
+            let at = (seed_slot + start_seed_index) as usize;
+            // SAFETY: `at` is a seed of this chunk; `run_bucket_counts` wrote
+            // its word at slot `seed_slot` of `seed_nib`, and a word that
+            // escapes names a row.
+            unsafe {
+                let seed_offset = *seed_offsets.get_unchecked(at);
+                query_loc = (seed_offset & 0xFFFF_FFFF) as u32 + seed_size;
+                w = *seed_nib.get_unchecked(seed_slot as usize);
+                lo = *seed_lo.get_unchecked(at);
+                esc = nibble_escapes(w);
+                if esc {
+                    row = ((w >> 8) << row_shift) as usize;
+                }
+            }
+        }
+        // The live lanes of a warp are its first ones.
+        if warp::ballot_sync(FULL_MASK, live) == 0 {
+            return;
+        }
+        // Lane `b` fetches where this run's slice of bucket `b` starts.
+        let mut run_start = 0u32;
+        if lane < n_buckets {
+            let flat = lane * num_runs + run;
+            if flat > 0 {
+                // SAFETY: a live warp's run is below `num_runs`, and `incl`
+                // holds `n_buckets * num_runs` words.
+                run_start = unsafe { *incl.get_unchecked(flat as usize - 1) };
+            }
+        }
+
+        let mut b = 0u32;
+        while b < n_buckets {
+            // This seed's hits in bucket `b`: `pos_table[lo..lo + c]`.
+            let mut c = (w >> (4 * b)) & 15;
+            if esc {
+                // SAFETY: edge `b + 1 <= n_buckets` of the k-mer's row.
+                c = unsafe { *bounds.get_unchecked(row + b as usize + 1) } - lo;
+            }
+            // What this lane and the lanes before it hold in the bucket.
+            let mut x = c;
+            let mut d = 1u32;
+            while d < WARP_SIZE {
+                let t = warp::shuffle_sync(FULL_MASK, x, lane.wrapping_sub(d) & (WARP_SIZE - 1));
+                if lane >= d {
+                    x += t;
+                }
+                d <<= 1;
+            }
+            let total = warp::shuffle_sync(FULL_MASK, x, WARP_SIZE - 1);
+            let before = x - c;
+            let start = warp::shuffle_sync(FULL_MASK, run_start, b);
+            // Hit `g` of the bucket, held by seed `v`, is the position at index
+            // `lo_v + (g - before_v)`: this lane's part of it.
+            let pos_key = lo.wrapping_sub(before);
+
+            let mut round = 0u32;
+            while round < total {
+                let g0 = round + lane;
+                let g1 = g0 + WARP_SIZE;
+                let g2 = g1 + WARP_SIZE;
+                let g3 = g2 + WARP_SIZE;
+                let v0 = run_owner_lane(before, g0);
+                let v1 = run_owner_lane(before, g1);
+                let v2 = run_owner_lane(before, g2);
+                let v3 = run_owner_lane(before, g3);
+                let at0 = warp::shuffle_sync(FULL_MASK, pos_key, v0).wrapping_add(g0);
+                let at1 = warp::shuffle_sync(FULL_MASK, pos_key, v1).wrapping_add(g1);
+                let at2 = warp::shuffle_sync(FULL_MASK, pos_key, v2).wrapping_add(g2);
+                let at3 = warp::shuffle_sync(FULL_MASK, pos_key, v3).wrapping_add(g3);
+                let query0 = warp::shuffle_sync(FULL_MASK, query_loc, v0);
+                let query1 = warp::shuffle_sync(FULL_MASK, query_loc, v1);
+                let query2 = warp::shuffle_sync(FULL_MASK, query_loc, v2);
+                let query3 = warp::shuffle_sync(FULL_MASK, query_loc, v3);
+                let (ok0, ok1, ok2, ok3) = (g0 < total, g1 < total, g2 < total, g3 < total);
+                let (mut r0, mut r1, mut r2, mut r3) = (0u32, 0u32, 0u32, 0u32);
+                // SAFETY: for `g < total` the index is one of the owner's
+                // positions of this bucket.
+                unsafe {
+                    if ok0 {
+                        r0 = *pos_table.get_unchecked(at0 as usize) + seed_size;
+                    }
+                    if ok1 {
+                        r1 = *pos_table.get_unchecked(at1 as usize) + seed_size;
+                    }
+                    if ok2 {
+                        r2 = *pos_table.get_unchecked(at2 as usize) + seed_size;
+                    }
+                    if ok3 {
+                        r3 = *pos_table.get_unchecked(at3 as usize) + seed_size;
+                    }
+                }
+                // SAFETY: the scanned counts give the run `total` slots of the
+                // bucket from `start`, inside `0..iter_num_hits`, and hit `g`
+                // takes slot `start + g`.
+                unsafe {
+                    if ok0 {
+                        *sorted_anchor.get_unchecked_mut((start + g0) as usize) =
+                            r0 as u64 | ((query0 as u64) << 32);
+                    }
+                    if ok1 {
+                        *sorted_anchor.get_unchecked_mut((start + g1) as usize) =
+                            r1 as u64 | ((query1 as u64) << 32);
+                    }
+                    if ok2 {
+                        *sorted_anchor.get_unchecked_mut((start + g2) as usize) =
+                            r2 as u64 | ((query2 as u64) << 32);
+                    }
+                    if ok3 {
+                        *sorted_anchor.get_unchecked_mut((start + g3) as usize) =
+                            r3 as u64 | ((query3 as u64) << 32);
+                    }
+                }
+                round += 4 * WARP_SIZE;
+            }
+            lo += c;
+            b += 1;
+        }
+    }
+
     /// [`find_num_hits`] that also writes where each seed's positions start in
     /// `pos_table`, for [`find_hits_groups`].
     #[cfg(feature = "find-hits-groups")]
