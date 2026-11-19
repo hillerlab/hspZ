@@ -1054,6 +1054,17 @@ fn max_packed(bins: &[Bin]) -> Result<u64, String> {
 ///   `4*32*ceil(H/256) + 8*ceil(32*ceil(H/256)/256)` for the bucket histogram
 ///   and its block sums; zero otherwise. The survivor sort needs no device
 ///   scratch — it is one block of shared memory, or a host round trip.
+/// - sieve: under `gate-sieve` add the packed planes — `8` bytes per 32
+///   reference bases and `12` per 32 query bases on each strand, each with 9
+///   groups of padding — and `ceil(H/8)` for the candidate words of its count
+///   diagnostic; zero otherwise. The query planes are freed before a swap
+///   uploads the next query, so they add nothing to the swap overlap.
+/// - group line: under `find-hits-groups` + `ref-loc-buckets` + `gate-sieve`,
+///   and for `k <= 12` (the engine builds the tables for no longer seed),
+///   add `4 * 4^k` for the counts per k-mer, `max(64 MiB, ref_bp / 4)` for the
+///   rows of the k-mers whose counts do not fit (the engine keeps the count and
+///   the scatter for a reference that would need more), `4S` for the seeds'
+///   words and `4 * 8 * ceil(S/32)` plus its block sums for the runs' histogram.
 /// - 64 MiB unmodelled headroom
 ///
 /// `C = wga_chunk_size`, `S = C * (1+k if transitions else 1)`, `H = max_hits`.
@@ -1128,6 +1139,36 @@ pub fn unit_device_bytes(
         0
     };
 
+    // `gate-sieve`: 2-bit planes of the reference, 2-bit planes plus a bad
+    // plane of both query strands, and the count diagnostic's candidate words.
+    // A plane has one group per 32 bases, one more, and the padding at both ends.
+    const PLANE_EXTRA: u128 = 1 + 2 * crate::gpu::sieve::PADG as u128;
+    let sieve_b: u128 = if cfg!(feature = "gate-sieve") {
+        8 * (u128::from(ref_bp) / 32 + PLANE_EXTRA)
+            + 2 * 12 * (u128::from(query_bp) / 32 + PLANE_EXTRA)
+            + h.div_ceil(8)
+    } else {
+        0
+    };
+
+    // The group line (round 119): the counts per k-mer, the allowance for the
+    // rows of edges, a word per seed and the runs' histogram with its block sums.
+    let group_line_b: u128 = if cfg!(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )) && kmer_size <= 12
+    {
+        let runs = 8 * s.div_ceil(32);
+        (1u128 << (2 * kmer_size)) * 4
+            + (u128::from(ref_bp) / 4).max(64 << 20)
+            + 4 * s
+            + 4 * runs
+            + 8 * runs.div_ceil(256)
+    } else {
+        0
+    };
+
     // The largest term is below 2^66 and the full sum below 2^67;
     // only the final conversion to u64 can overflow.
     let total = u128::from(ref_bp).div_ceil(u128::from(step)) * 4
@@ -1139,6 +1180,8 @@ pub fn unit_device_bytes(
         + h * bucket_b
         + bucket_scan_b
         + bucket_bits_b
+        + sieve_b
+        + group_line_b
         + 16 * s
         + 8 * s
         + 4 * c
@@ -1334,6 +1377,14 @@ pub struct HostEstimate {
     /// Per-worker peak without prefetch: the build is inline, so it does not
     /// overlap the query phase.
     pub per_worker_no_prefetch: u64,
+    /// One more packed query bin per worker: the next unit's bin, packed on a
+    /// thread while the current unit runs (round 107). Charged on top of either
+    /// shape, and only when [`host_query_ahead`] says it fits.
+    pub query_ahead: u64,
+    /// What one reference build holds more when it keeps all its pairs at once
+    /// (round 112), per worker. Charged only when [`host_pairs_at_once`] says
+    /// it fits.
+    pub pairs_at_once: u64,
 }
 
 pub fn host_estimate(
@@ -1386,15 +1437,22 @@ pub(crate) fn host_estimate_sizes(
 ) -> HostEstimate {
     let index = (1u64 << (2 * kmer_size)) * 4; // index_table, 4 B/entry
     let pos = largest_ref / step.max(1) as u64 * 4; // pos_table, 4 B/indexed bp
-    let counts = threads as u64 * index; // build_parallel pass-1 transient
+    // What a build holds beside its tables while it runs (`seed::build_parallel`).
+    let positions = largest_ref / step.max(1) as u64;
+    let counts = crate::seed::build_transient_bytes(threads, kmer_size, positions);
     let packed_ref = largest_ref * 2; // buf + enc (no rc for a reference bin)
     let query = largest_qry * 4; // buf + rc + enc + enc_rc
-    let pinned = 2 * max_seeds as u64 * 8; // two u64 seed slots
+    // Host seed slots (round 107): one per producer plus the two the consumer
+    // holds, each one worst-case batch of u64 seeds.
+    let slot = max_seeds as u64 * 8;
+    let pinned = (crate::seed::producers_auto(threads, slot as usize) as u64 + 2) * slot;
 
     HostEstimate {
         shared: ref_bp_total + qry_bp_total,
         per_worker_prefetch: packed_ref + counts + index + pos + query + pinned,
         per_worker_no_prefetch: (packed_ref + counts + index + pos).max(query + pinned),
+        query_ahead: query,
+        pairs_at_once: crate::seed::build_pairs_at_once_bytes(threads, kmer_size, positions),
     }
 }
 
@@ -1443,6 +1501,63 @@ pub fn host_peak(est: &HostEstimate, assignment: &[Vec<u32>], prefetch: bool) ->
                 }
             })
             .sum::<u64>()
+}
+
+/// Bytes the workers hold on top of [`host_peak`] when each packs its next
+/// query bin ahead of the unit that needs it.
+pub fn host_query_ahead_bytes(est: &HostEstimate, assignment: &[Vec<u32>]) -> u64 {
+    assignment.len() as u64 * est.query_ahead
+}
+
+/// Whether the workers may pack their next query bin ahead (round 107). It is a
+/// third rung below reference prefetch, decided after it: a host that only fits
+/// the reference prefetch keeps that and packs each query bin when its unit
+/// starts, as before. Without reference prefetch (refused by the flag or by the
+/// preflight) memory is the constraint and nothing is packed ahead. `available`
+/// is `None` when the host gave no reading; the request then stands, as it does
+/// for reference prefetch.
+pub fn host_query_ahead(
+    est: &HostEstimate,
+    assignment: &[Vec<u32>],
+    prefetch: bool,
+    available: Option<u64>,
+) -> bool {
+    prefetch
+        && match available {
+            Some(a) => {
+                host_peak(est, assignment, true) + host_query_ahead_bytes(est, assignment) <= a
+            }
+            None => true,
+        }
+}
+
+/// Bytes the workers hold on top of [`host_peak`] when each reference build
+/// keeps all its pairs at once. A worker builds one bin at a time.
+pub fn host_pairs_at_once_bytes(est: &HostEstimate, assignment: &[Vec<u32>]) -> u64 {
+    assignment.len() as u64 * est.pairs_at_once
+}
+
+/// Whether reference builds may keep all their pairs at once (round 112): the
+/// last rung, decided after reference prefetch and the query bins packed
+/// ahead, on top of whatever those two came to. Without a reading of the
+/// host's memory the builds stay in rounds, which hold no more than a build
+/// did before round 112.
+pub fn host_pairs_at_once(
+    est: &HostEstimate,
+    assignment: &[Vec<u32>],
+    prefetch: bool,
+    pack_ahead: bool,
+    available: Option<u64>,
+) -> bool {
+    let ahead = if pack_ahead {
+        host_query_ahead_bytes(est, assignment)
+    } else {
+        0
+    };
+    available.is_some_and(|a| {
+        host_peak(est, assignment, prefetch) + ahead + host_pairs_at_once_bytes(est, assignment)
+            <= a
+    })
 }
 
 /// FNV-1a over names, lengths and bases, in input order. A frozen manifest
@@ -2387,11 +2502,14 @@ mod tests {
     #[test]
     fn host_preflight_keeps_prefetch_then_falls_back_then_errors() {
         use super::{HostEstimate, host_peak, host_preflight};
-        // shared 100, per-worker prefetch 300, no-prefetch 150.
+        // shared 100, per-worker prefetch 300, no-prefetch 150, one query bin
+        // packed ahead 40.
         let est = HostEstimate {
             shared: 100,
             per_worker_prefetch: 300,
             per_worker_no_prefetch: 150,
+            query_ahead: 40,
+            pairs_at_once: 25,
         };
         let multi = |w: usize| vec![vec![0u32, 1]; w]; // every worker owns 2 bins
         // 1 worker: 100 + 300 = 400 fits → prefetch kept.
@@ -2412,6 +2530,37 @@ mod tests {
         // Mixed 2/1/1: only the first worker prefetches.
         let mixed = vec![vec![0u32, 1], vec![2], vec![3]];
         assert_eq!(host_peak(&est, &mixed, true), 100 + 300 + 150 + 150);
+
+        // Round 107: packing the next query bin ahead is a third rung. It costs
+        // one more packed query bin per worker on top of the prefetch shape and
+        // never takes the reference prefetch away from a host that fits it.
+        use super::{host_query_ahead, host_query_ahead_bytes};
+        assert_eq!(host_query_ahead_bytes(&est, &multi(4)), 160);
+        assert!(host_query_ahead(&est, &multi(1), true, Some(440)));
+        assert!(!host_query_ahead(&est, &multi(1), true, Some(439)));
+        assert_eq!(host_preflight(&est, &multi(1), 439), Ok(true));
+        assert!(host_query_ahead(&est, &one_each, true, Some(860)));
+        assert!(!host_query_ahead(&est, &one_each, true, Some(859)));
+        // No reference prefetch, no pack ahead; no reading, the request stands.
+        assert!(!host_query_ahead(&est, &multi(1), false, Some(u64::MAX)));
+        assert!(host_query_ahead(&est, &multi(4), true, None));
+        // The last rung: all pairs of a build at once, 25 per worker, on top of
+        // whatever the two rungs above came to.
+        use super::host_pairs_at_once;
+        assert!(host_pairs_at_once(&est, &multi(1), true, true, Some(465)));
+        assert!(!host_pairs_at_once(&est, &multi(1), true, true, Some(464)));
+        assert!(host_pairs_at_once(&est, &multi(1), true, false, Some(425)));
+        assert!(!host_pairs_at_once(&est, &multi(1), true, false, Some(424)));
+        assert!(host_pairs_at_once(&est, &multi(4), false, false, Some(800)));
+        assert!(!host_pairs_at_once(
+            &est,
+            &multi(4),
+            false,
+            false,
+            Some(799)
+        ));
+        // No reading: the builds stay in rounds.
+        assert!(!host_pairs_at_once(&est, &multi(1), true, true, None));
         // Shared counted once, never per worker.
         assert_eq!(
             host_peak(&est, &multi(2), true) - host_peak(&est, &multi(1), true),
@@ -3298,13 +3447,11 @@ mod tests {
                 0
             }
         };
-        // Round 2 sorted bitmask flags: 1 bit per hit, so it steps once per 8.
+        // Round 2 sorted bitmask flags and the sieve's candidate words: 1 bit per
+        // hit each, so each steps once per 8.
         let bmask = |h: u32| {
-            if cfg!(feature = "ref-loc-buckets") {
-                u64::from(h).div_ceil(8)
-            } else {
-                0
-            }
+            u64::from(h).div_ceil(8)
+                * (cfg!(feature = "ref-loc-buckets") as u64 + cfg!(feature = "gate-sieve") as u64)
         };
         assert_eq!(
             delta(255, 256),

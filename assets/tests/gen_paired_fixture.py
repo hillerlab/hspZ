@@ -18,6 +18,7 @@ Writes OUT/{targets,queries}.fa (every pair), OUT/c_{targets,queries}.fa
 low-complexity pairs and their neighbours) and OUT/pairs.tsv.
 """
 import gzip
+import os
 import subprocess
 import sys
 
@@ -25,6 +26,7 @@ SPAN = 19  # 12of19
 chain_path, t_fa, q_fa, out = sys.argv[1:5]
 n_gaps = int(sys.argv[5]) if len(sys.argv) > 5 else 300
 small_c = int(sys.argv[6]) if len(sys.argv) > 6 else 2000
+os.makedirs(out, exist_ok=True)
 
 gaps = []  # (t_name, t_from, t_to, q_name, q_from, q_to, strand), 1-based inclusive forward
 with gzip.open(chain_path, "rt") as fh:

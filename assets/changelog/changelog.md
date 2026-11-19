@@ -36,6 +36,230 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.1.0] — 2026-11-19
+
+Exact speed-ups, all on by default. A whole genome takes an eighth of the time and every byte of the output
+is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
+schedules planned on 0.0.x numbers no longer hold.
+
+hg38 × mm39 on A100 80GB cards, production defaults, the inputs of the 0.0.5 runs, every output byte-identical
+to that run's (3,864 files, 865,049,792 bytes, 15,917,736 HSPs):
+
+| cards | 0.0.5 | 0.1.0 | |
+| ---: | ---: | ---: | --- |
+| 1 | 3,491.8 s | **417–423 s** | 8.3× |
+| 8 | 576.9 s | **69.0 s** | 8.4× |
+
+Change by change (the last eight rows against the build before them on the same card):
+
+| change | one card | eight cards |
+| --- | --- | --- |
+| the score-gate sieve and its bucket pass | 3,492 → 773 s | 577 → 137 s |
+| one worker per card | | 137 → 126 s |
+| host side: seeds produced ahead, query packs ahead, inputs read together | 775 → 712 s, 765 → 703 s | 125 → 119 s |
+| `find_hits` by runs of 32 seeds per warp | 711 → 656 s, 703 → 648 s | 120 → 112 s |
+| the sieve's bound carried on for sides that have not decided | 656 → 588 s, 649 → 581 s | 111 → 100 s |
+| start-up: the seed table built by partitions, the devices opened once | 588 → 583 s, 581 → 576 s | 100 → 91 s |
+| the bucket pass without its loop of votes | 581 → 560 s, 575 → 555 s | 92.7 → 89.8 s |
+| a batch's survivors taken in bucket order | 560 → 531 s, 554 → 525 s | 88.6 → 85.7 s |
+| the sieve's bound without the query's mask plane | 531 → 503 s, 527 → 496 s | 86.5 → 80.9 s |
+| a batch's anchors written in bucket order from its seeds | 501 → 423 s, 497 → 417 s | 81.1 → 69.0 s |
+
+The same build takes 417 to 423 s on two cards of one node, so a difference of 1% between two runs is not a
+result, and the eight-card control of the bucket-pass row (92.7 s) was taken hours after the 91 s of the row
+above it, on a node whose host-side phases had drifted by about a second. Two, four and six cards were measured
+only before the last eight changes: 380.0, 218.1 and 149.4 s
+(1,771.8, 942.9 and 648.0 s with 0.0.5). All times are with `--time`, which itself costs about 3%. Other species
+pairs and other GPU classes were not measured for this release, except where a bullet says so.
+
+- **The score-gate sieve: the score gate of hg38 × mm39 on one A100 from 3,109 s to 215 s.** The gate was 89% of a
+  whole-genome run. It scores every seed hit exactly, one hit per warp, and rejects all but about 0.01% of them.
+  Now each lane first bounds the score of *its own* hit from 2-bit packed bases, and the warp scores exactly only
+  the hits whose bound reaches the threshold or could not be certified: about 0.04% of them between human and
+  mouse. A hit is rejected only when an upper bound on its score is below the threshold, so the keep decisions,
+  the HSP set and the files do not change.
+  - **How it works.** The reference and both query strands are packed on the device into two bit planes; a
+    base that is not an uppercase A, C, G or T is packed as a fill base (C in the reference, G in the query).
+    For its own hit a lane reads six reference and seven query words, aligns them on the hit's diagonal, and
+    walks 64 bases to the right and 96 to the left in blocks of eight: two population counts per block give the
+    matches and transitions, and three class scores taken from the substitution matrix (match, transition,
+    transversion; 100, −31, −114 by default) turn them into an upper bound on the X-drop extension. A class
+    score is the largest real score of any pair of symbols packed into that class, fill bases included, so the
+    bound is never below the real score. A side is certified once its bound has dropped by X-drop; if both
+    sides are certified and their bounds sum below the threshold, the hit is rejected without being scored.
+    That first window is one branch-free block for 32 hits; exact scoring costs about 229 instructions per hit.
+  - **No mask plane for the query.** The bound first read a third query plane marking the bases outside ACGT
+    and stopped its walk at the first of them, as the exact extension does. Packing those bases as G makes
+    them one more pair of codes under the class scores, exactly as such reference bases already were: a third
+    of the first window's loads, the tests for the marked base and a bit reversal of the left words go away,
+    and the plane is not built. The bound is looser there, so the exact scorer sees 0.037% of the hits of unit
+    0 instead of 0.023%, and the gate still takes 4.29 s instead of 4.85 s (4.58 against 5.14 s at
+    `--hspthresh 2400`); the whole genome goes from 531 to 503 s and from 527 to 496 s on two cards, and from
+    86.5 to 80.9 s on eight. `HSPZ_GATE_SIEVE_MASK=1` restores the plane, and `HSPZ_GATE_SIEVE=gather` and
+    `auto` keep it.
+  - **A side that has not decided is carried on.** Inside 64 and 96 bases a side often has neither met a
+    marked base nor dropped by X-drop; it used to abstain, and the hit went to the exact scorer: 1.4% of the
+    hits between human and mouse, each costing as much as bounding about 29 hits, so they were 29% of the
+    gate. Such a side now keeps walking, 32 bases at a time, up to 128 to the right and 160 to the left, for as
+    long as the hit is undecided (once the two bounds reach the threshold it goes to the exact scorer whatever
+    follows). The proof does not use the window's length. Each lane carries its own side and loads only its own
+    words, so the lanes that are done wait instead of working. On unit 0 of hg38 × mm39 the exact scorer sees
+    0.023% of the hits instead of 1.42% and the gate takes 4.87 s instead of 6.21 s; the whole genome goes from
+    656 to 588 s. `HSPZ_SIEVE_WORDS=2,3` restores the first window alone.
+  - **The bucket pass is sized for the packed bases.** The reference-locality pass in front of the gate (0.0.4)
+    sorts a batch's hits into reference windows that fit the L2. The sieve reads a quarter of a byte per base,
+    so its windows are four times longer in bases (64 Mbp on an A100 or an L4), the pass needs fewer buckets, and
+    an A100, which could not use the pass at its batch size before, now does: in L2 the sieve itself is 2.4×
+    faster. With the sieve on, the pass runs whenever such a window fits half of the L2, without the timed trial
+    of 0.0.4; a batch the sieve does not gate skips it. `HSPZ_REF_BUCKETS=0` turns the pass off and `auto` runs
+    the trial.
+  - **When it switches itself off.** The class scores are derived from the matrix in use, and the sieve runs
+    only if a match scores at least 0, a transition and a transversion at most 0, and a random pair drifts
+    downward. So it is off, and `--time` prints the reason, with `--ambiguous n` or `iupac` and with matrices
+    that do not meet those conditions. IUPAC codes in either sequence only loosen the bound (the transversion
+    class becomes −100). With the mask plane (`HSPZ_GATE_SIEVE_MASK=1`, `gather`, `auto`) a marked query base
+    must also end an extension, so there the sieve is off with `--xdrop` at 1000 or above under default
+    scoring and with IUPAC codes other than N in the query.
+  - **Measured.** With the sieve and its bucket pass alone the one-card run took 772.9 s (2, 4, 6 and 8 cards:
+    380.0, 218.1, 149.4 and 136.9 s); in the same session and on the same node the default build of 0.0.6 took
+    3,546.6 s. At `--hspthresh 2400`, the make_lastz_chains setting, one card took 933.8 s before the plane-sized
+    bucket pass against 3,524.1 s, with the same 29,001,375 HSPs.
+
+    Unit 0 of that pair (125.6 billion hits) in reversed pairs, each arm byte-identical to the digest recorded
+    for the unit:
+
+    | GPU | setting | score gate | wall |
+    | --- | --- | --- | --- |
+    | A100 80GB | production defaults | 63.9 → 6.2 s, plus a 3.0 s bucket pass | 78.0 → 21.3 s (3.7×) |
+    | A100 80GB | bucket pass off | 63.9 → 12.8 s (5.0×) | 78.0 → 24.5 s (3.2×) |
+    | L4 | bucket pass under the 0.0.4 trial, 16 Mbp windows | 120.0 → 19.1 s (6.3×) | 157.5 → 56.5 s (2.8×) |
+
+    On the L4 the plane-sized pass without the trial takes the unit's GPU time from 43.6 s to 37.5 s more (the
+    node's CPUs were shared that day, so its wall times are not quoted).
+  - **Runtime switch.** `HSPZ_SIEVE_WORDS=R,L` sets how many 32-base words a side may be carried to (2 to 4 on
+    the right, 3 to 5 on the left; unset is `4,5`). `HSPZ_GATE_SIEVE=0` scores every hit exactly, as 0.0.6 did. `HSPZ_GATE_SIEVE=gather`
+    loads the bound's reference words through shared memory instead of once per lane; that is faster where
+    memory bandwidth binds (L4 with its bucket pass off: 30.5 s against 41.0 s) and slower on an A100 (19.0 s
+    against 16.0 s), so per-lane loads are the default. `auto` gathers only when the bucket pass is off.
+  - **Costs.** Device memory grows by a quarter of a byte per reference base and half a byte per query base
+    (three quarters with the mask plane; under 0.5 GB for 500 Mbp bins). The first run on a machine compiles a larger kernel module (2.6 s against
+    0.8 s on an L4, then cached).
+  - **Guard.** Where the bound rejects little, such as long unmasked satellite arrays, a hit would pay the
+    bound on top of exact scoring, and the bound's own time per hit is about 20% of exact scoring on an A100
+    and 11–25% on an L4. So every 32nd score-gate launch counts the hits the bound passed, and when that is
+    more than half of them the launches up to the next count run the exact gate alone. On two diverged copies
+    of one tandem array, where the bound passes every hit, the score gate takes +8% with the guard and +33%
+    without it (RX 6500 XT); the output is the same either way. Every query starts with a count, and a count
+    too small to decide (under 65,536 hits) ends the exact-only stretch instead of extending it.
+    `HSPZ_GATE_SIEVE_GUARD=<n>` sets the interval and `0` removes the guard; a run where the guard acted
+    prints a `#sieve guard:` line.
+  - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
+    IUPAC codes, both sequence ends, five X-drops, two matrices), each walked at three window lengths and four
+    thresholds, finds no certified bound below the exact score, no kept hit rejected and no rejection taken
+    back by a longer window, and catches three deliberately low bounds; it runs with and without the mask
+    plane. `assets/tests/sieve-identity.sh` runs 62
+    option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
+    `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
+    exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`
+    keep the machine code of 0.0.6.
+- **`find_hits` by runs of 32 seeds per warp: 135 s → 73 s of GPU on that genome.** Hit expansion gave every
+  seed a warp (or a thread, below 8 hits per seed). At 22 hits per seed most of a warp's time was the chain of
+  loads it pays once per seed, not the hits. Now a warp owns 32 consecutive seeds: each lane loads its own
+  seed, the hit prefixes say how many of the run's hits come before each seed, and the lanes are spread over
+  the run's hits, each finding the seed that holds its hit with five shuffles. The anchors are the same words
+  in the same places, so nothing after this step changes.
+  - `find_num_hits` keeps each seed's first position index beside its count, so the expansion does not fetch
+    the same random line of the index table a second time.
+  - Four rounds of 32 positions are requested before any anchor is stored. With one round at a time a warp
+    had a single load in flight and the card waited on it: unit 0 on an A100 took 2,900 ms with a warp per
+    seed, 2,042 ms with runs of 32 seeds and one round, 1,515 ms with four.
+  - `HSPZ_FIND_HITS_GROUPS=0` restores the earlier kernels; `=check` runs both on every chunk and compares
+    every anchor on the host. On an A100 that check passed on all 125,607,610,143 anchors of unit 0.
+    `--paired` keeps its own kernel.
+- **The bucket pass without its loop of votes: 147 s → 127 s of GPU on that genome.** The pass sorts a batch's
+  hits by reference window in two kernels, a count and a scatter, and both learned which lanes of a warp share
+  a window by taking one vote per window: seven trips of a loop that every lane walked. One `match` instruction
+  now gives each lane the lanes that hold its window; the first of them stores the window's count for the warp,
+  and a lane's rank is the number of those lanes before it. The two buffers are the same words in the same
+  places. Unit 0 on an A100: count 1,048 → 782 ms, scatter 1,947 → 1,824 ms; what is left is the memory the
+  two kernels move, which is now close to what the card gives. `HSPZ_BUCKET_VOTES=loop` restores the earlier
+  kernels, and `HSPZ_BUCKET_ORDER_CHECK=<n>` proves the permutation on the device for the first n batches (on
+  an A100 it passed on the first 100 batches of unit 0, and `sieve-identity.sh` runs it on every batch with 1,
+  4, 8, 16 and 31 windows).
+- **A batch's anchors are written in bucket order from its seeds: 80 s less per genome on one card.** With the
+  bucket pass a batch's hits were expanded in seed order, counted per reference window and scattered into
+  window order: 32 bytes moved per hit after its position had been read, and on unit 0 as much GPU time as
+  nine tenths of the gate. But a k-mer's positions ascend, so its hits of one window are one slice of the
+  position table, and how many each window gets is a property of the k-mer, known before any hit is read.
+  - **Two small tables per reference bin**, built on the device in 3 ms: each k-mer's hits per window in four
+    bits (4 bytes per k-mer, the size of the index table: 64 MiB for 12of19), and a row of window edges for
+    the k-mers with more than 14 hits in a window (about 300,000 of 16.8 million on a bin of hg38, 9 MiB).
+  - **A pass over the seeds** sums those counts per run of 32 seeds, and a scan gives every run its place in
+    every window. The expansion then writes each anchor once, where it belongs: it takes a run's hits window
+    by window, numbers them, and lane `l` of a round takes hit `round + l`, so one store writes 32 consecutive
+    anchors. No hit is written in seed order, nothing is counted from anchors and nothing is scattered.
+  - **What it took to get there.** A first form read a row of every k-mer's window edges (512 MiB) per seed
+    and gained 2%: one random read of a table far larger than the L2 costs three times a lookup in the index
+    table, whoever does it. A second form stored a few anchors per seed and window at a time and lost 100 ms
+    of unit 0 per window to stores that covered parts of 32-byte sectors.
+  - **Measured.** Unit 0 on an A100: expansion and bucketing 4,099 → 2,487 ms, GPU time 8.70 → 7.10 s, wall
+    12.3 → 10.7 s; the whole genome 501 → 423 s and 497 → 417 s on two cards, 81.1 → 69.0 s on eight, the
+    same bytes. The order of anchors inside a window differs from before, which the change above made free.
+  - **Where it applies.** Wherever a batch's survivors are taken in bucket order, the reference bin has at
+    most eight windows and the seed at most 12 care bases (with 14of22 the counts would be a gibibyte, far
+    past the L2, and that case is not measured); `--paired`, `HSPZ_FIND_HITS_GROUPS=0`, `--dump-raw`, the
+    census and the checks keep the count and the scatter, and so does a bin whose rows of edges would take
+    more than a quarter of a byte per base (`--time` says so). `HSPZ_HITS_BUCKETED=0` restores the earlier path; `=check` runs both on
+    every batch and compares each window's anchors on the host (on an A100 it passed on the first 1.2 billion
+    hits of unit 0, and `sieve-identity.sh` runs it on every batch with two, four and eight windows).
+- **A batch's survivors are taken in bucket order: 29 s less per genome on one card.** The bucket pass sorts a
+  batch's hits by reference window for the gate. It also wrote every hit's place in the unsorted batch, the
+  survivors were mapped back through it and sorted, and the extension read the unsorted anchors: the order
+  of before the pass, kept because it had been the order. Nothing in the output depends on it. Each
+  survivor is extended on its own, and the host sorts a batch's HSPs with a comparison over all four fields of
+  a segment, so two segments it calls equal are the same bytes whatever order they arrived in. Now the
+  scatter writes the sorted anchors alone (16 bytes moved per hit instead of 20), the survivors are the sorted
+  slots of the kept bits, the extension reads the sorted anchors, and nothing is sorted. Unit 0 on an A100:
+  scatter 1,826 → 1,412 ms, the survivor sort 145 → 0 ms, GPU time 9.88 → 9.34 s; the whole genome 560 → 531 s
+  and 554 → 525 s, eight cards 88.6 → 85.7 s. `HSPZ_SURVIVOR_ORDER=raw` restores the earlier path, and
+  `--dump-raw`, the census and `HSPZ_BUCKET_ORDER_CHECK`, which show an order, keep it.
+- **Start-up: the seed table of a reference bin in a second instead of eight; the devices opened once.**
+  With eight cards a run was start-up plus its slowest worker: each worker built its first seed table in 7 to
+  9 s while seven others did the same, and the devices were opened twice (probed one after another for free
+  memory, released, then built again by each worker).
+  - **Seed table.** The builder made three random memory accesses per reference position. Now every position
+    is first written, with the low bits of its k-mer, into the stream of its partition (the k-mer's four
+    leading care bases), and each partition is sorted on its own, where its count table and its part of the
+    position table stay in cache: 0.8–1.1 s per worker with eight builds at once, byte-identical tables. The
+    pairs are 8 bytes per position; a bin's pairs are held at once where the host budget has room for them
+    and in rounds of at most max(512 MiB, the old builder's count tables) otherwise (`--time` prints which).
+    `HSPZ_SEED_TABLE=two-pass` restores the earlier builder and `=rounds` keeps the pairs bounded.
+  - **Devices.** The contexts of all cards are created at the same time and held to the end of the run, so a
+    worker only takes a reference to its card's context.
+  - On one card the first table is 0.5 s instead of 4.3 s and the run is about 1% shorter; peak resident
+    memory falls from 13.0 to 11.7 GB (42.2 to 38.3 GB at eight cards).
+- **Host side: seeds produced ahead, query packs ahead, inputs read together.** With the gate five times
+  faster, a one-card run spent a fifth of its time outside the GPU.
+  - **Seeds.** One seed batch used to be generated per loop iteration, with a thread spawned per core for
+    every batch, and joined one batch before it was needed: a fill that outlasted that batch's GPU work stalled
+    the card. Producers now run ahead of the GPU and write each batch in place, sliding one window over the
+    query instead of decoding 19 bases at every position (17.4 → 2.8 ms per batch per thread). A run that is
+    not pinned to a few cores gains most: unit 0 on a 128-core node took 40.8 s before and 19.4 s after.
+    `HSPZ_SEED_PRODUCERS=0` restores the earlier shape. With more than one worker the device seeder remains
+    the default.
+  - **Query packs.** The next work unit's query bin is packed on a thread while the current unit runs, if the
+    host budget has room for one more packed bin per worker (about 2 GB at 500 Mbp); `HSPZ_QUERY_PACK_AHEAD=0`
+    packs each bin when its unit starts.
+  - **Inputs.** The reference and the query are read at the same time.
+- **One worker per card when there are more cards than reference bins.** A run started at most one worker per
+  reference bin, so the eighth A100 idled on hg38's seven bins. Under the unit partition a run now starts up to
+  one worker per work unit (`HSPZ_WORKER_CAP=units`, the default; `bins` restores the old limit). Each extra
+  worker on a bin builds its own copy of the bin.
+- **Survivor flags are bits.** With the sieve on, the gate writes one keep bit per hit instead of one byte, and
+  the survivor count and emit kernels read 32 hits per word: 52.7 s → 3.6 s over the whole-genome run above.
+- **`--xdrop` above 214,748,364 is refused.** The record separator scores `-10 × xdrop`; past that value the
+  product wrapped, a separator scored near zero and an extension could run across records.
+
 ## [0.0.6] — 2026-11-04
 
 - **`run --paired`: record *i* of `-r` against record *i* of `-q` only.** It is built for make_lastz_chains'

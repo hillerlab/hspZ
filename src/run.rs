@@ -277,9 +277,13 @@ struct Batch {
 /// The GPU path only ever sees `&[u64]`, so whether the pages are pinned is
 /// invisible to it — that is what makes N1 a buffer-placement experiment rather
 /// than a pipeline change. Pinned slots are allocated once at the worst-case
-/// size so the seed worker never allocates mid-pass.
+/// size so a seed producer never allocates mid-pass; a pageable slot grows to
+/// that size on its first batch and stays there.
 enum SeedSlot {
-    Paged(Vec<u64>),
+    Paged {
+        buf: Vec<u64>,
+        len: usize,
+    },
     Pinned {
         buf: cuda_core::PinnedHostBuffer<u64>,
         len: usize,
@@ -291,33 +295,71 @@ impl SeedSlot {
     fn into_pinned(self) -> Option<cuda_core::PinnedHostBuffer<u64>> {
         match self {
             SeedSlot::Pinned { buf, .. } => Some(buf),
-            SeedSlot::Paged(_) => None,
+            SeedSlot::Paged { .. } => None,
         }
     }
 
     fn seeds(&self) -> &[u64] {
         match self {
-            SeedSlot::Paged(v) => v,
+            SeedSlot::Paged { buf, len } => &buf[..*len],
             SeedSlot::Pinned { buf, len } => &buf.as_slice()[..*len],
         }
     }
 
-    /// Concatenates the per-worker pieces into this slot. Identical work in both
-    /// variants — the `Vec` path is the concatenation `chunk_seeds_parallel`
-    /// already did, so pinning adds no copy.
-    fn fill(&mut self, parts: &[Vec<u64>]) {
-        let total: usize = parts.iter().map(Vec::len).sum();
-        match self {
-            SeedSlot::Paged(v) => {
-                v.clear();
-                v.resize(total, 0);
-                seed::concat_parts(parts, v);
+    /// Generates one batch's seeds into this slot: the sequence `chunk_seeds`
+    /// returns for `range`, whichever way it is produced. With one thread the
+    /// seeds are written in place (round 107); with more, the range is split
+    /// over scoped workers and their pieces concatenated, as before round 107.
+    fn fill(
+        &mut self,
+        seq: &[u8],
+        shape: &Shape,
+        transitions: bool,
+        range: (u32, u32),
+        threads: usize,
+    ) {
+        let cap = seed::max_seeds(range.1.saturating_sub(range.0), shape, transitions);
+        let (dst, len) = match self {
+            SeedSlot::Paged { buf, len } => {
+                if buf.len() < cap {
+                    buf.resize(cap, 0);
+                }
+                (buf.as_mut_slice(), len)
             }
-            SeedSlot::Pinned { buf, len } => {
-                *len = seed::concat_parts(parts, buf.as_mut_slice());
-                debug_assert_eq!(*len, total);
-            }
-        }
+            SeedSlot::Pinned { buf, len } => (buf.as_mut_slice(), len),
+        };
+        *len = if threads > 1 {
+            let parts = seed::chunk_seeds_parts(seq, shape, transitions, range, threads);
+            seed::concat_parts(&parts, dst)
+        } else {
+            seed::chunk_seeds_into(seq, shape, transitions, range, dst)
+        };
+    }
+}
+
+/// How the host seed stream is generated (round 107), as `(producers, threads
+/// per producer)`.
+///
+/// Unset: [`seed::producers_auto`] producers, each writing whole batches on its
+/// own thread, so nothing is spawned or copied per batch and a long GPU batch
+/// lets them run ahead. `HSPZ_SEED_PRODUCERS=0` restores
+/// the shape before round 107 (one batch at a time, split over all threads);
+/// `1..=64` pins the number of single-threaded producers.
+pub(crate) fn seed_producers(
+    env: Option<&str>,
+    threads: usize,
+    slot_bytes: usize,
+) -> Result<(usize, usize), String> {
+    let threads = threads.max(1);
+    match env {
+        None => Ok((seed::producers_auto(threads, slot_bytes), 1)),
+        Some("0") => Ok((1, threads)),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) if (1..=64).contains(&n) && n.to_string() == v => Ok((n, 1)),
+            _ => Err(format!(
+                "HSPZ_SEED_PRODUCERS must be unset or an integer in 0..=64, got {v:?}"
+            )),
+        },
     }
 }
 
@@ -427,16 +469,8 @@ pub(crate) fn seed_and_filter_all(
     {
         let fwd = q.fwd;
         let rc = q.rc;
-        // Identical call to the one the serial loop made: this experiment must
-        // not touch the seed-generation algorithm, so the seed sequence stays
-        // bit-identical.
-        let parts = |b: &Batch| -> Vec<Vec<u64>> {
-            let seq: &[u8] = if b.rev { rc } else { fwd };
-            seed::chunk_seeds_parts(seq, shape, transitions, b.range, threads)
-        };
-
-        // N1: two host slots, allocated once. The pinned pair is sized from the
-        // widest chunk any batch will ask for, so the worker never allocates.
+        // N1: host slots allocated once. Pinned ones are sized from the widest
+        // chunk any batch will ask for, so a producer never allocates.
         let widest = batches
             .iter()
             .map(|b| b.range.1 - b.range.0)
@@ -447,22 +481,25 @@ pub(crate) fn seed_and_filter_all(
         // available — ZLUDA returns DriverError(801) for it at any size — so a
         // refusal falls back to a pageable `Vec` rather than failing the run.
         let new_slot = |engine: &mut Engine| -> SeedSlot {
+            let paged = || SeedSlot::Paged {
+                buf: Vec::new(),
+                len: 0,
+            };
             if args.no_pinned_seeds {
-                return SeedSlot::Paged(Vec::new());
+                return paged();
             }
             match engine.take_pinned(cap) {
                 Ok(buf) => SeedSlot::Pinned { buf, len: 0 },
-                Err(_) => SeedSlot::Paged(Vec::new()),
+                Err(_) => paged(),
             }
         };
-        // Phase 3: how many batches the host runs ahead of the one computing.
+        // How many batches the consumer holds at once.
         //
         // One is enough to hide seed *generation* behind GPU work (N1). Overlapping
         // the *upload* needs two: batch N+1's seeds must already be in host memory
         // when batch N's kernels are enqueued, or there is no compute left for the DMA
         // to hide behind — which is exactly why round 15's same-stream async copy
-        // bought nothing. Slots: one being consumed, one being uploaded, one being
-        // generated.
+        // bought nothing.
         //
         // Two things turn the overlap off, both because it cannot work without them:
         // pageable staging (an async copy from unpinned memory blocks until staged, so
@@ -474,66 +511,126 @@ pub(crate) fn seed_and_filter_all(
             && matches!(first, SeedSlot::Pinned { .. });
         engine.async_seed_copy = overlap;
         let lead = if overlap { 2 } else { 1 };
-        let nslots = lead + 1;
-        let mut ring: Vec<SeedSlot> = std::iter::once(first)
-            .chain((1..nslots).map(|_| new_slot(engine)))
-            .collect();
 
-        // Standalone generation time summed across workers, versus the part of it
-        // that the GPU could not cover. `exposed` is measured as the time the main
-        // thread actually blocks in `join` after its own GPU work finished, which
-        // is exactly `max(0, seed_end[N+1] - gpu_end[N])`.
+        // Round 107: the seed stream comes from producers that run ahead of the
+        // GPU. Before it, one batch was generated per loop iteration and joined
+        // one batch before it was needed, so a fill that outlasted that one
+        // batch's GPU work stalled the card even when the average fill was
+        // shorter (A100, hg38 x mm39: 32 s of a 748 s run), and every batch paid
+        // a thread spawn per worker thread plus a serial copy of its seeds.
+        //
+        // Each producer owns one slot at a time: it takes a free slot, claims the
+        // next batch index (in that order, under one lock, so a claimed batch
+        // always has a slot and the consumer can never wait on a batch nobody can
+        // write), fills it and hands it over. The consumer takes batches in index
+        // order, which is the order of `batches`, so the seed sequence and with it
+        // the `MAX_HITS` chunking are unchanged.
+        let (producers, inner) = seed_producers(
+            std::env::var("HSPZ_SEED_PRODUCERS").ok().as_deref(),
+            threads,
+            cap * std::mem::size_of::<u64>(),
+        )?;
+        let (free_tx, free_rx) = std::sync::mpsc::channel::<SeedSlot>();
+        free_tx.send(first).expect("receiver is alive");
+        for _ in 1..producers + lead {
+            free_tx.send(new_slot(engine)).expect("receiver is alive");
+        }
+        // `None` is a producer's dying word: without it a panic in one of them
+        // would leave the consumer waiting for a batch that never comes.
+        let (filled_tx, filled_rx) =
+            std::sync::mpsc::channel::<Option<(usize, SeedSlot, Duration)>>();
+        struct Alarm(std::sync::mpsc::Sender<Option<(usize, SeedSlot, Duration)>>);
+        impl Drop for Alarm {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    let _ = self.0.send(None);
+                }
+            }
+        }
+        let claim = std::sync::Mutex::new((free_rx, 0usize));
+
+        // Generation time summed over the producers, versus the part of it the
+        // GPU could not cover: `exposed` is the time the consumer blocks waiting
+        // for the batch it needs next.
         let (mut standalone, mut exposed) = (Duration::ZERO, Duration::ZERO);
 
         std::thread::scope(|scope| -> Fallible<()> {
             if batches.is_empty() {
                 return Ok(());
             }
-            // The first `lead` batches have no GPU work to hide behind; they are
-            // exposed by construction and are the only ones that must be.
-            for (i, b) in batches.iter().enumerate().take(lead) {
-                let t = Instant::now();
-                ring[i % nslots].fill(&parts(b));
-                standalone += t.elapsed();
-                exposed += t.elapsed();
-            }
-            // Batch 0's upload, so the loop can always be one upload ahead.
-            if overlap {
-                engine.upload_seeds(0, ring[0].seeds())?;
+            // Owned by this closure, so every way out of it drops the sender and
+            // wakes a producer that is waiting for a free slot.
+            let free_tx = free_tx;
+            for _ in 0..producers {
+                let alarm = Alarm(filled_tx.clone());
+                let (claim, batches) = (&claim, &batches);
+                scope.spawn(move || {
+                    loop {
+                        let (mut slot, i) = {
+                            let mut next = claim.lock().expect("a seed producer panicked");
+                            if next.1 >= batches.len() {
+                                return;
+                            }
+                            let Ok(slot) = next.0.recv() else {
+                                return;
+                            };
+                            next.1 += 1;
+                            (slot, next.1 - 1)
+                        };
+                        let t = Instant::now();
+                        let b = &batches[i];
+                        // The same call the serial loop made for this batch, so the
+                        // seed sequence stays bit-identical.
+                        let seq: &[u8] = if b.rev { rc } else { fwd };
+                        slot.fill(seq, shape, transitions, b.range, inner);
+                        if alarm.0.send(Some((i, slot, t.elapsed()))).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
 
+            let mut early: Vec<(usize, SeedSlot)> = Vec::new();
+            let mut take = |want: usize| -> Fallible<SeedSlot> {
+                let t = Instant::now();
+                loop {
+                    if let Some(k) = early.iter().position(|e| e.0 == want) {
+                        exposed += t.elapsed();
+                        return Ok(early.swap_remove(k).1);
+                    }
+                    match filled_rx.recv() {
+                        Ok(Some((i, slot, dur))) => {
+                            standalone += dur;
+                            early.push((i, slot));
+                        }
+                        Ok(None) | Err(_) => return Err("a seed producer panicked".into()),
+                    }
+                }
+            };
+
+            let mut cur = take(0)?;
+            // Batch 0's upload, so the loop can always be one upload ahead.
+            if overlap {
+                engine.upload_seeds(0, cur.seeds())?;
+            }
             for i in 0..batches.len() {
                 // Issue batch N+1's upload before touching the GPU: it runs on the
                 // copy stream while this batch's kernels run on the compute stream.
+                // Without the overlap batch N+1 is not needed until batch N is
+                // done, so its producer keeps that time too.
+                let mut next = None;
                 if overlap {
-                    if batches.get(i + 1).is_some() {
-                        engine.upload_seeds((i + 1) % 2, ring[(i + 1) % nslots].seeds())?;
+                    if i + 1 < batches.len() {
+                        let slot = take(i + 1)?;
+                        engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                        next = Some(slot);
                     }
                 } else {
-                    engine.upload_seeds(0, ring[i % nslots].seeds())?;
+                    engine.upload_seeds(0, cur.seeds())?;
                 }
 
-                // Hand batch N+lead to a worker before touching the GPU, so it runs
-                // while the main thread is blocked on this batch's kernels. The slot
-                // moves into the worker and comes back filled, which keeps exactly
-                // `nslots` host buffers alive without borrowing one across the scope.
-                //
-                // Reuse is safe without an extra wait: this slot last held batch
-                // N-1 (or older), whose compute has finished, and whose compute could
-                // only finish after its upload completed.
-                let worker = batches.get(i + lead).map(|next| {
-                    let k = (i + lead) % nslots;
-                    let mut slot = std::mem::replace(&mut ring[k], SeedSlot::Paged(Vec::new()));
-                    let handle = scope.spawn(move || {
-                        let t = Instant::now();
-                        slot.fill(&parts(next));
-                        (slot, t.elapsed())
-                    });
-                    (k, handle)
-                });
-
                 let b = &batches[i];
-                let n_seeds = ring[i % nslots].seeds().len();
+                let n_seeds = cur.seeds().len();
                 if n_seeds > 0 {
                     pass.stats.seeds += n_seeds as u64;
                     let o = engine
@@ -562,20 +659,29 @@ pub(crate) fn seed_and_filter_all(
                     );
                 }
 
-                if let Some((k, worker)) = worker {
-                    let t = Instant::now();
-                    let (slot, dur) = worker.join().expect("seed worker panicked");
-                    exposed += t.elapsed();
-                    standalone += dur;
-                    ring[k] = slot;
-                }
+                // This slot's upload finished before its compute started, and its
+                // compute has finished: a producer may overwrite it. A send only
+                // fails when every producer is gone, which is after the last claim.
+                let done = match next {
+                    Some(slot) => std::mem::replace(&mut cur, slot),
+                    None if i + 1 < batches.len() => {
+                        let slot = take(i + 1)?;
+                        std::mem::replace(&mut cur, slot)
+                    }
+                    None => break,
+                };
+                let _ = free_tx.send(done);
             }
+            let _ = free_tx.send(cur);
             Ok(())
         })?;
 
         // Give the pinned buffers back so the next pass reuses them rather than
-        // paying cuMemHostAlloc again.
-        for slot in ring {
+        // paying cuMemHostAlloc again. Every slot is back in the
+        // free queue: the producers have stopped and the consumer returned each
+        // one it took.
+        let (free_rx, _) = claim.into_inner().expect("a seed producer panicked");
+        for slot in free_rx.try_iter() {
             if let Some(buf) = slot.into_pinned() {
                 engine.give_pinned(buf);
             }
@@ -1181,6 +1287,10 @@ struct TimeFooter<'a> {
     host_status: &'a str,
     prefetch_requested: bool,
     prefetch: bool,
+    est_query_ahead: u64,
+    pack_ahead: bool,
+    est_pairs_at_once: u64,
+    pairs_at_once: bool,
 }
 
 impl TimeFooter<'_> {
@@ -1251,6 +1361,17 @@ impl TimeFooter<'_> {
             self.host_status,
             self.prefetch_requested,
             self.prefetch,
+        );
+        // Its own line: scripts read the last field of the one above.
+        eprintln!(
+            "  query packs ahead: {} ({:.0} MiB per worker, counted in the estimate when on)",
+            self.pack_ahead,
+            mib(self.est_query_ahead),
+        );
+        eprintln!(
+            "  seed-table pairs at once: {} ({:.0} MiB per worker, counted in the estimate when on)",
+            self.pairs_at_once,
+            mib(self.est_pairs_at_once),
         );
     }
 }
@@ -1668,11 +1789,14 @@ pub(crate) fn single_query_slot_costs(
     }
 }
 
-/// `HSPZ_WORKER_CAP`: how many workers a multi-GPU run may start (opt-in, 2026-10-27).
+/// `HSPZ_WORKER_CAP`: how many workers a multi-GPU run may start.
 ///
-/// Unset (or `bins`) keeps at most one worker per reference bin, as before.
-/// `units` allows up to one worker per work unit, so several workers can share a
-/// reference bin, each running its own slice of the bin's query units and each
+/// Unset (or `units`, the default since round 106) allows up to one worker per
+/// work unit, so with more GPUs than reference bins none sits idle: hg38 x mm39
+/// on eight A100s has seven bins, and the eighth worker takes the run from
+/// 136.9 to 126.2 s (two reversed pairs, same bytes). `bins` keeps at most one
+/// worker per reference bin, the rule before. Under `units` several workers
+/// share a reference bin, each running its own slice of the bin's query units and each
 /// building its own copy of the bin. It takes effect only under the unit
 /// partition; whole-bin ownership cannot use more workers than bins. Output does
 /// not depend on it: units keep their ordinals and are emitted in ordinal order.
@@ -1686,10 +1810,24 @@ pub(crate) enum WorkerCap {
 /// error.
 pub(crate) fn worker_cap_policy(env: Option<&str>) -> Result<WorkerCap, String> {
     match env {
-        None | Some("bins") => Ok(WorkerCap::Bins),
-        Some("units") => Ok(WorkerCap::Units),
+        None | Some("units") => Ok(WorkerCap::Units),
+        Some("bins") => Ok(WorkerCap::Bins),
         Some(v) => Err(format!(
             "HSPZ_WORKER_CAP must be unset, bins or units, got {v:?}"
+        )),
+    }
+}
+
+/// Parses `HSPZ_QUERY_PACK_AHEAD` (round 107): unset or `1` lets a worker pack
+/// its next unit's query bin on a thread while the current unit runs, if the
+/// host budget has room for one more packed bin per worker; `0` packs every bin
+/// when its unit starts (rollback, and the control arm of a measurement).
+pub(crate) fn pack_ahead_policy(env: Option<&str>) -> Result<bool, String> {
+    match env {
+        None | Some("1") => Ok(true),
+        Some("0") => Ok(false),
+        Some(v) => Err(format!(
+            "HSPZ_QUERY_PACK_AHEAD must be unset, 0 or 1, got {v:?}"
         )),
     }
 }
@@ -1852,6 +1990,8 @@ fn run_bins(
     transitions: bool,
     args: &RunArgs,
     prefetch: bool,
+    // Round 107: pack the next unit's query bin on a thread while this unit runs.
+    pack_ahead: bool,
     threads: usize,
     // Round 69: the device seeder is worth -20.3% of 2-GPU wall and a loss on one GPU,
     // so the executor decides per run rather than the build deciding once.
@@ -1991,6 +2131,27 @@ fn run_bins(
             // own job's records; the slot position itself never becomes a
             // query-bin id. Single-job slot lists run in ordinal order, so
             // the single-query path executes exactly as before.
+            // A query bin's pack (both strands, both alphabets) is host work the
+            // GPU cannot hide if it happens between two units. With prefetch on,
+            // the next unit's bin is packed on a thread while this unit runs, so
+            // only the first pack of a visit stays exposed; one more packed query
+            // bin is alive meanwhile, which the host budget counts.
+            let pack_query = |slot: usize| -> (PackedBin, Duration) {
+                let entry = &slots[visit.bin][slot];
+                let job_input = &jobs[entry.job];
+                let qbin = &job_input.plan.query_bins[entry.unit.query_bin as usize];
+                let t = Instant::now();
+                let packed = PackedBin::build(
+                    qbin.record_ids.iter().map(|&id| {
+                        let (n, s) = &job_input.qry_records[id as usize];
+                        (n.as_str(), s.as_slice())
+                    }),
+                    &args.query_prefix,
+                    true,
+                );
+                (packed, t.elapsed())
+            };
+            let mut packed_ahead = None;
             for slot in visit.queries.clone() {
                 let entry = &slots[visit.bin][slot];
                 let job_input = &jobs[entry.job];
@@ -1999,16 +2160,22 @@ fn run_bins(
                 debug_assert_eq!(unit.reference_bin, rbin.id);
                 let host_start_ms = run_started.elapsed().as_secs_f64() * 1000.0;
                 let t = Instant::now();
-                let packed_q = PackedBin::build(
-                    qbin.record_ids.iter().map(|&id| {
-                        let (n, s) = &job_input.qry_records[id as usize];
-                        (n.as_str(), s.as_slice())
-                    }),
-                    &args.query_prefix,
-                    true,
-                );
+                let packed_q = match packed_ahead.take() {
+                    Some(ahead) => {
+                        let ahead: std::thread::ScopedJoinHandle<'_, (PackedBin, Duration)> = ahead;
+                        let (packed, standalone) = ahead.join().expect("query pack panicked");
+                        rep.phases
+                            .add_overlapped("query pack (standalone)", standalone);
+                        packed
+                    }
+                    None => pack_query(slot).0,
+                };
+                // What the unit waited for: the whole pack, or what was left of it.
                 let pack_dur = t.elapsed();
                 rep.phases.add("query pack", pack_dur);
+                if pack_ahead && slot + 1 < visit.queries.end {
+                    packed_ahead = Some(scope.spawn(move || pack_query(slot + 1)));
+                }
                 // Per-bin intervals + q_block_len. `intervals` is empty for a
                 // block <= seed, and `q_block_len` is then never read; saturating
                 // avoids the underflow the single-block path guards with an error.
@@ -2266,9 +2433,6 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         .query
         .as_ref()
         .ok_or("--query is required without --query-list")?;
-    let t = Instant::now();
-    let (_, qry_records, _) = sequence::read_records(query_path)?;
-    phases.add("input.query", t.elapsed());
     // The owned reference records without `--index`; empty with it (the
     // executor's `None` says the bytes are unreachable there).
     let mut ref_records_owned: Vec<(String, Vec<u8>)> = Vec::new();
@@ -2276,7 +2440,11 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     // verifier gate (`Some` whenever `--index` is given).
     let mut index_manifest_owned: Option<crate::index::IndexManifest> = None;
     let mut verify_gate: Option<VerifyGate> = None;
+    let qry_records;
     if let Some(dir) = &args.index {
+        let t = Instant::now();
+        qry_records = sequence::read_records(query_path)?.1;
+        phases.add("input.query", t.elapsed());
         let manifest = crate::index::load_manifest(dir)?;
         verify_gate = Some(match &args.reference {
             Some(reference) => VerifyGate::spawn(reference.clone(), dir.clone(), manifest.clone()),
@@ -2284,14 +2452,30 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         });
         index_manifest_owned = Some(manifest);
     } else {
-        let t = Instant::now();
         let reference = args
             .reference
             .as_ref()
             .ok_or("--reference is required without --index")?;
-        let (_, ref_records, _) = sequence::read_records(reference)?;
-        phases.add("input.reference", t.elapsed());
-        ref_records_owned = ref_records;
+        // Round 107: the two inputs are read at the same time. Both must be in
+        // memory before the plan exists, and neither read depends on the other;
+        // a failure of the query is still the one reported first.
+        let t = Instant::now();
+        let (query_read, reference_read, standalone) = std::thread::scope(|scope| {
+            let reader = scope.spawn(|| {
+                let t = Instant::now();
+                (sequence::read_records(reference), t.elapsed())
+            });
+            let query_read = sequence::read_records(query_path);
+            phases.add("input.query", t.elapsed());
+            let t = Instant::now();
+            let (reference_read, standalone) = reader.join().expect("reference reader panicked");
+            // What the run still waited for after the query was in.
+            phases.add("input.reference", t.elapsed());
+            (query_read, reference_read, standalone)
+        });
+        phases.add_overlapped("input.reference (standalone)", standalone);
+        qry_records = query_read?.1;
+        ref_records_owned = reference_read?.1;
     }
     let ref_records: &[(String, Vec<u8>)] = &ref_records_owned;
 
@@ -2356,7 +2540,14 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let t = Instant::now();
     let devices = crate::gpu::device_count().max(1);
     let probe = args.gpus.max(1).min(devices);
-    let free = crate::gpu::min_free_bytes(probe)?;
+    // Held to the end of the run, so that each worker finds its device's
+    // context alive instead of building it again. They are opened after the
+    // inputs are in memory. Opening them on a thread during the read was
+    // tried: in some sessions the read beside it took a second longer and the
+    // wall did not move, in others it was worth about 1% at eight cards, and
+    // on one card it cost 0.2 s. Not enough for the exception it needs to "a
+    // bad replay fails before it costs a context".
+    let (_devices_open, free) = crate::gpu::open_devices(probe)?;
     // `min(gpus, n_records)` overcharges when the plan has fewer bins than records;
     // tighten it only if that is ever measured to reject a run that would have fit.
     // HSPZ_WORKER_CAP=units may start up to `--gpus` workers, so the budget assumes that many.
@@ -2576,14 +2767,18 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
     if !use_units && workers > bin_workers {
-        eprintln!(
-            "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
-             ({bin_workers} worker(s), one per reference bin)"
-        );
+        // Only a request by name is worth a line; the default just falls back.
+        if std::env::var("HSPZ_WORKER_CAP").is_ok() {
+            eprintln!(
+                "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
+                 ({bin_workers} worker(s), one per reference bin)"
+            );
+        }
         workers = bin_workers;
     } else if workers > bin_workers {
         eprintln!(
-            "note: HSPZ_WORKER_CAP=units: {workers} workers over {} reference bins",
+            "note: {workers} workers over {} reference bins: workers share bins, each with its \
+             own copy (HSPZ_WORKER_CAP=bins keeps one worker per bin)",
             plan.reference_bins.len()
         );
     }
@@ -2706,9 +2901,32 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         }
         prefetch &= fits;
     }
+    let pack_ahead = pack_ahead_policy(std::env::var("HSPZ_QUERY_PACK_AHEAD").ok().as_deref())?
+        && plan::host_query_ahead(&est, &visit_bins, prefetch, host_budget);
+    // Refuse a bad value here, before any unit runs; each pass resolves the count
+    // for its own slot size.
+    seed_producers(std::env::var("HSPZ_SEED_PRODUCERS").ok().as_deref(), 1, 1)?;
     // The estimate that the decision was made on, so a run can be checked
     // against its own measured RSS without re-deriving the model.
-    let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
+    // The last rung: all the pairs of a reference build at once.
+    let pairs_at_once = seed::set_pairs_at_once(plan::host_pairs_at_once(
+        &est,
+        &visit_bins,
+        prefetch,
+        pack_ahead,
+        host_budget,
+    ));
+    let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch)
+        + if pack_ahead {
+            plan::host_query_ahead_bytes(&est, &visit_bins)
+        } else {
+            0
+        }
+        + if pairs_at_once {
+            plan::host_pairs_at_once_bytes(&est, &visit_bins)
+        } else {
+            0
+        };
 
     // The gated emitter creates no file or directory until the background
     // verification passes (first emit); the eager path is unchanged.
@@ -2790,6 +3008,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                     transitions,
                     args,
                     prefetch,
+                    pack_ahead,
                     per_worker,
                     device_seeds,
                     contract,
@@ -3133,6 +3352,10 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             host_status,
             prefetch_requested,
             prefetch,
+            est_query_ahead: est.query_ahead,
+            pack_ahead,
+            est_pairs_at_once: est.pairs_at_once,
+            pairs_at_once,
         }
         .print();
     }
@@ -3672,7 +3895,8 @@ fn run_batch(
     // scope — so replan each job here and reject on any difference (or on
     // insufficient capacity, which never lowers the semantic cap).
     let exec_probe = workers_req.min(devices);
-    let exec_free = crate::gpu::min_free_bytes(exec_probe)?;
+    // Held to the end of the batch, as in a single run.
+    let (_devices_open, exec_free) = crate::gpu::open_devices(exec_probe)?;
     let exec_upper = match worker_cap {
         WorkerCap::Bins => workers_req.min(ref_meta.len().max(1)),
         WorkerCap::Units => workers_req,
@@ -3816,13 +4040,18 @@ fn run_batch(
     let (unit_enabled, reason) = partition_policy(unit_env.as_deref(), workers, &profiles)?;
     let use_units = unit_enabled && workers > 1;
     if !use_units && workers > bin_workers {
-        eprintln!(
-            "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
-             ({bin_workers} worker(s), one per reference bin)"
-        );
+        if std::env::var("HSPZ_WORKER_CAP").is_ok() {
+            eprintln!(
+                "note: HSPZ_WORKER_CAP=units has no effect: the whole-bin policy is in use \
+                 ({bin_workers} worker(s), one per reference bin)"
+            );
+        }
         workers = bin_workers;
     } else if workers > bin_workers {
-        eprintln!("note: HSPZ_WORKER_CAP=units: {workers} workers over {r_bins} reference bins");
+        eprintln!(
+            "note: {workers} workers over {r_bins} reference bins: workers share bins, each with \
+             its own copy (HSPZ_WORKER_CAP=bins keeps one worker per bin)"
+        );
     }
     if !use_units && workers > 1 && unit_cost_env.is_some() && unit_cost != UnitCost::Count {
         eprintln!(
@@ -3975,7 +4204,30 @@ fn run_batch(
         }
         prefetch &= fits;
     }
-    let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch);
+    let pack_ahead = pack_ahead_policy(std::env::var("HSPZ_QUERY_PACK_AHEAD").ok().as_deref())?
+        && plan::host_query_ahead(&est, &visit_bins, prefetch, host_budget);
+    // Refuse a bad value here, before any unit runs; each pass resolves the count
+    // for its own slot size.
+    seed_producers(std::env::var("HSPZ_SEED_PRODUCERS").ok().as_deref(), 1, 1)?;
+    // Round 112, the last rung: all the pairs of a reference build at once.
+    let pairs_at_once = seed::set_pairs_at_once(plan::host_pairs_at_once(
+        &est,
+        &visit_bins,
+        prefetch,
+        pack_ahead,
+        host_budget,
+    ));
+    let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch)
+        + if pack_ahead {
+            plan::host_query_ahead_bytes(&est, &visit_bins)
+        } else {
+            0
+        }
+        + if pairs_at_once {
+            plan::host_pairs_at_once_bytes(&est, &visit_bins)
+        } else {
+            0
+        };
 
     // One emitter (+ `-D` history) per job, each starting empty. With
     // `--index` the emitters are gated (no file or directory is created until
@@ -4108,6 +4360,7 @@ fn run_batch(
                     transitions,
                     args,
                     prefetch,
+                    pack_ahead,
                     per_worker,
                     device_seeds,
                     contract,
@@ -4491,6 +4744,10 @@ fn run_batch(
             host_status,
             prefetch_requested,
             prefetch,
+            est_query_ahead: est.query_ahead,
+            pack_ahead,
+            est_pairs_at_once: est.pairs_at_once,
+            pairs_at_once,
         }
         .print();
         for (j, a) in job_audits.iter().flatten().enumerate() {
@@ -4555,6 +4812,58 @@ pub(crate) fn report_counts(stats: &Stats) {
     eprintln!("#seed hits: {}", stats.seed_hits);
     eprintln!("#raw HSPs: {}", stats.raw_hsps);
     eprintln!("#HSPs: {}", stats.hsps);
+    #[cfg(feature = "gate-sieve")]
+    for line in crate::gpu::sieve_totals::report() {
+        eprintln!("{line}");
+    }
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    {
+        use crate::gpu::hits_bucketed_totals as t;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
+        if chunks > 0 {
+            eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        let (chunks, hits) = (
+            t::CHECKED_CHUNKS.load(Relaxed),
+            t::CHECKED_HITS.load(Relaxed),
+        );
+        if chunks > 0 {
+            eprintln!(
+                "bucket order from the seeds check: {chunks} chunks, {hits} hits, every bucket the same anchors as the scatter's"
+            );
+            let (seeds, saturated) = (
+                t::CHECKED_SEEDS.load(Relaxed),
+                t::SATURATED_SEEDS.load(Relaxed),
+            );
+            eprintln!(
+                "bucket order from the seeds check: {saturated} of {seeds} seeds read a row of the table ({:.3}%)",
+                100.0 * saturated as f64 / seeds.max(1) as f64
+            );
+        }
+    }
+    #[cfg(feature = "find-hits-groups")]
+    {
+        use crate::gpu::find_hits_groups_totals as t;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
+        if chunks > 0 {
+            eprintln!("find_hits by groups: {chunks} chunks, {hits} hits");
+        }
+        let (chunks, hits) = (
+            t::CHECKED_CHUNKS.load(Relaxed),
+            t::CHECKED_HITS.load(Relaxed),
+        );
+        if chunks > 0 {
+            eprintln!(
+                "find_hits by groups check: {chunks} chunks, {hits} hits, every anchor equal to the per-seed kernel's"
+            );
+        }
+    }
 }
 
 /// Seed and hit counts without a GPU: `find_num_hits` is just a lookup into the
@@ -6063,20 +6372,58 @@ mod partition_policy_tests {
 #[cfg(test)]
 mod unit_cost_tests {
     use super::{
-        BatchJob, UnitCost, WorkerCap, capped_workers, single_query_slot_costs, slot_costs,
-        unit_cost_policy, worker_cap_policy,
+        BatchJob, UnitCost, WorkerCap, capped_workers, pack_ahead_policy, seed_producers,
+        single_query_slot_costs, slot_costs, unit_cost_policy, worker_cap_policy,
     };
     use crate::plan::{self, Bin, Plan, WorkUnit};
 
     #[test]
-    fn worker_cap_parses_and_defaults_to_bins() {
-        assert_eq!(worker_cap_policy(None), Ok(WorkerCap::Bins));
+    fn worker_cap_parses_and_defaults_to_units() {
+        assert_eq!(worker_cap_policy(None), Ok(WorkerCap::Units));
         assert_eq!(worker_cap_policy(Some("bins")), Ok(WorkerCap::Bins));
         assert_eq!(worker_cap_policy(Some("units")), Ok(WorkerCap::Units));
         for bad in ["", "Units", "unit", "1", "units "] {
             assert_eq!(
                 worker_cap_policy(Some(bad)).unwrap_err(),
                 format!("HSPZ_WORKER_CAP must be unset, bins or units, got {bad:?}"),
+            );
+        }
+    }
+
+    /// Round 107: one producer per thread up to six and up to 512 MiB of
+    /// worst-case slots; `0` is the shape before it; a pinned count is taken as
+    /// given.
+    #[test]
+    fn seed_producers_follow_threads_and_the_slot_budget() {
+        let slot = 26 << 20; // a 250 kbp chunk of 12of19 with transitions
+        assert_eq!(seed_producers(None, 1, slot), Ok((1, 1)));
+        assert_eq!(seed_producers(None, 2, slot), Ok((2, 1)));
+        assert_eq!(seed_producers(None, 4, slot), Ok((4, 1)));
+        assert_eq!(seed_producers(None, 24, slot), Ok((6, 1)));
+        assert_eq!(seed_producers(None, 0, slot), Ok((1, 1)));
+        // 512 MiB / 200 MiB = 2 slots; a slot larger than the budget still gets one.
+        assert_eq!(seed_producers(None, 24, 200 << 20), Ok((2, 1)));
+        assert_eq!(seed_producers(None, 24, 1 << 30), Ok((1, 1)));
+        assert_eq!(seed_producers(Some("0"), 24, slot), Ok((1, 24)));
+        assert_eq!(seed_producers(Some("1"), 24, slot), Ok((1, 1)));
+        assert_eq!(seed_producers(Some("64"), 2, 1 << 30), Ok((64, 1)));
+        for bad in ["", "65", "-1", "auto", "08", " 4"] {
+            assert_eq!(
+                seed_producers(Some(bad), 8, slot).unwrap_err(),
+                format!("HSPZ_SEED_PRODUCERS must be unset or an integer in 0..=64, got {bad:?}"),
+            );
+        }
+    }
+
+    #[test]
+    fn pack_ahead_parses_and_defaults_to_on() {
+        assert_eq!(pack_ahead_policy(None), Ok(true));
+        assert_eq!(pack_ahead_policy(Some("1")), Ok(true));
+        assert_eq!(pack_ahead_policy(Some("0")), Ok(false));
+        for bad in ["", "on", "true", "2", "0 "] {
+            assert_eq!(
+                pack_ahead_policy(Some(bad)).unwrap_err(),
+                format!("HSPZ_QUERY_PACK_AHEAD must be unset, 0 or 1, got {bad:?}"),
             );
         }
     }

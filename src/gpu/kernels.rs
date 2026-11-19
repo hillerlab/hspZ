@@ -52,12 +52,38 @@ pub const SORT_MAX: u32 = 4096;
 
 const WARP_SIZE: u32 = 32;
 const FULL_MASK: u32 = 0xFFFF_FFFF;
+/// `score_gate`'s sieve modes (`gate-sieve`): score every slot, or bound each
+/// lane's own hit first with every lane loading its own reference groups.
+#[cfg(feature = "dense-anchors")]
+const NO_SIEVE: u32 = 0;
+#[cfg(feature = "gate-sieve")]
+const SIEVE_SCATTER: u32 = 1;
+/// The same bound with the reference groups gathered through shared memory:
+/// six lanes load the six groups of one hit, five hits per round.
+#[cfg(feature = "gate-sieve")]
+const SIEVE_GATHER: u32 = 2;
+/// [`SIEVE_SCATTER`] over a query packed without a mask plane
+/// (`sieve::QRY_FILL`, round 117): only a drop certifies a side.
+#[cfg(feature = "gate-sieve")]
+const SIEVE_OPEN: u32 = 3;
+/// Shared `u64` slots one warp gathers into: six rows of 32 hits, each row 4
+/// slots longer so that neighbouring rows fall on different banks.
+#[cfg(feature = "gate-sieve")]
+const GATHER_ROW: usize = 36;
+#[cfg(feature = "gate-sieve")]
+const GATHER_SLOTS: usize = 6 * GATHER_ROW;
 /// `parameters.h: NUC`.
 const NUC: usize = 8;
 
 #[cuda_host::cuda_module]
 pub mod device {
+    #[cfg(feature = "dense-anchors")]
+    use super::NO_SIEVE;
     use super::{FULL_MASK, NUC, NUM_WARPS, SCAN_BLOCK, SegmentPair, WARP_SIZE};
+    #[cfg(feature = "gate-sieve")]
+    use super::{GATHER_ROW, GATHER_SLOTS, SIEVE_GATHER, SIEVE_OPEN, SIEVE_SCATTER};
+    #[cfg(feature = "dense-anchors")]
+    use crate::gpu::sieve;
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, thread, warp};
 
     /// Does nothing. Launched in a loop to price a launch under ZLUDA, where
@@ -427,6 +453,67 @@ pub mod device {
             // allocated survivor range, once each; a set bit implies the gate
             // wrote that slot, so `slot < n` indexes `sorted_idx`.
             unsafe { *survivor_ids.get_unchecked_mut(out as usize) = sorted_idx[slot as usize] };
+            out += 1;
+            m &= m - 1;
+        }
+    }
+
+    /// `gate-sieve`: [`emit_bits`] over a bitmask indexed by raw hit id, as the
+    /// plain sieve kernels write it. A slot is its own id, so the list comes out
+    /// ascending and needs no sort. A copy rather than a shared body: routing
+    /// `emit_bits` through a helper changed its machine code.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    pub fn emit_bits_plain(
+        bits: &[u32],
+        offsets: &[u32],
+        mut survivor_ids: DisjointSlice<u32>,
+        n_words: u32,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let word = if i < n_words { bits[i as usize] } else { 0 };
+        let c = word.count_ones();
+
+        // Inclusive warp scan of the per-word counts: `s - c` is how many
+        // survivors the lower lanes of this warp emit.
+        let mut s = c;
+        let mut off = 1;
+        while off < WARP_SIZE {
+            let up = warp::shuffle_up_sync(FULL_MASK, s, off);
+            if lane >= off {
+                s += up;
+            }
+            off <<= 1;
+        }
+        if lane == WARP_SIZE - 1 {
+            unsafe { WARP_COUNTS[warp_id] = s };
+        }
+        thread::sync_threads();
+
+        if tid == 0 {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_COUNTS[w] };
+                unsafe { WARP_COUNTS[w] = prefix };
+                prefix += count;
+            }
+        }
+        thread::sync_threads();
+
+        let mut out = offsets[bid as usize] + unsafe { WARP_COUNTS[warp_id] } + (s - c);
+        let mut m = word;
+        while m != 0 {
+            let slot = i * WARP_SIZE + m.trailing_zeros();
+            // SAFETY: the block prefixes and per-word ranks cover exactly the
+            // allocated survivor range, once each.
+            unsafe { *survivor_ids.get_unchecked_mut(out as usize) = slot };
             out += 1;
             m &= m - 1;
         }
@@ -874,6 +961,610 @@ pub mod device {
         }
     }
 
+    /// Round 110, `find-hits-groups`: one warp expands a run of 32 consecutive
+    /// seeds, with its lanes spread over the run's hits.
+    ///
+    /// [`find_hits_dense_warp`] gives every seed a warp, and at 22 hits per seed
+    /// most of its time is what a warp pays once per seed, a chain of dependent
+    /// loads (seed, index line, first positions), not the hits. Here thread `t`
+    /// owns seed slot `t`. Each lane loads its own seed, the index of its first
+    /// position (`seed_lo`, which [`find_num_hits_lo`] wrote next to the count,
+    /// so the index table is not read a second time) and its inclusive hit
+    /// prefix: three sequential streams, and the 32 chains of a run overlap.
+    ///
+    /// The prefix says how many of the run's hits come before each seed. Lane
+    /// `l` of round `i` writes the run's hit `h = 32 i + l`: [`run_owner`] finds
+    /// the seed `v` that holds it and the lane stores
+    /// `pos[end_v - 1 - (h - before_v)]` at raw address `base + h`. That is
+    /// seeds ascending and, inside a seed, descending position: the address
+    /// `prefix - 1 - j` the per-seed kernels give hit `j`, so the anchors are
+    /// the same words in the same places.
+    ///
+    /// Four rounds go through the loop together: their four positions are
+    /// requested before any is stored, so a warp has four loads in flight. On
+    /// an A100 that is what the kernel waits for (unit 0 of hg38 x mm39: 2,042
+    /// ms with one round per iteration, 1,686 with two, 1,515 with four; 2,900
+    /// for a warp per seed).
+    #[cfg(feature = "find-hits-groups")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_groups(
+        pos_table: &[u32],
+        seed_lo: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_hit_num: &[u32],
+        mut anchors: DisjointSlice<u64>,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) {
+        let lane = thread::threadIdx_x() % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let live = seed_slot < num_seeds;
+        let (mut end, mut count, mut query_loc, mut prefix) = (0u32, 0u32, 0u32, 0u32);
+        if live {
+            let at = (seed_slot + start_seed_index) as usize;
+            let seed_offset = seed_offsets[at];
+            prefix = seed_hit_num[at];
+            // The prefix is inclusive over the batch's seeds, so the seed's own
+            // count is its difference from the seed before.
+            let before = if at > 0 { seed_hit_num[at - 1] } else { 0 };
+            count = prefix - before;
+            end = seed_lo[at] + count;
+            query_loc = (seed_offset & 0xFFFF_FFFF) as u32 + seed_size;
+        }
+        // A warp's slots are consecutive, so its live lanes are a prefix of the
+        // warp and lane 0 is live whenever any lane is.
+        let live_mask = warp::ballot_sync(FULL_MASK, live);
+        if live_mask == 0 {
+            return;
+        }
+        // Hits of the batch before this lane's seed; lane 0's is the run's base.
+        let first = prefix.wrapping_sub(count);
+        let run_first = warp::shuffle_sync(FULL_MASK, first, 0);
+        // Hits of the run before this lane's seed. A lane past the chunk's seeds
+        // answers `u32::MAX`, which no hit index reaches, so it is never chosen.
+        let before = if live {
+            first.wrapping_sub(run_first)
+        } else {
+            u32::MAX
+        };
+        let last = 31 - live_mask.leading_zeros();
+        let total = warp::shuffle_sync(FULL_MASK, before.wrapping_add(count), last);
+        let base = run_first.wrapping_sub(start_hit_index);
+
+        let mut round = 0u32;
+        while round < total {
+            let h0 = round + lane;
+            let h1 = h0 + WARP_SIZE;
+            let h2 = h1 + WARP_SIZE;
+            let h3 = h2 + WARP_SIZE;
+            let (v0, b0) = run_owner(before, h0);
+            let (v1, b1) = run_owner(before, h1);
+            let (v2, b2) = run_owner(before, h2);
+            let (v3, b3) = run_owner(before, h3);
+            let end0 = warp::shuffle_sync(FULL_MASK, end, v0);
+            let end1 = warp::shuffle_sync(FULL_MASK, end, v1);
+            let end2 = warp::shuffle_sync(FULL_MASK, end, v2);
+            let end3 = warp::shuffle_sync(FULL_MASK, end, v3);
+            let query0 = warp::shuffle_sync(FULL_MASK, query_loc, v0);
+            let query1 = warp::shuffle_sync(FULL_MASK, query_loc, v1);
+            let query2 = warp::shuffle_sync(FULL_MASK, query_loc, v2);
+            let query3 = warp::shuffle_sync(FULL_MASK, query_loc, v3);
+            let (ok0, ok1, ok2, ok3) = (h0 < total, h1 < total, h2 < total, h3 < total);
+            let (mut r0, mut r1, mut r2, mut r3) = (0u32, 0u32, 0u32, 0u32);
+            if ok0 {
+                r0 = pos_table[(end0 - 1 - (h0 - b0)) as usize];
+            }
+            if ok1 {
+                r1 = pos_table[(end1 - 1 - (h1 - b1)) as usize];
+            }
+            if ok2 {
+                r2 = pos_table[(end2 - 1 - (h2 - b2)) as usize];
+            }
+            if ok3 {
+                r3 = pos_table[(end3 - 1 - (h3 - b3)) as usize];
+            }
+            // SAFETY: `base + h` runs over the run's own hit addresses for every
+            // `h < total`; the prefix offsets place them inside
+            // `0..iter_num_hits`, each once.
+            unsafe {
+                if ok0 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h0) as usize) =
+                        (r0 + seed_size) as u64 | ((query0 as u64) << 32);
+                }
+                if ok1 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h1) as usize) =
+                        (r1 + seed_size) as u64 | ((query1 as u64) << 32);
+                }
+                if ok2 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h2) as usize) =
+                        (r2 + seed_size) as u64 | ((query2 as u64) << 32);
+                }
+                if ok3 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h3) as usize) =
+                        (r3 + seed_size) as u64 | ((query3 as u64) << 32);
+                }
+            }
+            round += 4 * WARP_SIZE;
+        }
+    }
+
+    /// The seed of a run that holds hit `h`: the last lane with `before <= h`,
+    /// and that lane's `before`. Seeds without hits share their `before` with
+    /// the next one, so the last such seed always has hits (if `h` is below the
+    /// run's total) and is the one that holds `h`. Five probes, each answered
+    /// by the lane that owns the probed seed; every lane of the warp must call
+    /// it.
+    #[cfg(feature = "find-hits-groups")]
+    #[inline(always)]
+    fn run_owner(before: u32, h: u32) -> (u32, u32) {
+        let (mut v, mut before_v) = (0u32, 0u32);
+        let mut step = 16u32;
+        while step > 0 {
+            let b = warp::shuffle_sync(FULL_MASK, before, v + step);
+            if b <= h {
+                v += step;
+                before_v = b;
+            }
+            step >>= 1;
+        }
+        (v, before_v)
+    }
+
+    /// [`run_owner`] without the owner's `before`: the last lane whose `before`
+    /// is at most `h`. With a lane's first position index less its `before`
+    /// shuffled from the owner, the index of hit `h` is that value plus `h`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn run_owner_lane(before: u32, h: u32) -> u32 {
+        let mut v = 0u32;
+        let mut step = 16u32;
+        while step > 0 {
+            if warp::shuffle_sync(FULL_MASK, before, v + step) <= h {
+                v += step;
+            }
+            step >>= 1;
+        }
+        v
+    }
+
+    /// Edge `w` of a k-mer whose positions are `pos_table[start..end]`: the
+    /// index of its first position whose anchor falls in bucket `w` or a later
+    /// one, so `edge(w)..edge(w + 1)` is the k-mer's slice of bucket `w`.
+    /// Positions ascend within a k-mer (`seed.rs`), which is what makes each
+    /// slice contiguous. The bucket is the bucket pass's:
+    /// `min((pos + seed_size) >> shift, n_buckets - 1)`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn bucket_edge(
+        pos_table: &[u32],
+        start: u32,
+        end: u32,
+        w: u32,
+        shift: u32,
+        seed_size: u32,
+        n_buckets: u32,
+    ) -> u32 {
+        if w == 0 {
+            start
+        } else if w >= n_buckets {
+            end
+        } else {
+            lower_bound_in(
+                pos_table,
+                start,
+                end,
+                (w << shift).saturating_sub(seed_size),
+            )
+        }
+    }
+
+    /// Whether a k-mer's word of [`bucket_nibbles`] points at a row of edges
+    /// instead of holding the counts.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn nibble_escapes(w: u32) -> bool {
+        w & 0xFF == 0xFF
+    }
+
+    /// Round 119: a k-mer's hits per bucket in four bits each, for at most
+    /// eight buckets. A table of every k-mer's bucket edges would be eight or
+    /// sixteen times the index table, and one random row of it per seed costs
+    /// three times what `find_num_hits` pays per seed on an A100, whose L2 holds
+    /// most of the index table and little of that; this one is the size of the
+    /// index table.
+    ///
+    /// A count above 14 does not fit: such a k-mer's word is `0xFF` (no word of
+    /// counts has two nibbles of 15) and `sat[k]` is 1, for
+    /// [`bucket_overflow_rows`] to give it a row of edges.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_nibbles(
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_size: u32,
+        shift: u32,
+        n_buckets: u32,
+        n_kmers: u32,
+        mut nibbles: DisjointSlice<u32>,
+        mut sat: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let end = index_table[k as usize];
+            let start = if k > 0 {
+                index_table[(k - 1) as usize]
+            } else {
+                0
+            };
+            let (mut w, mut over) = (0u32, 0u32);
+            let mut lo = start;
+            let mut b = 0u32;
+            while b < n_buckets {
+                let hi = bucket_edge(pos_table, start, end, b + 1, shift, seed_size, n_buckets);
+                let c = hi - lo;
+                if c > 14 {
+                    over = 1;
+                }
+                w |= c.min(14) << (4 * b);
+                lo = hi;
+                b += 1;
+            }
+            // SAFETY: `k < n_kmers`, the length of both.
+            unsafe {
+                *nibbles.get_unchecked_mut(k as usize) = if over != 0 { 0xFF } else { w };
+                *sat.get_unchecked_mut(k as usize) = over;
+            }
+            k += stride;
+        }
+    }
+
+    /// Round 119: the rows of the k-mers [`bucket_nibbles`] could not hold.
+    /// `sat_incl` is the inclusive scan of its `sat`, so a k-mer whose value
+    /// differs from the one before it is the `sat_incl[k] - 1`-th of them: its
+    /// `1 << row_shift` edges go to that row (the words past edge `n_buckets`
+    /// repeat the last edge) and its word becomes `0xFF | row << 8`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_overflow_rows(
+        index_table: &[u32],
+        pos_table: &[u32],
+        seed_size: u32,
+        shift: u32,
+        n_buckets: u32,
+        row_shift: u32,
+        n_kmers: u32,
+        sat_incl: &[u32],
+        mut nibbles: DisjointSlice<u32>,
+        mut rows: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let here = sat_incl[k as usize];
+            let before = if k > 0 { sat_incl[(k - 1) as usize] } else { 0 };
+            if here != before {
+                let row = here - 1;
+                let end = index_table[k as usize];
+                let start = if k > 0 {
+                    index_table[(k - 1) as usize]
+                } else {
+                    0
+                };
+                let mut w = 0u32;
+                while w < 1 << row_shift {
+                    let edge = bucket_edge(pos_table, start, end, w, shift, seed_size, n_buckets);
+                    // SAFETY: row `row` is below the number of saturated
+                    // k-mers, which sized `rows`; this k-mer owns it.
+                    unsafe { *rows.get_unchecked_mut(((row << row_shift) + w) as usize) = edge };
+                    w += 1;
+                }
+                // SAFETY: `k < n_kmers`.
+                unsafe { *nibbles.get_unchecked_mut(k as usize) = 0xFF | row << 8 };
+            }
+            k += stride;
+        }
+    }
+
+    /// Round 119: how many hits each run of 32 seeds of a chunk
+    /// has in each bucket, from the seeds' words of [`bucket_nibbles`]: one
+    /// thread per seed, one warp per run (the runs of
+    /// [`find_hits_groups_bucketed`]), no anchor read. Bucket-major and
+    /// run-minor, so one inclusive scan gives every run the end of its slice of
+    /// every bucket. Each seed's word is kept in `seed_nib` for the group
+    /// kernel, which then reads no table for a seed whose counts fit; a seed
+    /// whose word points at a row reads its edges there.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_bucket_counts(
+        seed_offsets: &[u64],
+        nibbles: &[u32],
+        bounds: &[u32],
+        start_seed_index: u32,
+        num_seeds: u32,
+        n_buckets: u32,
+        row_shift: u32,
+        num_runs: u32,
+        mut counts: DisjointSlice<u32>,
+        mut seed_nib: DisjointSlice<u32>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
+        let run = seed_slot / WARP_SIZE;
+        let live = seed_slot < num_seeds;
+        // The live lanes of a warp are its first ones: a warp with one has
+        // lane 0, and `run < num_runs`.
+        if warp::ballot_sync(FULL_MASK, live) == 0 {
+            return;
+        }
+        let (mut w, mut row, mut lo, mut esc) = (0u32, 0usize, 0u32, false);
+        if live {
+            // SAFETY: a seed of this chunk; its k-mer indexes the words, a
+            // word that escapes names a row, and the seed owns slot
+            // `seed_slot` of `seed_nib`.
+            unsafe {
+                let at = (seed_slot + start_seed_index) as usize;
+                let k = (*seed_offsets.get_unchecked(at) >> 32) as u32;
+                w = *nibbles.get_unchecked(k as usize);
+                *seed_nib.get_unchecked_mut(seed_slot as usize) = w;
+                esc = nibble_escapes(w);
+                if esc {
+                    row = ((w >> 8) << row_shift) as usize;
+                    lo = *bounds.get_unchecked(row);
+                }
+            }
+        }
+        let mut b = 0u32;
+        while b < n_buckets {
+            let mut c = (w >> (4 * b)) & 15;
+            if esc {
+                // SAFETY: edge `b + 1 <= n_buckets` of the k-mer's row.
+                let hi = unsafe { *bounds.get_unchecked(row + b as usize + 1) };
+                c = hi - lo;
+                lo = hi;
+            }
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 16);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 8);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 4);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 2);
+            c += warp::shuffle_sync(FULL_MASK, c, lane ^ 1);
+            if lane == 0 {
+                // SAFETY: lane 0 of run `run < num_runs` owns this slot.
+                unsafe { *counts.get_unchecked_mut((b * num_runs + run) as usize) = c };
+            }
+            b += 1;
+        }
+    }
+
+    /// Round 119: [`find_hits_groups`] and the bucket pass in one.
+    /// A warp expands a run of 32 seeds as there, and stores each anchor
+    /// straight at its place in bucket order instead of at its raw address.
+    ///
+    /// `incl` is the inclusive scan of [`run_bucket_counts`], so the word before
+    /// a run's own is where its slice of that bucket starts. A seed's hits of
+    /// one bucket are one contiguous slice of `pos_table`, `e[b]..e[b + 1]`: its
+    /// start and the counts in its word of `seed_nib`, or the row of edges that
+    /// word names when a count does not fit four bits.
+    ///
+    /// The run's hits are taken bucket by bucket. Inside bucket `b` they are
+    /// numbered `g = 0..total` in seed order, a prefix sum across the warp says
+    /// how many come before each seed, and lane `l` of a round takes hit
+    /// `round + l`: it finds the seed that holds it with five shuffles, loads
+    /// one position and stores at `start + g`. So one store instruction writes
+    /// 32 consecutive slots, as the raw kernel does. (Taking the hits seed by
+    /// seed and looking each one's place up stored about three slots of a
+    /// bucket at a time, parts of 32-byte sectors, and the kernel was 100 ms of
+    /// unit 0 slower per bucket.) The order inside a bucket is not the raw
+    /// order, and since round 116 nothing needs it to be.
+    ///
+    /// At most eight buckets (the host falls back above that).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_groups_bucketed(
+        pos_table: &[u32],
+        bounds: &[u32],
+        seed_nib: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_lo: &[u32],
+        incl: &[u32],
+        n_buckets: u32,
+        row_shift: u32,
+        num_runs: u32,
+        start_seed_index: u32,
+        num_seeds: u32,
+        mut sorted_anchor: DisjointSlice<u64>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
+        let run = seed_slot / WARP_SIZE;
+        let live = seed_slot < num_seeds;
+        let mut query_loc = 0u32;
+        let (mut w, mut row, mut lo, mut esc) = (0u32, 0usize, 0u32, false);
+        if live {
+            let at = (seed_slot + start_seed_index) as usize;
+            // SAFETY: `at` is a seed of this chunk; `run_bucket_counts` wrote
+            // its word at slot `seed_slot` of `seed_nib`, and a word that
+            // escapes names a row.
+            unsafe {
+                let seed_offset = *seed_offsets.get_unchecked(at);
+                query_loc = (seed_offset & 0xFFFF_FFFF) as u32 + seed_size;
+                w = *seed_nib.get_unchecked(seed_slot as usize);
+                lo = *seed_lo.get_unchecked(at);
+                esc = nibble_escapes(w);
+                if esc {
+                    row = ((w >> 8) << row_shift) as usize;
+                }
+            }
+        }
+        // The live lanes of a warp are its first ones.
+        if warp::ballot_sync(FULL_MASK, live) == 0 {
+            return;
+        }
+        // Lane `b` fetches where this run's slice of bucket `b` starts.
+        let mut run_start = 0u32;
+        if lane < n_buckets {
+            let flat = lane * num_runs + run;
+            if flat > 0 {
+                // SAFETY: a live warp's run is below `num_runs`, and `incl`
+                // holds `n_buckets * num_runs` words.
+                run_start = unsafe { *incl.get_unchecked(flat as usize - 1) };
+            }
+        }
+
+        let mut b = 0u32;
+        while b < n_buckets {
+            // This seed's hits in bucket `b`: `pos_table[lo..lo + c]`.
+            let mut c = (w >> (4 * b)) & 15;
+            if esc {
+                // SAFETY: edge `b + 1 <= n_buckets` of the k-mer's row.
+                c = unsafe { *bounds.get_unchecked(row + b as usize + 1) } - lo;
+            }
+            // What this lane and the lanes before it hold in the bucket.
+            let mut x = c;
+            let mut d = 1u32;
+            while d < WARP_SIZE {
+                let t = warp::shuffle_sync(FULL_MASK, x, lane.wrapping_sub(d) & (WARP_SIZE - 1));
+                if lane >= d {
+                    x += t;
+                }
+                d <<= 1;
+            }
+            let total = warp::shuffle_sync(FULL_MASK, x, WARP_SIZE - 1);
+            let before = x - c;
+            let start = warp::shuffle_sync(FULL_MASK, run_start, b);
+            // Hit `g` of the bucket, held by seed `v`, is the position at index
+            // `lo_v + (g - before_v)`: this lane's part of it.
+            let pos_key = lo.wrapping_sub(before);
+
+            let mut round = 0u32;
+            while round < total {
+                let g0 = round + lane;
+                let g1 = g0 + WARP_SIZE;
+                let g2 = g1 + WARP_SIZE;
+                let g3 = g2 + WARP_SIZE;
+                let v0 = run_owner_lane(before, g0);
+                let v1 = run_owner_lane(before, g1);
+                let v2 = run_owner_lane(before, g2);
+                let v3 = run_owner_lane(before, g3);
+                let at0 = warp::shuffle_sync(FULL_MASK, pos_key, v0).wrapping_add(g0);
+                let at1 = warp::shuffle_sync(FULL_MASK, pos_key, v1).wrapping_add(g1);
+                let at2 = warp::shuffle_sync(FULL_MASK, pos_key, v2).wrapping_add(g2);
+                let at3 = warp::shuffle_sync(FULL_MASK, pos_key, v3).wrapping_add(g3);
+                let query0 = warp::shuffle_sync(FULL_MASK, query_loc, v0);
+                let query1 = warp::shuffle_sync(FULL_MASK, query_loc, v1);
+                let query2 = warp::shuffle_sync(FULL_MASK, query_loc, v2);
+                let query3 = warp::shuffle_sync(FULL_MASK, query_loc, v3);
+                let (ok0, ok1, ok2, ok3) = (g0 < total, g1 < total, g2 < total, g3 < total);
+                let (mut r0, mut r1, mut r2, mut r3) = (0u32, 0u32, 0u32, 0u32);
+                // SAFETY: for `g < total` the index is one of the owner's
+                // positions of this bucket.
+                unsafe {
+                    if ok0 {
+                        r0 = *pos_table.get_unchecked(at0 as usize) + seed_size;
+                    }
+                    if ok1 {
+                        r1 = *pos_table.get_unchecked(at1 as usize) + seed_size;
+                    }
+                    if ok2 {
+                        r2 = *pos_table.get_unchecked(at2 as usize) + seed_size;
+                    }
+                    if ok3 {
+                        r3 = *pos_table.get_unchecked(at3 as usize) + seed_size;
+                    }
+                }
+                // SAFETY: the scanned counts give the run `total` slots of the
+                // bucket from `start`, inside `0..iter_num_hits`, and hit `g`
+                // takes slot `start + g`.
+                unsafe {
+                    if ok0 {
+                        *sorted_anchor.get_unchecked_mut((start + g0) as usize) =
+                            r0 as u64 | ((query0 as u64) << 32);
+                    }
+                    if ok1 {
+                        *sorted_anchor.get_unchecked_mut((start + g1) as usize) =
+                            r1 as u64 | ((query1 as u64) << 32);
+                    }
+                    if ok2 {
+                        *sorted_anchor.get_unchecked_mut((start + g2) as usize) =
+                            r2 as u64 | ((query2 as u64) << 32);
+                    }
+                    if ok3 {
+                        *sorted_anchor.get_unchecked_mut((start + g3) as usize) =
+                            r3 as u64 | ((query3 as u64) << 32);
+                    }
+                }
+                round += 4 * WARP_SIZE;
+            }
+            lo += c;
+            b += 1;
+        }
+    }
+
+    /// [`find_num_hits`] that also writes where each seed's positions start in
+    /// `pos_table`, for [`find_hits_groups`].
+    #[cfg(feature = "find-hits-groups")]
+    #[kernel]
+    pub fn find_num_hits_lo(
+        num_seeds: u32,
+        index_table: &[u32],
+        seed_offsets: &[u64],
+        mut seed_hit_num: DisjointSlice<u32>,
+        mut seed_lo: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut id = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while id < num_seeds {
+            let i = id as usize;
+            let seed = (seed_offsets[i] >> 32) as usize;
+            let end = index_table[seed];
+            let start = if seed > 0 { index_table[seed - 1] } else { 0 };
+            // SAFETY: `id < num_seeds`, and the host sizes both buffers for it.
+            unsafe {
+                *seed_hit_num.get_unchecked_mut(i) = end - start;
+                *seed_lo.get_unchecked_mut(i) = start;
+            }
+            id += stride;
+        }
+    }
+
     /// Round 83, `ref-loc-buckets`: per-block histogram of the reference
     /// address bucket `(anchor as u32) >> shift`, laid out bucket-major and
     /// block-minor so one inclusive scan of `counts` gives every block its
@@ -1001,6 +1692,201 @@ pub mod device {
         }
     }
 
+    /// [`bucket_count`] without its loop (round 114): the same counts, word for
+    /// word.
+    ///
+    /// `bucket_count` and `bucket_scatter` take one vote per bucket, seven trips
+    /// of a loop that every lane of every warp walks for the windows of an A100,
+    /// and they were measured to pay for each trip (66 ms per bucket on a unit
+    /// of 125.6e9 hits). One `match.any` says the same: each lane gets the lanes
+    /// of its warp that hold its bucket. The first of them stores the bucket's
+    /// count for the warp, over the zero that lane `v` stores for bucket `v`
+    /// (a warp barrier between the two stores orders them), and a lane's rank in
+    /// the scatter is the number of those lanes before it.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn bucket_count_match(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        mut counts: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        // The clamp is `bucket_count`'s. Lanes past the end share a key that no
+        // bucket has (`n_buckets <= 32`).
+        let b = if live {
+            let raw = (anchors[i as usize] as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        if lane < n_buckets {
+            unsafe { WARP_COUNTS[warp_id * 32 + lane as usize] = 0 };
+        }
+        // The count below goes over that zero, and it is another lane's store:
+        // the barrier is what orders the two (the lanes of a warp are free to
+        // run the two `if`s in any order otherwise).
+        warp::sync_mask(FULL_MASK);
+        if live && (own & warp::lanemask_lt()) == 0 {
+            unsafe { WARP_COUNTS[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut total = 0u32;
+            for w in 0..WARPS {
+                total += unsafe { WARP_COUNTS[w * 32 + tid as usize] };
+            }
+            // SAFETY: `n_buckets * n_blocks` slots, one per (bucket, block).
+            unsafe { *counts.get_unchecked_mut((tid * n_blocks + bid) as usize) = total };
+        }
+    }
+
+    /// [`bucket_scatter`] without its loop, as [`bucket_count_match`]: the same
+    /// two buffers, word for word.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_scatter_match(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        incl: &[u32],
+        mut sorted_anchor: DisjointSlice<u64>,
+        mut sorted_idx: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_PREFIX: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+        static mut BLOCK_TOTAL: SharedArray<u32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        let anchor = if live { anchors[i as usize] } else { 0 };
+        let b = if live {
+            let raw = (anchor as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        let before = own & warp::lanemask_lt();
+        if lane < n_buckets {
+            unsafe { WARP_PREFIX[warp_id * 32 + lane as usize] = 0 };
+        }
+        // As in `bucket_count_match`: the barrier orders the zero and the count.
+        warp::sync_mask(FULL_MASK);
+        if live && before == 0 {
+            unsafe { WARP_PREFIX[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_PREFIX[w * 32 + tid as usize] };
+                unsafe { WARP_PREFIX[w * 32 + tid as usize] = prefix };
+                prefix += count;
+            }
+            unsafe { BLOCK_TOTAL[tid as usize] = prefix };
+        }
+        thread::sync_threads();
+
+        if live {
+            let bu = b as usize;
+            let block_base = incl[(b * n_blocks + bid) as usize] - unsafe { BLOCK_TOTAL[bu] };
+            let out = block_base + unsafe { WARP_PREFIX[warp_id * 32 + bu] } + before.count_ones();
+            // SAFETY: the block bases and local ranks partition `0..n` exactly,
+            // one slot per hit.
+            unsafe {
+                *sorted_anchor.get_unchecked_mut(out as usize) = anchor;
+                *sorted_idx.get_unchecked_mut(out as usize) = i;
+            }
+        }
+    }
+
+    /// [`bucket_scatter_match`] without the raw hit ids (round 116): the same
+    /// `sorted_anchor`, word for word, and nothing else. For a chunk whose
+    /// survivors go to `find_hsps` by sorted slot: twelve bytes of a hit's twenty
+    /// were the scatter's own stores, four of them the id. A copy rather than a
+    /// shared body, as for `emit_bits_plain`.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn bucket_scatter_match_anchors(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        incl: &[u32],
+        mut sorted_anchor: DisjointSlice<u64>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_PREFIX: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+        static mut BLOCK_TOTAL: SharedArray<u32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        let anchor = if live { anchors[i as usize] } else { 0 };
+        let b = if live {
+            let raw = (anchor as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        let before = own & warp::lanemask_lt();
+        if lane < n_buckets {
+            unsafe { WARP_PREFIX[warp_id * 32 + lane as usize] = 0 };
+        }
+        // As in `bucket_count_match`: the barrier orders the zero and the count.
+        warp::sync_mask(FULL_MASK);
+        if live && before == 0 {
+            unsafe { WARP_PREFIX[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_PREFIX[w * 32 + tid as usize] };
+                unsafe { WARP_PREFIX[w * 32 + tid as usize] = prefix };
+                prefix += count;
+            }
+            unsafe { BLOCK_TOTAL[tid as usize] = prefix };
+        }
+        thread::sync_threads();
+
+        if live {
+            let bu = b as usize;
+            let block_base = incl[(b * n_blocks + bid) as usize] - unsafe { BLOCK_TOTAL[bu] };
+            let out = block_base + unsafe { WARP_PREFIX[warp_id * 32 + bu] } + before.count_ones();
+            // SAFETY: the block bases and local ranks partition `0..n` exactly,
+            // one slot per hit.
+            unsafe { *sorted_anchor.get_unchecked_mut(out as usize) = anchor };
+        }
+    }
+
     /// Runs only the promoted score gate and writes one byte for every hit.
     /// The rare survivors are materialized later from a stable compacted ID
     /// list, so the common reject path writes neither an HSP nor a `u32` flag.
@@ -1043,6 +1929,17 @@ pub mod device {
             false,
             flags.as_mut_ptr(),
             core::ptr::null_mut(),
+            NO_SIEVE,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
         );
     }
 
@@ -1083,7 +1980,464 @@ pub mod device {
             true,
             core::ptr::null_mut(),
             flags_bits.as_mut_ptr(),
+            NO_SIEVE,
+            core::ptr::null(),
+            core::ptr::null(),
+            core::ptr::null(),
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            core::ptr::null_mut(),
         );
+    }
+
+    /// [`mark_score_survivors`] behind the lane-local bound of `gpu/sieve.rs`:
+    /// each lane first bounds its own hit from the packed planes, and the warp
+    /// scores only the hits the bound could not reject. `um`, `ua`, `ub` and
+    /// `ubias` are `Classes::kernel_args`; `hspthresh` is `keep_threshold`.
+    /// With `count` set, lane 0 also stores each chunk's candidate mask. The
+    /// flags are one word of keep bits per 32 hits at the raw hit id, read by
+    /// `count_bits` and `emit_bits_plain`.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_SCATTER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_sieve`] over a query without a mask plane (round 117):
+    /// `qry_bad` is not read.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve_open(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_OPEN,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered`] behind the same bound.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_SCATTER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered_sieve`] over a query without a mask plane (round 117):
+    /// `qry_bad` is not read.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve_open(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_OPEN,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// The gather arm of the sieve: the warp's six reference groups per hit,
+    /// loaded coalesced instead of by 32 lanes at 32 unrelated addresses.
+    ///
+    /// Lane `l` loads group `l % 6` of hit `5 * round + l / 6`: six neighbouring
+    /// lanes read the 48 contiguous bytes of one hit, five hits per round, seven
+    /// rounds per chunk (lanes 30 and 31 idle). Each word goes to shared memory
+    /// at row = group, column = hit, and every lane then reads its own column.
+    /// The same six words reach the same arithmetic as in the scatter arm.
+    ///
+    /// # Safety
+    /// As `sieve::bound_at` for every anchor of the chunk: lane `i` holds the
+    /// reference position of hit `i` in `my_lo`.
+    #[cfg(feature = "gate-sieve")]
+    #[inline(always)]
+    unsafe fn sieve_gather(
+        w: usize,
+        lane_id: u32,
+        my_lo: u32,
+        ref_pk: *const u64,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        static mut GROUPS: SharedArray<u64, { NUM_WARPS * GATHER_SLOTS }> = SharedArray::UNINIT;
+
+        let row = (lane_id % 6) as usize;
+        let column = lane_id / 6;
+        let base = w * GATHER_SLOTS;
+        let mut round = 0u32;
+        while round < 7 {
+            let hit = 5 * round + column;
+            let loads = column < 5 && hit < WARP_SIZE;
+            let ref_loc = warp::shuffle_sync(FULL_MASK, my_lo, if loads { hit } else { 0 });
+            if loads {
+                let (first, _, _, _) = sieve::locate(ref_loc, 0);
+                // SAFETY: the six groups of a packed hit; one lane per slot.
+                unsafe {
+                    GROUPS[base + row * GATHER_ROW + hit as usize] =
+                        *ref_pk.add(first as usize + row);
+                }
+            }
+            round += 1;
+        }
+        warp::sync_mask(FULL_MASK);
+        let at = base + lane_id as usize;
+        // SAFETY: column `lane_id` of all six rows was stored above.
+        unsafe {
+            (
+                GROUPS[at],
+                GROUPS[at + GATHER_ROW],
+                GROUPS[at + 2 * GATHER_ROW],
+                GROUPS[at + 3 * GATHER_ROW],
+                GROUPS[at + 4 * GATHER_ROW],
+                GROUPS[at + 5 * GATHER_ROW],
+            )
+        }
+    }
+
+    /// [`mark_score_survivors_sieve`] with the reference groups gathered
+    /// through shared memory ([`sieve_gather`]).
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve_gather(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_GATHER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered_sieve`] with the gathered groups.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve_gather(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_GATHER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// Packs an encoded sequence into the planes the sieve reads
+    /// (`gpu/sieve.rs: pack` is the host mirror): one thread per 32-base group.
+    /// Symbols outside `ACGT` take the code `fill` and a bad bit; everything
+    /// outside the sequence is code 0 and bad. `bad` is written only when
+    /// `want_bad` is set (the reference has no bad plane).
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn pack_planes(
+        seq: &[u8],
+        len: u32,
+        num_groups: u32,
+        fill: u32,
+        want_bad: u32,
+        mut pk: DisjointSlice<u64>,
+        mut bad: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut g = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while g < num_groups {
+            let (mut hi, mut lo, mut bd) = (0u32, 0u32, 0u32);
+            let mut b = 0u32;
+            while b < 32 {
+                // Groups in front of the sequence wrap to a position past `len`.
+                let pos = g.wrapping_sub(sieve::PADG).wrapping_mul(32).wrapping_add(b);
+                if g >= sieve::PADG && pos < len {
+                    // SAFETY: `pos < len == seq.len()`.
+                    let sym = unsafe { *seq.get_unchecked(pos as usize) } as u32;
+                    let code = if sym < 4 {
+                        sym
+                    } else {
+                        bd |= 1 << b;
+                        fill
+                    };
+                    hi |= ((code >> 1) & 1) << b;
+                    lo |= (code & 1) << b;
+                } else {
+                    bd |= 1 << b;
+                }
+                b += 1;
+            }
+            // SAFETY: `g < num_groups`, the length of both planes.
+            unsafe {
+                *pk.get_unchecked_mut(g as usize) = hi as u64 | (lo as u64) << 32;
+                if want_bad != 0 {
+                    *bad.get_unchecked_mut(g as usize) = bd;
+                }
+            }
+            g += stride;
+        }
     }
 
     /// Body of the score gate, shared by the plain and the reordered kernel.
@@ -1110,6 +2464,24 @@ pub mod device {
         // Round 83 round 2: one `u32` of keep bits per 32-slot chunk, written at
         // the chunk's sorted slot. Null and unused unless `reordered`.
         flags_bits: *mut u32,
+        // `gate-sieve` (`gpu/sieve.rs`): with a mode other than `NO_SIEVE` each
+        // lane first bounds its own hit and the slot loop walks only the hits
+        // the bound could not reject. A literal, like `reordered`: with
+        // `NO_SIEVE` everything below folds away and the planes, class constants
+        // and candidate words are never read.
+        sieve_mode: u32,
+        ref_pk: *const u64,
+        qry_pk: *const u64,
+        qry_bad: *const u32,
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        // Round 111: how far an undecided side of the bound is carried, as
+        // `right words | left words << 8` (`sieve::Words`).
+        words: u32,
+        cand_bits: *mut u32,
     ) {
         // The anchor no longer travels through shared memory (round 58): the warp
         // fetches its whole chunk coalesced and broadcasts by shuffle.
@@ -1166,7 +2538,16 @@ pub mod device {
             // load the anchor, write it to shared, sync the warp and have every lane
             // read it back, with nothing to overlap the load latency. Round 58.
             let my_idx = base + lane_id;
-            let my_anchor = if my_idx < num_hits {
+            // The sieve kernels load without the slice's bounds test, which is
+            // 16 instructions and a trap per chunk for an index the two
+            // comparisons already bound (`base < num_hits` is the loop's own
+            // condition). The plain gate kernels keep the checked load and
+            // their machine code.
+            let my_anchor = if sieve_mode != NO_SIEVE {
+                let at = if my_idx < num_hits { my_idx } else { base };
+                // SAFETY: `at < num_hits <= anchors.len()`.
+                unsafe { *anchors.get_unchecked(at as usize) }
+            } else if my_idx < num_hits {
                 anchors[my_idx as usize]
             } else {
                 anchors[base as usize]
@@ -1174,11 +2555,116 @@ pub mod device {
             let my_lo = my_anchor as u32;
             let my_hi = (my_anchor >> 32) as u32;
 
+            // `gate-sieve`: the slots this warp still has to score, as a mask.
+            // Each lane bounds the hit it just loaded; a hit whose bound is
+            // certified below the threshold cannot be kept and is never scored.
+            let mut rem = 0u32;
+            // A literal, like the mode: without the mask plane its loads and the
+            // terminal tests fold away.
+            #[cfg(feature = "gate-sieve")]
+            let masked = sieve_mode != SIEVE_OPEN;
+            #[cfg(not(feature = "gate-sieve"))]
+            let masked = true;
+            if sieve_mode != NO_SIEVE {
+                // SAFETY: the host packed both planes for these sequences, and a
+                // lane past `num_hits` holds the chunk's first anchor.
+                #[cfg(not(feature = "gate-sieve"))]
+                let (mut right, mut left) = unsafe {
+                    sieve::bound_at(
+                        ref_pk, qry_pk, qry_bad, my_lo, my_hi, masked, um, ua, ub, ubias, xdrop,
+                    )
+                };
+                #[cfg(feature = "gate-sieve")]
+                let (mut right, mut left) = unsafe {
+                    if sieve_mode == SIEVE_GATHER {
+                        let (r0, r1, r2, r3, r4, r5) = sieve_gather(w, lane_id, my_lo, ref_pk);
+                        let (_, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                        sieve::bound_words(
+                            r0,
+                            r1,
+                            r2,
+                            r3,
+                            r4,
+                            r5,
+                            qry_pk.add(qg as usize),
+                            qry_bad.add(qg as usize),
+                            o,
+                            qs,
+                            true,
+                            um,
+                            ua,
+                            ub,
+                            ubias,
+                            xdrop,
+                        )
+                    } else {
+                        sieve::bound_at(
+                            ref_pk, qry_pk, qry_bad, my_lo, my_hi, masked, um, ua, ub, ubias, xdrop,
+                        )
+                    }
+                };
+                // Round 111: a side that has not certified inside the static
+                // window is carried on, one word at a time. A lane whose side is
+                // certified, or whose two bounds already reach the threshold, has
+                // nothing to carry; neither has a lane past the chunk's hits. No
+                // lane needs another lane's data for this, so each walks as far
+                // as its own hit asks and the warp waits for the longest walk.
+                let live = my_idx < num_hits;
+                if live && sieve::carry(right, left, hspthresh) {
+                    let (rg, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                    let mut word = sieve::RIGHT_WORDS;
+                    while word < (words & 0xff) && sieve::carry(right, left, hspthresh) {
+                        // SAFETY: the planes carry `sieve::PADG` groups of padding
+                        // for words up to `sieve::RIGHT_WORDS_MAX`, which the host
+                        // never exceeds.
+                        right = unsafe {
+                            sieve::right_word(
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, right, masked, um,
+                                ua, ub, ubias, xdrop,
+                            )
+                        };
+                        word += 1;
+                    }
+                }
+                if live && sieve::carry(left, right, hspthresh) {
+                    let (rg, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                    let mut word = sieve::LEFT_WORDS;
+                    while word < (words >> 8) && sieve::carry(left, right, hspthresh) {
+                        // SAFETY: as above, up to `sieve::LEFT_WORDS_MAX`.
+                        left = unsafe {
+                            sieve::left_word(
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, left, masked, um, ua,
+                                ub, ubias, xdrop,
+                            )
+                        };
+                        word += 1;
+                    }
+                }
+                rem = warp::ballot_sync(FULL_MASK, live && sieve::passes(right, left, hspthresh));
+                if count != 0 && lane_id == 0 {
+                    // SAFETY: `base < limit <= num_hits`, one word per chunk.
+                    unsafe { *cand_bits.add((base / CHUNK) as usize) = rem };
+                }
+            }
+            // Every sieve kernel writes its chunk's keep bits as one word, as the
+            // reordered kernel does: a hit the bound rejected is a 0 bit that no
+            // lane has to store.
+            let word_flags = reordered || sieve_mode != NO_SIEVE;
+
             // Keep bits of this chunk, bit `s` for slot `s`; slots past
             // `num_hits` stay 0. Lane 0 owns it and stores it once below.
             let mut chunk_bits = 0u32;
             let mut slot = 0u32;
-            while slot < CHUNK {
+            loop {
+                if sieve_mode != NO_SIEVE {
+                    if rem == 0 {
+                        break;
+                    }
+                    slot = rem.trailing_zeros();
+                    rem &= rem - 1;
+                } else if slot >= CHUNK {
+                    break;
+                }
                 let hid = base + slot;
                 let ref_loc = warp::shuffle_sync(FULL_MASK, my_lo, slot);
                 let query_loc = warp::shuffle_sync(FULL_MASK, my_hi, slot);
@@ -1703,7 +3189,7 @@ pub mod device {
                     // integer compare decides the same, with no FP64 on the gate.
                     #[cfg(feature = "gate-int-keep")]
                     let keep = (total >= hspthresh) as u8;
-                    if reordered {
+                    if word_flags {
                         chunk_bits |= (keep as u32) << slot;
                     } else {
                         // SAFETY: `hid < num_hits`, one thread per flag byte.
@@ -1715,7 +3201,7 @@ pub mod device {
             // One store per chunk. `base` is a multiple of CHUNK == 32 for both
             // traversals, so each word has exactly one owning warp and every
             // word of `ceil(num_hits/32)` is overwritten — no stale bits.
-            if reordered && lane_id == 0 {
+            if word_flags && lane_id == 0 {
                 // SAFETY: `base < limit <= num_hits`, so the word index is
                 // inside the `ceil(num_hits/32)` the host allocated.
                 unsafe { *flags_bits.add((base / CHUNK) as usize) = chunk_bits };

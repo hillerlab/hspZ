@@ -32,6 +32,7 @@
 //! kernel stages also carry their CUDA-event duration (`gpu ms`).
 
 pub mod kernels;
+pub mod sieve;
 
 use crate::hsp::SegmentPair;
 use crate::seed::Shape;
@@ -911,6 +912,10 @@ pub struct Engine {
     /// or with `gate-int-keep` its [`keep_threshold`]. Resolved once here.
     #[cfg_attr(not(feature = "dense-anchors"), allow(dead_code))]
     gate_thresh: i32,
+    /// `gate-sieve`: the packed planes and this unit's class scores for the
+    /// lane-local bound in front of the gate (`gpu/sieve.rs`).
+    #[cfg(feature = "gate-sieve")]
+    sieve: GateSieve,
     noentropy: u32,
     max_hits: u32,
     hit_capacity: u32,
@@ -978,6 +983,62 @@ pub struct Engine {
     /// Window size (`1 << bucket_shift` bytes) and bucket count, fixed for the
     /// engine's reference. `n_buckets <= 32` is a hard invariant of the ballot
     /// loop in `bucket_count`/`bucket_scatter`.
+    /// The bucket window is sized for the sieve's packed planes (a quarter of
+    /// a byte per base), not for the byte reference: a chunk the sieve does not
+    /// gate (the unit switched it off, or its guard holds the plain gate) then
+    /// skips the bucket pass, whose window would not fit the L2 as bytes.
+    #[cfg(feature = "ref-loc-buckets")]
+    bucket_planes: bool,
+    /// Round 119 (`HSPZ_HITS_BUCKETED`, see `HitsBucketed`): a chunk's bucket
+    /// order written from its seeds. `buf_bucket_bounds` holds a row of bucket
+    /// edges for each k-mer whose counts do not fit `buf_bucket_nibbles`, and
+    /// `buf_seed_counts` a chunk's hits per bucket and run of 32 seeds.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    hits_bucketed: HitsBucketed,
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    buf_bucket_bounds: DeviceBuffer<u32>,
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    buf_seed_counts: DeviceBuffer<u32>,
+    /// Every k-mer's hits per bucket in four bits each (`bucket_nibbles`; empty
+    /// where the path does not apply), and the words of a chunk's seeds in seed
+    /// order.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    buf_bucket_nibbles: DeviceBuffer<u32>,
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    buf_seed_nib: DeviceBuffer<u32>,
+    /// Round 116: a bucketed chunk's survivors go to `find_hsps` by sorted slot
+    /// (`HSPZ_SURVIVOR_ORDER=raw` restores raw hit order).
+    #[cfg(all(feature = "ref-loc-buckets", feature = "gate-sieve"))]
+    survivor_slots: bool,
+    /// Round 114: the bucket kernels learn which lanes of a warp share a bucket
+    /// from one `match.any` (`true`, the default) or from a vote per bucket
+    /// (`HSPZ_BUCKET_VOTES=loop`).
+    #[cfg(feature = "ref-loc-buckets")]
+    bucket_match: bool,
+    /// Round 110 (`find-hits-groups`, experiment): which kernel expands the
+    /// seeds of a chunk into anchors.
+    #[cfg(feature = "find-hits-groups")]
+    find_hits_groups: FindHitsGroups,
     #[cfg(feature = "ref-loc-buckets")]
     bucket_shift: u32,
     #[cfg(feature = "ref-loc-buckets")]
@@ -1249,17 +1310,29 @@ const BUCKET_STREAM_BYTES: u64 = 1 << 20;
 /// path: the third element is `false` and the returned shift/count are still
 /// the smallest legal ones, so a caller that forces the pass on anyway has
 /// somewhere sane to run.
+///
+/// `planes` (round 106): under the score-gate sieve the gate's random reads go
+/// to the 2-bit planes, a quarter of a byte per base, and its keep bits are
+/// written in order. A window of `2^s` bases then costs `2^s / 4` bytes and the
+/// `max_hits/8` term drops out, so the window can be four times longer in bases:
+/// fewer buckets and a cheaper pass. The budget is half of the L2 rather than
+/// three quarters: on an A100 (40 MiB) 16 MiB of planes measured 3% less GPU
+/// busy than 32 MiB. That A100's byte rule switched the pass off altogether at
+/// production batch sizes; with this one it takes unit 0's sieve gate from
+/// 16.0 to 6.8 s for a 3.6 s pass.
 #[cfg(feature = "ref-loc-buckets")]
-fn ref_bucket_policy(ref_len: u32, max_hits: u32, l2_bytes: u64) -> (u32, u32, bool) {
+fn ref_bucket_policy(ref_len: u32, max_hits: u32, l2_bytes: u64, planes: bool) -> (u32, u32, bool) {
     let buckets = |s: u32| (ref_len >> s) + 1;
     // `ref_len` is a u32, so `ref_len >> 31 <= 1` and this always lands.
     let min_shift = (16..=31).find(|&s| buckets(s) <= 32).unwrap_or(31);
-    let budget = (l2_bytes / 4) * 3;
-    let overhead = u64::from(max_hits) / 8 + BUCKET_STREAM_BYTES;
-    match (min_shift..=31)
-        .rev()
-        .find(|&s| l2_bytes > 0 && (1u64 << s) + overhead <= budget)
-    {
+    let fits = |s: u32| {
+        if planes {
+            (1u64 << s) / 4 + BUCKET_STREAM_BYTES <= l2_bytes / 2
+        } else {
+            (1u64 << s) + u64::from(max_hits) / 8 + BUCKET_STREAM_BYTES <= (l2_bytes / 4) * 3
+        }
+    };
+    match (min_shift..=31).rev().find(|&s| l2_bytes > 0 && fits(s)) {
         Some(shift) => (shift, buckets(shift), true),
         None => (min_shift, buckets(min_shift), false),
     }
@@ -1274,6 +1347,7 @@ fn ref_bucket_geometry(
     ref_len: u32,
     max_hits: u32,
     l2_bytes: u64,
+    planes: bool,
 ) -> Result<(u32, u32, bool), String> {
     let buckets = |s: u32| (ref_len >> s) + 1;
     // `ref_len` is a u32, so `ref_len >> 31 <= 1` and this always lands.
@@ -1297,7 +1371,7 @@ the ballot loop allows at most 32 (use shift >= {min_shift})",
         }
         return Ok((shift, buckets(shift), true));
     }
-    let (shift, n_buckets, fits) = ref_bucket_policy(ref_len, max_hits, l2_bytes);
+    let (shift, n_buckets, fits) = ref_bucket_policy(ref_len, max_hits, l2_bytes, planes);
     assert!(
         n_buckets <= 32,
         "ref bucket count {n_buckets} exceeds the 32-wide ballot loop"
@@ -1818,10 +1892,19 @@ impl Engine {
         // forces the pass on). `HSPZ_REF_BUCKETS_TRIAL_ANYWAY=1` (debug-only)
         // lifts the geometry auto-off under `auto` so the blocks can be
         // exercised where the window does not fit.
+        // Under the sieve the bucket window is sized for the packed planes.
+        // Whether the sieve runs is settled per unit (IUPAC codes in a query
+        // switch it off); what can be known here is whether the scoring allows it.
+        #[cfg(feature = "gate-sieve")]
+        let bucket_planes = sieve_request().0
+            && sieve::classes(cfg.sub_mat, cfg.xdrop, false, false, sieve_masked()).is_ok();
+        #[cfg(all(feature = "ref-loc-buckets", not(feature = "gate-sieve")))]
+        let bucket_planes = false;
         #[cfg(feature = "ref-loc-buckets")]
         let (bucket_shift, n_buckets, bucket_mode) = {
             let l2 = l2_cache_bytes();
-            let (shift, n, fits) = ref_bucket_geometry(cfg.ref_seq.len() as u32, max_hits, l2)?;
+            let (shift, n, fits) =
+                ref_bucket_geometry(cfg.ref_seq.len() as u32, max_hits, l2, bucket_planes)?;
             let req = parse_bucket_env().map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             // A pinned shift is an explicit request: force ON under `auto`.
             // Geometry auto-off still wins over everything (a pinned shift
@@ -1835,6 +1918,17 @@ impl Engine {
                 // debug escape lifts it only for `auto` trials.
                 BucketRequest::Auto if !fits && !anyway => BucketMode::Forced(false),
                 BucketRequest::Auto if pinned && !anyway => BucketMode::Forced(true),
+                // Under the sieve a plane-sized window that fits is simply on,
+                // unless `auto` was asked for by name. The trial needs 18 s of
+                // gate per engine, a quarter of a reference bin's gate at sieve
+                // speed, and only counts chunks of at least a quarter of
+                // `max_hits`, which an 80 GB card's production batches never
+                // reach: there it would stay on the plain path for ever.
+                BucketRequest::Auto
+                    if bucket_planes && !anyway && std::env::var("HSPZ_REF_BUCKETS").is_err() =>
+                {
+                    BucketMode::Forced(true)
+                }
                 BucketRequest::Auto => BucketMode::Auto {
                     phase: AutoPhase::Warm { n: 0 },
                     blocks: Vec::new(),
@@ -1848,9 +1942,14 @@ impl Engine {
             if cfg.timing {
                 if on {
                     eprintln!(
-                        "  ref buckets: on — shift {} ({} window), {} buckets, L2 {} MiB ({})",
+                        "  ref buckets: on — shift {} ({} window{}), {} buckets, L2 {} MiB ({})",
                         shift,
                         window_desc(shift),
+                        if bucket_planes {
+                            format!(", {} of packed planes", window_desc(shift - 2))
+                        } else {
+                            String::new()
+                        },
                         n,
                         l2 >> 20,
                         if l2 > 0 { "device attr" } else { "unavailable" },
@@ -1865,8 +1964,13 @@ impl Engine {
                         "L2 attribute unavailable".to_string()
                     } else {
                         format!(
-                            "{} smallest legal window exceeds the 3/4-L2 budget (L2 {} MiB)",
+                            "{} smallest legal window exceeds the {} budget (L2 {} MiB)",
                             window_desc(shift),
+                            if bucket_planes {
+                                "half-L2 packed-plane"
+                            } else {
+                                "3/4-L2"
+                            },
                             l2 >> 20,
                         )
                     };
@@ -1897,6 +2001,8 @@ impl Engine {
             } else {
                 cfg.hspthresh
             },
+            #[cfg(feature = "gate-sieve")]
+            sieve: GateSieve::new(&stream, cfg.sub_mat)?,
             noentropy: cfg.noentropy as u32,
             max_hits,
             hit_capacity,
@@ -1936,6 +2042,44 @@ impl Engine {
             buf_bucket_counts: unsafe { uninitialized(&stream, 0)? },
             #[cfg(feature = "ref-loc-buckets")]
             buf_flags_bits: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "ref-loc-buckets")]
+            bucket_planes,
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            hits_bucketed: hits_bucketed_request(),
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            buf_bucket_bounds: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            buf_seed_counts: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            buf_bucket_nibbles: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            buf_seed_nib: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "ref-loc-buckets")]
+            bucket_match: bucket_match_request(),
+            #[cfg(all(feature = "ref-loc-buckets", feature = "gate-sieve"))]
+            survivor_slots: survivor_slots_request(),
+            #[cfg(feature = "find-hits-groups")]
+            find_hits_groups: find_hits_groups_request(),
             #[cfg(feature = "ref-loc-buckets")]
             bucket_shift,
             #[cfg(feature = "ref-loc-buckets")]
@@ -1995,6 +2139,16 @@ impl Engine {
             engine.copy_ready[s].record(&engine.copy_stream)?;
             engine.compute_done[s].record(&engine.stream)?;
         }
+        #[cfg(feature = "gate-sieve")]
+        let mut engine = engine;
+        #[cfg(feature = "gate-sieve")]
+        engine.sieve_pack_reference(cfg.ref_seq)?;
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        engine.build_bucket_tables()?;
         engine.stream.synchronize()?;
         engine.copy_stream.synchronize()?;
         phases.add("upload ref/query/tables", t.elapsed());
@@ -2016,6 +2170,19 @@ impl Engine {
             t_lo: DeviceBuffer::from_host(&self.stream, t_lo)?,
             t_hi: DeviceBuffer::from_host(&self.stream, t_hi)?,
         });
+        // The engine was built before its pairs were known, with the tables of
+        // the group line (round 119). They count a k-mer's hits over the whole
+        // reference; a pair takes a slice of them, so they must not be used.
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        // SAFETY: empty buffers, never read.
+        unsafe {
+            self.buf_bucket_nibbles = uninitialized(&self.stream, 0)?;
+            self.buf_bucket_bounds = uninitialized(&self.stream, 0)?;
+        }
         Ok(())
     }
 
@@ -2032,10 +2199,16 @@ impl Engine {
     /// `reference_uploads` deliberately does not move here — see
     /// [`reference_uploads`](Self::reference_uploads).
     pub fn swap_query(&mut self, query_seq: &[u8], query_rc_seq: &[u8]) -> Result<(), DriverError> {
+        // The old planes go before the new query arrives, so the swap never
+        // holds more than the three query buffers the plan budgets for.
+        #[cfg(feature = "gate-sieve")]
+        self.sieve.release_query(&self.stream)?;
         self.query_seq = DeviceBuffer::from_host(&self.stream, query_seq)?;
         self.query_rc_seq = DeviceBuffer::from_host(&self.stream, query_rc_seq)?;
         self.query_len = query_seq.len() as u32;
         self.query_swaps += 1;
+        #[cfg(feature = "gate-sieve")]
+        self.sieve_pack_query(query_seq, query_rc_seq)?;
         Ok(())
     }
 
@@ -2521,17 +2694,47 @@ impl Engine {
                 )?;
             }
         } else {
-            // SAFETY: grid-stride kernel; `index_table` covers every seed value and
-            // `d_hit_num` has one slot per seed.
-            unsafe {
-                self.module.find_num_hits(
-                    &self.stream,
-                    elementwise(),
-                    num_seeds,
-                    &self.index_table,
-                    &self.seed_slots[slot],
-                    &mut self.buf_hit_num,
-                )?;
+            // Round 110: the group kernel needs each seed's start index beside
+            // its count.
+            #[cfg(feature = "find-hits-groups")]
+            let with_lo = self.find_hits_groups != FindHitsGroups::Off;
+            #[cfg(not(feature = "find-hits-groups"))]
+            let with_lo = false;
+            #[cfg(feature = "find-hits-groups")]
+            if with_lo {
+                // SAFETY: as below; `buf_seed_lo` is grown to one slot per seed
+                // and fully written before `find_hits_groups` reads it.
+                unsafe {
+                    reserve(
+                        &mut self.buf_seed_lo,
+                        &self.stream,
+                        num_seeds as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                    self.module.find_num_hits_lo(
+                        &self.stream,
+                        elementwise(),
+                        num_seeds,
+                        &self.index_table,
+                        &self.seed_slots[slot],
+                        &mut self.buf_hit_num,
+                        &mut self.buf_seed_lo,
+                    )?;
+                }
+            }
+            if !with_lo {
+                // SAFETY: grid-stride kernel; `index_table` covers every seed value
+                // and `d_hit_num` has one slot per seed.
+                unsafe {
+                    self.module.find_num_hits(
+                        &self.stream,
+                        elementwise(),
+                        num_seeds,
+                        &self.index_table,
+                        &self.seed_slots[slot],
+                        &mut self.buf_hit_num,
+                    )?;
+                }
             }
         }
         self.end_stage(stage, "find_num_hits")?;
@@ -2736,8 +2939,25 @@ impl Engine {
             // path; timed chunks feed the block accounting at the
             // survivor-total sync below. Warm chunks and Forced/Decided
             // chunks never time.
+            // `gate-sieve`: this unit's class constants when the bound is on.
+            // The guard samples the candidate fraction on every `period`th
+            // chunk and holds the plain gate while the bound rejects too little.
+            #[cfg(feature = "gate-sieve")]
+            let (sieve_args, sieve_sample) = match (self.sieve.args, self.sieve.guard.next_batch())
+            {
+                (None, _) => (None, false),
+                (Some(_), GuardStep::Plain) => (None, false),
+                (args, GuardStep::Sieve) => (args, false),
+                (args, GuardStep::Sample) => (args, true),
+            };
+            #[cfg(not(feature = "gate-sieve"))]
+            #[cfg_attr(not(feature = "dense-anchors"), allow(unused_variables))]
+            let sieve_args: Option<(i32, i32, i32, i32)> = None;
             #[cfg(feature = "ref-loc-buckets")]
-            let (bucket_pass, time_span) = {
+            let (bucket_pass, time_span) = if self.bucket_planes && sieve_args.is_none() {
+                // A plane-sized window does nothing for the plain gate.
+                (false, false)
+            } else {
                 let max_hits = self.max_hits;
                 let timed = self.bucket_mode.auto_chunk(iter_num_hits, max_hits);
                 if timed {
@@ -2745,6 +2965,38 @@ impl Engine {
                 }
                 (self.bucket_mode.production_path(), timed)
             };
+
+            // Round 116: survivors by sorted slot (see `survivor_slots_request`).
+            #[cfg(all(feature = "ref-loc-buckets", feature = "gate-sieve"))]
+            let slot_order = bucket_pass
+                && self.survivor_slots
+                && self.bucket_match
+                && !self.dump_raw
+                && self.census.is_none()
+                && order_check_limit() == 0;
+            #[cfg(not(all(feature = "ref-loc-buckets", feature = "gate-sieve")))]
+            let slot_order = false;
+            // Round 119: the bucket order written from the seeds, in
+            // which case no raw anchor is written at all.
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            let seeds_can =
+                slot_order && self.paired.is_none() && !self.buf_bucket_nibbles.is_empty();
+            #[cfg(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            ))]
+            let from_seeds = seeds_can && self.hits_bucketed == HitsBucketed::On;
+            #[cfg(not(all(
+                feature = "find-hits-groups",
+                feature = "ref-loc-buckets",
+                feature = "gate-sieve"
+            )))]
+            let from_seeds = false;
 
             let t = Instant::now();
             #[cfg(not(feature = "dense-anchors"))]
@@ -2768,18 +3020,33 @@ impl Engine {
             // SAFETY: `find_hits_dense` and `mark_score_survivors` overwrite
             // every active anchor and flag before either is read.
             unsafe {
-                reserve(
-                    &mut self.buf_anchor,
-                    &self.stream,
-                    iter_num_hits as usize,
-                    &mut self.pipeline_syncs,
-                )?;
+                // No raw anchor is written when the chunk's bucket order comes
+                // from its seeds.
+                if !from_seeds {
+                    reserve(
+                        &mut self.buf_anchor,
+                        &self.stream,
+                        iter_num_hits as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
                 reserve(
                     &mut self.buf_flags,
                     &self.stream,
                     iter_num_hits as usize,
                     &mut self.pipeline_syncs,
                 )?;
+                // One candidate word per 32 hits, written by the batches the
+                // sieve's guard samples and under its count diagnostic.
+                #[cfg(feature = "gate-sieve")]
+                if self.sieve.count || self.sieve.guard.period > 0 {
+                    reserve(
+                        &mut self.sieve.cand_bits,
+                        &self.stream,
+                        iter_num_hits.div_ceil(32) as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
             }
             self.phases.add("alloc hit buffers", t.elapsed());
 
@@ -2789,67 +3056,67 @@ impl Engine {
             // cutoff anyway.
             let warp_find_hits =
                 self.paired.is_none() && use_warp_find_hits(iter_num_hits, iter_num_seeds);
-            // SAFETY: one thread or warp per seed; every store lands inside
-            // `0..iter_num_hits` by construction of the prefix offsets.
-            #[cfg(not(feature = "dense-anchors"))]
-            unsafe {
-                self.module.find_hits(
-                    &self.stream,
-                    LaunchConfig {
-                        grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
-                        block_dim: (BLOCK_SIZE, 1, 1),
-                        shared_mem_bytes: 0,
-                    },
-                    &self.index_table,
-                    &self.pos_table,
-                    &self.seed_slots[slot],
-                    self.seed_size,
-                    &self.buf_hit_num,
-                    &mut self.buf_hsp,
-                    start_seed_index,
-                    start_hit_val,
-                    iter_num_seeds,
-                )?;
-            }
-            #[cfg(feature = "dense-anchors")]
-            if self.paired.is_some() {
-                // SAFETY: as `find_hits_dense`; each seed walks only the
-                // `[seed_lo, seed_lo + count)` slice `find_num_hits_paired`
-                // counted, so the prefix offsets bound every store.
+            // Round 110: the same anchors from runs of 32 seeds per warp.
+            #[cfg(feature = "find-hits-groups")]
+            let groups = if self.paired.is_none() {
+                self.find_hits_groups
+            } else {
+                FindHitsGroups::Off
+            };
+            #[cfg(feature = "find-hits-groups")]
+            let by_groups = groups == FindHitsGroups::On;
+            #[cfg(not(feature = "find-hits-groups"))]
+            let by_groups = false;
+            if !from_seeds {
+                #[cfg(feature = "find-hits-groups")]
+                if by_groups {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    find_hits_groups_totals::CHUNKS.fetch_add(1, Relaxed);
+                    find_hits_groups_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
+                    self.launch_find_hits_groups(
+                        slot,
+                        start_seed_index,
+                        start_hit_val,
+                        iter_num_seeds,
+                    )?;
+                }
+                // SAFETY: one thread or warp per seed; every store lands inside
+                // `0..iter_num_hits` by construction of the prefix offsets.
+                #[cfg(not(feature = "dense-anchors"))]
                 unsafe {
-                    self.module.find_hits_dense_paired(
+                    self.module.find_hits(
                         &self.stream,
                         LaunchConfig {
                             grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
                             block_dim: (BLOCK_SIZE, 1, 1),
                             shared_mem_bytes: 0,
                         },
+                        &self.index_table,
                         &self.pos_table,
-                        &self.buf_seed_lo,
                         &self.seed_slots[slot],
                         self.seed_size,
                         &self.buf_hit_num,
-                        &mut self.buf_anchor,
+                        &mut self.buf_hsp,
                         start_seed_index,
                         start_hit_val,
                         iter_num_seeds,
                     )?;
                 }
-            }
-            #[cfg(feature = "dense-anchors")]
-            if self.paired.is_none() {
-                unsafe {
-                    #[cfg(feature = "find-hits-warp")]
-                    if warp_find_hits {
-                        self.module.find_hits_dense_warp(
+                #[cfg(feature = "dense-anchors")]
+                if self.paired.is_some() {
+                    // SAFETY: as `find_hits_dense`; each seed walks only the
+                    // `[seed_lo, seed_lo + count)` slice `find_num_hits_paired`
+                    // counted, so the prefix offsets bound every store.
+                    unsafe {
+                        self.module.find_hits_dense_paired(
                             &self.stream,
                             LaunchConfig {
-                                grid_dim: (iter_num_seeds.div_ceil(NUM_WARPS as u32), 1, 1),
+                                grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
                                 block_dim: (BLOCK_SIZE, 1, 1),
                                 shared_mem_bytes: 0,
                             },
-                            &self.index_table,
                             &self.pos_table,
+                            &self.buf_seed_lo,
                             &self.seed_slots[slot],
                             self.seed_size,
                             &self.buf_hit_num,
@@ -2858,7 +3125,50 @@ impl Engine {
                             start_hit_val,
                             iter_num_seeds,
                         )?;
-                    } else {
+                    }
+                }
+                #[cfg(feature = "dense-anchors")]
+                if self.paired.is_none() && !by_groups {
+                    unsafe {
+                        #[cfg(feature = "find-hits-warp")]
+                        if warp_find_hits {
+                            self.module.find_hits_dense_warp(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (iter_num_seeds.div_ceil(NUM_WARPS as u32), 1, 1),
+                                    block_dim: (BLOCK_SIZE, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &self.index_table,
+                                &self.pos_table,
+                                &self.seed_slots[slot],
+                                self.seed_size,
+                                &self.buf_hit_num,
+                                &mut self.buf_anchor,
+                                start_seed_index,
+                                start_hit_val,
+                                iter_num_seeds,
+                            )?;
+                        } else {
+                            self.module.find_hits_dense(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                                    block_dim: (BLOCK_SIZE, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &self.index_table,
+                                &self.pos_table,
+                                &self.seed_slots[slot],
+                                self.seed_size,
+                                &self.buf_hit_num,
+                                &mut self.buf_anchor,
+                                start_seed_index,
+                                start_hit_val,
+                                iter_num_seeds,
+                            )?;
+                        }
+                        #[cfg(not(feature = "find-hits-warp"))]
                         self.module.find_hits_dense(
                             &self.stream,
                             LaunchConfig {
@@ -2877,34 +3187,30 @@ impl Engine {
                             iter_num_seeds,
                         )?;
                     }
-                    #[cfg(not(feature = "find-hits-warp"))]
-                    self.module.find_hits_dense(
-                        &self.stream,
-                        LaunchConfig {
-                            grid_dim: (iter_num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
-                            block_dim: (BLOCK_SIZE, 1, 1),
-                            shared_mem_bytes: 0,
-                        },
-                        &self.index_table,
-                        &self.pos_table,
-                        &self.seed_slots[slot],
-                        self.seed_size,
-                        &self.buf_hit_num,
-                        &mut self.buf_anchor,
-                        start_seed_index,
-                        start_hit_val,
-                        iter_num_seeds,
-                    )?;
                 }
             }
             self.end_stage(
                 stage,
-                if warp_find_hits {
+                if from_seeds {
+                    "find_hits (none)"
+                } else if by_groups {
+                    "find_hits (groups)"
+                } else if warp_find_hits {
                     "find_hits (warp)"
                 } else {
                     "find_hits"
                 },
             )?;
+            #[cfg(feature = "find-hits-groups")]
+            if groups == FindHitsGroups::Check {
+                self.check_find_hits_groups(
+                    slot,
+                    start_seed_index,
+                    start_hit_val,
+                    iter_num_seeds,
+                    iter_num_hits,
+                )?;
+            }
             // Round 2: the compiled-in pass is a runtime choice, so one binary
             // covers both a card the window helps and one it does not
             // (`HSPZ_REF_BUCKETS=0`). Round 87 `auto` runs alternating LONG
@@ -2940,12 +3246,14 @@ impl Engine {
                             iter_num_hits as usize,
                             &mut self.pipeline_syncs,
                         )?;
-                        reserve(
-                            &mut self.buf_sorted_idx,
-                            &self.stream,
-                            iter_num_hits as usize,
-                            &mut self.pipeline_syncs,
-                        )?;
+                        if !slot_order {
+                            reserve(
+                                &mut self.buf_sorted_idx,
+                                &self.stream,
+                                iter_num_hits as usize,
+                                &mut self.pipeline_syncs,
+                            )?;
+                        }
                         reserve(
                             &mut self.buf_bucket_counts,
                             &self.stream,
@@ -2973,108 +3281,191 @@ impl Engine {
                             .record(&self.stream)?;
                     }
 
-                    let stage = self.stage();
-                    // SAFETY: one hit per thread; thread `v < n_buckets` of block
-                    // `bid` owns exactly slot `v * cblocks + bid`.
-                    unsafe {
-                        self.module.bucket_count(
-                            &self.stream,
-                            LaunchConfig {
+                    // Round 119: the bucket order from the seeds in
+                    // place of the count and the scatter, or beside them.
+                    // SAFETY: empty, never read; one of the two branches below
+                    // replaces it.
+                    let mut d_bucket_sums = unsafe { uninitialized::<u32>(&self.stream, 0)? };
+                    #[cfg(all(
+                        feature = "find-hits-groups",
+                        feature = "ref-loc-buckets",
+                        feature = "gate-sieve"
+                    ))]
+                    if from_seeds {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        hits_bucketed_totals::CHUNKS.fetch_add(1, Relaxed);
+                        hits_bucketed_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
+                        d_bucket_sums =
+                            self.launch_hits_bucketed(slot, start_seed_index, iter_num_seeds)?;
+                    }
+                    if !from_seeds {
+                        let stage = self.stage();
+                        // SAFETY: one hit per thread; thread `v < n_buckets` of block
+                        // `bid` owns exactly slot `v * cblocks + bid`.
+                        unsafe {
+                            let config = LaunchConfig {
                                 grid_dim: (cblocks, 1, 1),
                                 block_dim: (SCAN_BLOCK, 1, 1),
                                 shared_mem_bytes: 0,
-                            },
-                            &self.buf_anchor,
-                            iter_num_hits,
-                            self.bucket_shift,
-                            cblocks,
-                            self.n_buckets,
-                            &mut self.buf_bucket_counts,
-                        )?;
-                    }
-                    self.end_stage(stage, "ref_bucket_count")?;
+                            };
+                            if self.bucket_match {
+                                self.module.bucket_count_match(
+                                    &self.stream,
+                                    config,
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &mut self.buf_bucket_counts,
+                                )?;
+                            } else {
+                                self.module.bucket_count(
+                                    &self.stream,
+                                    config,
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &mut self.buf_bucket_counts,
+                                )?;
+                            }
+                        }
+                        self.end_stage(stage, "ref_bucket_count")?;
 
-                    let sblocks = counts_len.div_ceil(SCAN_BLOCK);
-                    let mut d_bucket_sums =
-                        DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
-                    let stage = self.stage();
-                    // SAFETY: one count per thread, one sum slot per launched block.
-                    unsafe {
-                        self.module.scan_blocks(
-                            &self.stream,
-                            LaunchConfig {
-                                grid_dim: (sblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &mut self.buf_bucket_counts,
-                            &mut d_bucket_sums,
-                            counts_len,
-                        )?;
-                    }
-                    self.end_stage(stage, "ref_bucket_scan")?;
+                        let sblocks = counts_len.div_ceil(SCAN_BLOCK);
+                        d_bucket_sums =
+                            DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+                        let stage = self.stage();
+                        // SAFETY: one count per thread, one sum slot per launched block.
+                        unsafe {
+                            self.module.scan_blocks(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (sblocks, 1, 1),
+                                    block_dim: (SCAN_BLOCK, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &mut self.buf_bucket_counts,
+                                &mut d_bucket_sums,
+                                counts_len,
+                            )?;
+                        }
+                        self.end_stage(stage, "ref_bucket_scan")?;
 
-                    // Round 2: the upper level of the scan runs in ONE block on the
-                    // device instead of crossing the bus twice per chunk. `sblocks`
-                    // is ~6.6k block sums today (~27k at a 64M cap); the kernel
-                    // loops over any length, and the totals it adds are hit counts,
-                    // so `u32` is exact.
-                    let stage = self.stage();
-                    // SAFETY: one block, in place over the `sblocks` block sums.
-                    unsafe {
-                        self.module.scan_exclusive_one_block(
-                            &self.stream,
-                            LaunchConfig {
-                                grid_dim: (1, 1, 1),
-                                block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &mut d_bucket_sums,
-                            sblocks,
-                        )?;
-                    }
-                    self.end_stage(stage, "ref_bucket_scan")?;
+                        // Round 2: the upper level of the scan runs in ONE block on the
+                        // device instead of crossing the bus twice per chunk. `sblocks`
+                        // is ~6.6k block sums today (~27k at a 64M cap); the kernel
+                        // loops over any length, and the totals it adds are hit counts,
+                        // so `u32` is exact.
+                        let stage = self.stage();
+                        // SAFETY: one block, in place over the `sblocks` block sums.
+                        unsafe {
+                            self.module.scan_exclusive_one_block(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (1, 1, 1),
+                                    block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &mut d_bucket_sums,
+                                sblocks,
+                            )?;
+                        }
+                        self.end_stage(stage, "ref_bucket_scan")?;
 
-                    let stage = self.stage();
-                    // SAFETY: same geometry as `scan_blocks`, so block `b` reads
-                    // offset `b`.
-                    unsafe {
-                        self.module.add_block_offsets(
-                            &self.stream,
-                            LaunchConfig {
-                                grid_dim: (sblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &mut self.buf_bucket_counts,
-                            &d_bucket_sums,
-                            counts_len,
-                        )?;
-                    }
-                    self.end_stage(stage, "ref_bucket_scan")?;
+                        let stage = self.stage();
+                        // SAFETY: same geometry as `scan_blocks`, so block `b` reads
+                        // offset `b`.
+                        unsafe {
+                            self.module.add_block_offsets(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (sblocks, 1, 1),
+                                    block_dim: (SCAN_BLOCK, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &mut self.buf_bucket_counts,
+                                &d_bucket_sums,
+                                counts_len,
+                            )?;
+                        }
+                        self.end_stage(stage, "ref_bucket_scan")?;
 
-                    let stage = self.stage();
-                    // SAFETY: same geometry as `bucket_count`, and the inclusive
-                    // prefix partitions `0..iter_num_hits` into one slot per hit.
-                    unsafe {
-                        self.module.bucket_scatter(
-                            &self.stream,
-                            LaunchConfig {
+                        let stage = self.stage();
+                        // SAFETY: same geometry as `bucket_count`, and the inclusive
+                        // prefix partitions `0..iter_num_hits` into one slot per hit.
+                        unsafe {
+                            let config = LaunchConfig {
                                 grid_dim: (cblocks, 1, 1),
                                 block_dim: (SCAN_BLOCK, 1, 1),
                                 shared_mem_bytes: 0,
-                            },
-                            &self.buf_anchor,
-                            iter_num_hits,
-                            self.bucket_shift,
-                            cblocks,
-                            self.n_buckets,
-                            &self.buf_bucket_counts,
-                            &mut self.buf_sorted_anchor,
-                            &mut self.buf_sorted_idx,
-                        )?;
+                            };
+                            #[cfg(feature = "gate-sieve")]
+                            if slot_order {
+                                self.module.bucket_scatter_match_anchors(
+                                    &self.stream,
+                                    config,
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &self.buf_bucket_counts,
+                                    &mut self.buf_sorted_anchor,
+                                )?;
+                            }
+                            if slot_order {
+                                // Launched above.
+                            } else if self.bucket_match {
+                                self.module.bucket_scatter_match(
+                                    &self.stream,
+                                    config,
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &self.buf_bucket_counts,
+                                    &mut self.buf_sorted_anchor,
+                                    &mut self.buf_sorted_idx,
+                                )?;
+                            } else {
+                                self.module.bucket_scatter(
+                                    &self.stream,
+                                    config,
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &self.buf_bucket_counts,
+                                    &mut self.buf_sorted_anchor,
+                                    &mut self.buf_sorted_idx,
+                                )?;
+                            }
+                        }
+                        self.end_stage(stage, "ref_bucket_scatter")?;
                     }
-                    self.end_stage(stage, "ref_bucket_scatter")?;
+                    #[cfg(all(
+                        feature = "find-hits-groups",
+                        feature = "ref-loc-buckets",
+                        feature = "gate-sieve"
+                    ))]
+                    if let HitsBucketed::Check(limit) = self.hits_bucketed {
+                        use std::sync::atomic::Ordering::Relaxed;
+                        if seeds_can
+                            && hits_bucketed_totals::CHECKED_CHUNKS.load(Relaxed) < u64::from(limit)
+                        {
+                            self.check_hits_bucketed(
+                                slot,
+                                start_seed_index,
+                                iter_num_seeds,
+                                iter_num_hits,
+                            )?;
+                        }
+                    }
                     #[cfg(feature = "ref-loc-buckets")]
                     if order_check_limit() > 0 {
                         static BUCKET_CHECK_DONE: std::sync::atomic::AtomicU32 =
@@ -3249,6 +3640,48 @@ impl Engine {
                                 self.n_buckets,
                                 self.bucket_shift,
                             );
+                            // Round 116: the scatter that writes no raw id, run
+                            // beside the one just checked into a buffer of its
+                            // own, must write the same anchors word for word.
+                            #[cfg(feature = "gate-sieve")]
+                            if self.survivor_slots && self.bucket_match {
+                                // SAFETY: the kernel writes every one of the
+                                // `iter_num_hits` slots before the copy below.
+                                let mut d_plain = unsafe {
+                                    uninitialized::<u64>(&self.stream, iter_num_hits as usize)?
+                                };
+                                unsafe {
+                                    self.module.bucket_scatter_match_anchors(
+                                        &self.stream,
+                                        LaunchConfig {
+                                            grid_dim: (cblocks, 1, 1),
+                                            block_dim: (SCAN_BLOCK, 1, 1),
+                                            shared_mem_bytes: 0,
+                                        },
+                                        &self.buf_anchor,
+                                        iter_num_hits,
+                                        self.bucket_shift,
+                                        cblocks,
+                                        self.n_buckets,
+                                        &self.buf_bucket_counts,
+                                        &mut d_plain,
+                                    )?;
+                                }
+                                let plain = copy_prefix(&d_plain, &self.stream, check_n)?;
+                                let differ = plain
+                                    .iter()
+                                    .zip(&check_sorted_anchor)
+                                    .position(|(a, b)| a != b);
+                                if let Some(at) = differ {
+                                    eprintln!(
+                                        "#bucket-check-violation chunk={check_c} anchors_only slot={at}"
+                                    );
+                                }
+                                eprintln!(
+                                    "#bucket-check-anchors-only chunk={check_c} n={check_n} equal={}",
+                                    ok_str(differ.is_none()),
+                                );
+                            }
                         }
                     }
                     // Retained until the pass drains the stream: `add_block_offsets`
@@ -3275,8 +3708,101 @@ impl Engine {
                         .record(&self.stream)?;
                 }
                 let stage = self.stage();
+                // With `sieve_args` the launch goes to the sieve kernel of its path.
+                // The sieve kernels write keep bits, one word per 32 hits, on both
+                // gate paths; the plain gate kernel writes a byte per hit.
+                let bits_pass = bucket_pass || sieve_args.is_some();
+                #[cfg(feature = "gate-sieve")]
+                if let Some((um, ua, ub, ubias)) = sieve_args {
+                    let strand = rev as usize;
+                    let count = (self.sieve.count || sieve_sample) as u32;
+                    let words = self.sieve.words.0 | self.sieve.words.1 << 8;
+                    let masked = self.sieve.masked;
+                    if !bucket_pass {
+                        // SAFETY: the gate overwrites every word of the chunk.
+                        unsafe {
+                            reserve(
+                                &mut self.buf_flags_bits,
+                                &self.stream,
+                                flag_words as usize,
+                                &mut self.pipeline_syncs,
+                            )?;
+                        }
+                    }
+                    // One launch, four kernels: plain or bucketed anchors, own or
+                    // gathered reference groups.
+                    macro_rules! launch_sieve {
+                        ($kernel:ident, $anchors:expr, $flags:expr) => {
+                            self.module.$kernel(
+                                &self.stream,
+                                LaunchConfig {
+                                    grid_dim: (self.hsp_blocks, 1, 1),
+                                    block_dim: (HSP_THREADS, 1, 1),
+                                    shared_mem_bytes: 0,
+                                },
+                                &self.ref_seq,
+                                query,
+                                self.ref_len,
+                                self.query_len,
+                                &self.sub_mat,
+                                self.xdrop,
+                                self.gate_thresh,
+                                iter_num_hits,
+                                $anchors,
+                                $flags,
+                                &self.sieve.ref_pk,
+                                &self.sieve.qry_pk[strand],
+                                &self.sieve.qry_bad[strand],
+                                um,
+                                ua,
+                                ub,
+                                ubias,
+                                count,
+                                words,
+                                &mut self.sieve.cand_bits,
+                            )?
+                        };
+                    }
+                    // SAFETY: as the two launches below; the planes were packed
+                    // for this reference and this query strand, and the
+                    // candidate words are reserved whenever `count` is set.
+                    unsafe {
+                        match (bucket_pass, self.sieve.gather.unwrap_or(!bucket_pass)) {
+                            (false, false) if !masked => launch_sieve!(
+                                mark_score_survivors_sieve_open,
+                                &self.buf_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (true, false) if !masked => launch_sieve!(
+                                mark_score_survivors_reordered_sieve_open,
+                                &self.buf_sorted_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (false, false) => launch_sieve!(
+                                mark_score_survivors_sieve,
+                                &self.buf_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (false, true) => launch_sieve!(
+                                mark_score_survivors_sieve_gather,
+                                &self.buf_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (true, false) => launch_sieve!(
+                                mark_score_survivors_reordered_sieve,
+                                &self.buf_sorted_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                            (true, true) => launch_sieve!(
+                                mark_score_survivors_reordered_sieve_gather,
+                                &self.buf_sorted_anchor,
+                                &mut self.buf_flags_bits
+                            ),
+                        }
+                    }
+                }
                 // SAFETY: one warp per raw hit; every active flag is written.
-                if !bucket_pass {
+                if !bucket_pass && sieve_args.is_none() {
                     unsafe {
                         self.module.mark_score_survivors(
                             &self.stream,
@@ -3302,7 +3828,7 @@ impl Engine {
                 // one keep-bit word per 32 sorted slots and `emit_bits` maps
                 // those slots back through `buf_sorted_idx`.
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bucket_pass && sieve_args.is_none() {
                     unsafe {
                         self.module.mark_score_survivors_reordered(
                             &self.stream,
@@ -3325,15 +3851,24 @@ impl Engine {
                     }
                 }
                 self.end_stage(stage, "score_gate")?;
+                #[cfg(feature = "gate-sieve")]
+                if sieve_args.is_some() && (self.sieve.count || sieve_sample) {
+                    let candidates = if self.sieve.count {
+                        self.sieve_audit(rev, iter_num_hits, bucket_pass)?
+                    } else {
+                        self.sieve_count_candidates(iter_num_hits)?
+                    };
+                    if sieve_sample {
+                        self.sieve
+                            .guard
+                            .observe(candidates, u64::from(iter_num_hits));
+                    }
+                }
 
                 // The bitmask packs 32 hits per word, so its scan launches 32x
                 // fewer blocks and its block-sum round trip is 32x smaller.
                 #[cfg(feature = "ref-loc-buckets")]
-                let scan_len = if bucket_pass {
-                    flag_words
-                } else {
-                    iter_num_hits
-                };
+                let scan_len = if bits_pass { flag_words } else { iter_num_hits };
                 #[cfg(not(feature = "ref-loc-buckets"))]
                 let scan_len = iter_num_hits;
                 let blocks = scan_len.div_ceil(SCAN_BLOCK);
@@ -3341,7 +3876,7 @@ impl Engine {
                 // block before the host copy reads it.
                 let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
                 let stage = self.stage();
-                if !bucket_pass {
+                if !bits_pass {
                     unsafe {
                         self.module.count_survivors(
                             &self.stream,
@@ -3357,7 +3892,7 @@ impl Engine {
                     }
                 }
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bits_pass {
                     unsafe {
                         self.module.count_bits(
                             &self.stream,
@@ -3497,7 +4032,7 @@ impl Engine {
                 let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
                 self.pipeline_syncs += 1;
                 let stage = self.stage();
-                if !bucket_pass {
+                if !bits_pass {
                     unsafe {
                         self.module.emit_survivors(
                             &self.stream,
@@ -3513,8 +4048,32 @@ impl Engine {
                         )?;
                     }
                 }
+                // The plain sieve kernels index their bitmask by raw hit id: the
+                // set bits are the survivor ids, already ascending.
+                // So are the sorted slots of a bucketed chunk whose survivors
+                // keep that order (round 116): each is its own id into the
+                // sorted anchors.
+                #[cfg(feature = "gate-sieve")]
+                if bits_pass && (!bucket_pass || slot_order) {
+                    // SAFETY: the block prefixes partition the `total` survivor
+                    // slots, one per set bit.
+                    unsafe {
+                        self.module.emit_bits_plain(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (blocks, 1, 1),
+                                block_dim: (SCAN_BLOCK, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &self.buf_flags_bits,
+                            &d_offsets,
+                            &mut self.buf_survivors,
+                            flag_words,
+                        )?;
+                    }
+                }
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bucket_pass && !slot_order {
                     // SAFETY: the block prefixes partition the `total` survivor
                     // slots; a set bit implies a sorted slot below `iter_num_hits`,
                     // so every `sorted_idx` read is in bounds.
@@ -3536,14 +4095,14 @@ impl Engine {
                 }
                 self.end_stage(stage, "emit_survivors")?;
 
-                // `emit_bits` emits in ascending SORTED-slot order; everything
-                // downstream (find_hsps' anchor reads, dump_raw, the census
-                // monotone walk, dedup tie-breaking) needs ascending ORIGINAL
-                // ids, so restore them. One block on the device up to
+                // `emit_bits` emits in ascending SORTED-slot order; `dump_raw`
+                // and the census walk show ascending ORIGINAL ids, so the paths
+                // that keep the ids restore them. (The output needs neither:
+                // `survivor_slots_request`.) One block on the device up to
                 // `SORT_MAX`; longer lists go to the host, which is rare enough
                 // to have its own ledger row rather than a second kernel.
                 #[cfg(feature = "ref-loc-buckets")]
-                if bucket_pass {
+                if bucket_pass && !slot_order {
                     if total <= kernels::SORT_MAX {
                         let stage = self.stage();
                         // SAFETY: `total` ids in `buf_survivors`, sorted in place
@@ -3663,7 +4222,14 @@ impl Engine {
             } else {
                 &self.query_seq
             };
-            #[cfg(feature = "dense-anchors")]
+            #[cfg(all(feature = "dense-anchors", feature = "ref-loc-buckets"))]
+            let anchor_ptr = if slot_order {
+                // The survivor ids are sorted slots.
+                self.buf_sorted_anchor.cu_deviceptr() as *const u64
+            } else {
+                self.buf_anchor.cu_deviceptr() as *const u64
+            };
+            #[cfg(all(feature = "dense-anchors", not(feature = "ref-loc-buckets")))]
             let anchor_ptr = self.buf_anchor.cu_deviceptr() as *const u64;
             #[cfg(not(feature = "dense-anchors"))]
             let anchor_ptr = core::ptr::null::<u64>();
@@ -3865,6 +4431,83 @@ impl Engine {
             self.phases.add_overlapped_ms("H->D seeds (standalone)", ms);
         }
         Ok(out)
+    }
+
+    /// Round 110: expands a chunk's seeds into `buf_anchor` with one warp per
+    /// run of 32 seeds (thread `t` owns seed slot `t`), from the start indices
+    /// `find_num_hits_lo` left in `buf_seed_lo`.
+    #[cfg(feature = "find-hits-groups")]
+    fn launch_find_hits_groups(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) -> Result<(), DriverError> {
+        // SAFETY: every store lands inside `0..iter_num_hits` by construction of
+        // the prefix offsets, as for the other `find_hits` kernels.
+        unsafe {
+            self.module.find_hits_groups(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                    block_dim: (BLOCK_SIZE, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &self.pos_table,
+                &self.buf_seed_lo,
+                &self.seed_slots[slot],
+                self.seed_size,
+                &self.buf_hit_num,
+                &mut self.buf_anchor,
+                start_seed_index,
+                start_hit_index,
+                num_seeds,
+            )
+        }
+    }
+
+    /// Round 110, `HSPZ_FIND_HITS_GROUPS=check`: a per-seed kernel has just
+    /// written this chunk's anchors; expand the seeds again by groups into a
+    /// zeroed scratch buffer and compare every anchor on the host.
+    #[cfg(feature = "find-hits-groups")]
+    fn check_find_hits_groups(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+        num_hits: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = num_hits as usize;
+        self.sync_pipeline()?;
+        let want = copy_prefix(&self.buf_anchor, &self.stream, n)?;
+        // Zeroed, so a slot the group kernel never wrote cannot pass on what was
+        // there before (no anchor is zero: `ref_loc >= seed_size`).
+        let mut scratch = DeviceBuffer::<u64>::zeroed(&self.stream, n)?;
+        std::mem::swap(&mut self.buf_anchor, &mut scratch);
+        let stage = self.stage();
+        let launched =
+            self.launch_find_hits_groups(slot, start_seed_index, start_hit_index, num_seeds);
+        let ended = self.end_stage(stage, "find_hits (groups)");
+        let synced = self.sync_pipeline();
+        std::mem::swap(&mut self.buf_anchor, &mut scratch);
+        launched?;
+        ended?;
+        synced?;
+        let got = copy_prefix(&scratch, &self.stream, n)?;
+        if let Some(p) = (0..n).find(|&p| got[p] != want[p]) {
+            return Err(format!(
+                "find-hits-groups check: anchor {p} of {n} (chunk seeds {start_seed_index}+{num_seeds}): \
+                 {:#018x} by groups, {:#018x} by the per-seed kernel",
+                got[p], want[p]
+            )
+            .into());
+        }
+        find_hits_groups_totals::CHECKED_CHUNKS.fetch_add(1, Relaxed);
+        find_hits_groups_totals::CHECKED_HITS.fetch_add(n as u64, Relaxed);
+        Ok(())
     }
 
     fn stage(&self) -> Stage {
@@ -4114,6 +4757,1125 @@ unsafe fn uninitialized<T>(
     }
     let ptr = unsafe { cuda_core::memory::malloc_sync(bytes)? };
     Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx) })
+}
+
+/// What the sieve's guard tells one gate launch to do.
+#[cfg(feature = "gate-sieve")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardStep {
+    /// Run the sieve and count its candidates.
+    Sample,
+    /// Run the sieve.
+    Sieve,
+    /// Run the plain gate: the last sample rejected too little.
+    Plain,
+}
+
+/// Keeps the sieve from costing more than it saves. Where the bound rejects
+/// little (long unmasked satellite arrays, self-alignment) a hit pays the bound
+/// and then exact scoring, and the bound's own time is 11-25% of exact scoring.
+/// Every `period`th gate launch is a sample: it runs the sieve and counts the
+/// candidates. If more than [`SieveGuard::HOLD_ABOVE`] of its hits were
+/// candidates, the launches up to the next sample run the plain gate. Both
+/// gates are exact, so the output never depends on the guard.
+#[cfg(feature = "gate-sieve")]
+struct SieveGuard {
+    /// Launches per sample; 0 switches the guard off (`HSPZ_GATE_SIEVE_GUARD`).
+    period: u32,
+    tick: u32,
+    hold: bool,
+}
+
+#[cfg(feature = "gate-sieve")]
+impl SieveGuard {
+    /// Candidate fraction above which the plain gate is the cheaper one. The
+    /// sieve breaks even where exact scoring of the candidates plus the bound
+    /// equals exact scoring of everything, a fraction of 0.75-0.89 on the cards
+    /// measured; half leaves a margin.
+    const HOLD_ABOVE: f64 = 0.5;
+    /// A sample this small says little about the launches that follow.
+    const MIN_HITS: u64 = 1 << 16;
+
+    fn new(period: u32) -> Self {
+        Self {
+            period,
+            tick: 0,
+            hold: false,
+        }
+    }
+
+    fn next_batch(&mut self) -> GuardStep {
+        if self.period == 0 {
+            return GuardStep::Sieve;
+        }
+        let step = if self.tick == 0 {
+            // A hold lasts until the next sample and no longer: a sample too
+            // small to decide (`observe` leaves it alone) must not keep the
+            // plain gate on for another period.
+            self.hold = false;
+            GuardStep::Sample
+        } else if self.hold {
+            GuardStep::Plain
+        } else {
+            GuardStep::Sieve
+        };
+        self.tick = (self.tick + 1) % self.period;
+        step
+    }
+
+    fn observe(&mut self, candidates: u64, hits: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if hits < Self::MIN_HITS {
+            return;
+        }
+        self.hold = candidates as f64 > Self::HOLD_ABOVE * hits as f64;
+        sieve_totals::GUARD_SAMPLES.fetch_add(1, Relaxed);
+        sieve_totals::GUARD_HOLDS.fetch_add(u64::from(self.hold), Relaxed);
+    }
+}
+
+/// `HSPZ_GATE_SIEVE_GUARD`: gate launches per guard sample (default 32), `0` for
+/// no guard. Read once; anything else is reported and the default used.
+#[cfg(feature = "gate-sieve")]
+fn sieve_guard_period() -> u32 {
+    const DEFAULT: u32 = 32;
+    static PERIOD: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *PERIOD.get_or_init(|| match std::env::var("HSPZ_GATE_SIEVE_GUARD") {
+        Err(_) => DEFAULT,
+        Ok(v) => v.trim().parse().unwrap_or_else(|_| {
+            eprintln!("warning: HSPZ_GATE_SIEVE_GUARD={v:?} is not an integer; using {DEFAULT}");
+            DEFAULT
+        }),
+    })
+}
+
+/// `gate-sieve`: what the engine holds for the lane-local bound in front of the
+/// score gate (`gpu/sieve.rs`): the packed planes of the reference and of both
+/// query strands, and this unit's class scores.
+#[cfg(feature = "gate-sieve")]
+struct GateSieve {
+    /// `HSPZ_GATE_SIEVE=0` keeps every launch on the plain gate.
+    requested: bool,
+    /// Which kernels load the reference groups through shared memory instead of
+    /// every lane loading its own: all (`HSPZ_GATE_SIEVE=gather`), none
+    /// (`scatter`, the default), or `None` for `auto` — gathered on the plain
+    /// gate, where the loads miss the L2, and per lane under the bucket pass.
+    gather: Option<bool>,
+    /// `HSPZ_GATE_SIEVE_COUNT=1`: read every batch's candidate words back and
+    /// report the passing fraction. A diagnostic: it waits on every batch.
+    count: bool,
+    sub_mat: Vec<i32>,
+    ref_has_x: bool,
+    ref_pk: DeviceBuffer<u64>,
+    qry_pk: [DeviceBuffer<u64>; 2],
+    qry_bad: [DeviceBuffer<u32>; 2],
+    /// `Classes::kernel_args` for the unit in place; `None` runs the plain gate.
+    args: Option<(i32, i32, i32, i32)>,
+    classes: Option<sieve::Classes>,
+    /// Round 111: how far an undecided side of the bound is carried
+    /// (`HSPZ_SIEVE_WORDS=R,L`).
+    words: sieve::Words,
+    /// Round 117: whether the bound reads the query's mask plane
+    /// (`HSPZ_GATE_SIEVE_MASK`; without it the plane is not built).
+    masked: bool,
+    /// The state last printed under `--time`, so that a run prints it once per
+    /// change rather than once per unit.
+    said: String,
+    cand_bits: DeviceBuffer<u32>,
+    guard: SieveGuard,
+    /// `HSPZ_GATE_SIEVE_CHECK=1`: host copies of both sequences and their
+    /// planes, to recompute every hit on the host — the lane's decision, and the
+    /// exact gate's — and compare both with the device.
+    host: Option<SieveHost>,
+}
+
+#[cfg(feature = "gate-sieve")]
+#[derive(Default)]
+struct SieveHost {
+    ref_enc: Vec<u8>,
+    ref_pk: Vec<u64>,
+    qry_enc: [Vec<u8>; 2],
+    qry_pk: [Vec<u64>; 2],
+    qry_bad: [Vec<u32>; 2],
+}
+
+/// Process-wide tallies of the sieve diagnostics, printed with the run's counts.
+#[cfg(feature = "gate-sieve")]
+pub mod sieve_totals {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    pub(super) static HITS: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CANDIDATES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CHECKED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KEPT: AtomicU64 = AtomicU64::new(0);
+    pub(super) static CANDIDATE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static FLAG_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static KEPT_BUT_REJECTED: AtomicU64 = AtomicU64::new(0);
+    pub(super) static PLANE_MISMATCHES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GUARD_SAMPLES: AtomicU64 = AtomicU64::new(0);
+    pub(super) static GUARD_HOLDS: AtomicU64 = AtomicU64::new(0);
+
+    /// The lines for the run report; empty unless a diagnostic ran or the guard
+    /// held the plain gate.
+    pub fn report() -> Vec<String> {
+        let mut out = Vec::new();
+        let (hits, cands) = (HITS.load(Relaxed), CANDIDATES.load(Relaxed));
+        if hits > 0 {
+            out.push(format!(
+                "#sieve candidates: {cands} of {hits} hits ({:.4}%)",
+                cands as f64 / hits as f64 * 100.0
+            ));
+        }
+        let (samples, holds) = (GUARD_SAMPLES.load(Relaxed), GUARD_HOLDS.load(Relaxed));
+        if holds > 0 {
+            out.push(format!(
+                "#sieve guard: the bound passed more than half of the hits in {holds} of {samples} \
+                 sampled batches; the plain gate ran after each of them"
+            ));
+        }
+        let checked = CHECKED.load(Relaxed);
+        if checked > 0 {
+            out.push(format!(
+                "#sieve check: {checked} hits, {} kept by the exact model; candidate mismatches {}, \
+                 flag mismatches {}, kept but rejected {}, plane word mismatches {}",
+                KEPT.load(Relaxed),
+                CANDIDATE_MISMATCHES.load(Relaxed),
+                FLAG_MISMATCHES.load(Relaxed),
+                KEPT_BUT_REJECTED.load(Relaxed),
+                PLANE_MISMATCHES.load(Relaxed),
+            ));
+        }
+        out
+    }
+}
+
+/// `HSPZ_GATE_SIEVE` as (sieve requested, gathered reference): unset, `1` or
+/// `scatter` run the sieve with every lane loading its own reference groups,
+/// `gather` gathers them through shared memory, `auto` gathers on the plain
+/// gate only, `0` keeps the plain gate. Read once; any other value is reported
+/// and runs the default arm.
+#[cfg(feature = "gate-sieve")]
+fn sieve_request() -> (bool, Option<bool>) {
+    static REQUEST: std::sync::OnceLock<(bool, Option<bool>)> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_GATE_SIEVE").as_deref() {
+        Err(_) | Ok("1") | Ok("scatter") => (true, Some(false)),
+        Ok("gather") => (true, Some(true)),
+        Ok("auto") => (true, None),
+        Ok("0") => (false, Some(false)),
+        Ok(other) => {
+            eprintln!(
+                "warning: HSPZ_GATE_SIEVE={other:?} is not 0, 1, scatter, gather or auto; using scatter"
+            );
+            (true, Some(false))
+        }
+    })
+}
+
+/// Round 117: whether the bound reads the query's mask plane.
+///
+/// Unset or `HSPZ_GATE_SIEVE_MASK=0`: the query is packed with
+/// `sieve::QRY_FILL`, no mask plane is built for it, and only a drop certifies a
+/// side of the bound. `1`: the plane of rounds 104 to 116, where a query base
+/// outside `ACGT` ends the bound's walk. The gathered arms keep the plane, so
+/// asking for them keeps it everywhere.
+#[cfg(feature = "gate-sieve")]
+fn sieve_masked() -> bool {
+    static MASKED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MASKED.get_or_init(|| {
+        let asked = match std::env::var("HSPZ_GATE_SIEVE_MASK").as_deref() {
+            Err(_) => None,
+            Ok("0") => Some(false),
+            Ok("1") => Some(true),
+            Ok(other) => {
+                eprintln!("warning: HSPZ_GATE_SIEVE_MASK={other:?} is not 0 or 1; using 0");
+                None
+            }
+        };
+        if sieve_request().1 != Some(false) {
+            if asked == Some(false) {
+                eprintln!(
+                    "warning: HSPZ_GATE_SIEVE_MASK=0 has no gathered arm; the mask plane stays \
+                     (HSPZ_GATE_SIEVE=gather or auto)"
+                );
+            }
+            return true;
+        }
+        asked.unwrap_or(false)
+    })
+}
+
+/// `HSPZ_SIEVE_WORDS=R,L`: the words (32 bases each) the bound may read on the
+/// right and on the left of a hit. Every lane reads 2 and 3; a side that has not
+/// certified by then is carried on up to `R` and `L`. Unset is the longest
+/// window, 4 and 5 (round 111); `2,3` is the static window of rounds 104 to 110.
+/// A value outside those ranges is reported once and ignored.
+#[cfg(feature = "gate-sieve")]
+fn sieve_words() -> sieve::Words {
+    const DEFAULT: sieve::Words = (sieve::RIGHT_WORDS_MAX, sieve::LEFT_WORDS_MAX);
+    static WORDS: std::sync::OnceLock<sieve::Words> = std::sync::OnceLock::new();
+    *WORDS.get_or_init(|| {
+        let Ok(text) = std::env::var("HSPZ_SIEVE_WORDS") else {
+            return DEFAULT;
+        };
+        let parsed = text.split_once(',').and_then(|(r, l)| {
+            let (r, l) = (r.trim().parse::<u32>().ok()?, l.trim().parse::<u32>().ok()?);
+            ((sieve::RIGHT_WORDS..=sieve::RIGHT_WORDS_MAX).contains(&r)
+                && (sieve::LEFT_WORDS..=sieve::LEFT_WORDS_MAX).contains(&l))
+            .then_some((r, l))
+        });
+        parsed.unwrap_or_else(|| {
+            eprintln!(
+                "warning: HSPZ_SIEVE_WORDS={text:?} is not R,L with R in {}..={} and L in {}..={}; \
+                 using {},{}",
+                sieve::RIGHT_WORDS,
+                sieve::RIGHT_WORDS_MAX,
+                sieve::LEFT_WORDS,
+                sieve::LEFT_WORDS_MAX,
+                DEFAULT.0,
+                DEFAULT.1,
+            );
+            DEFAULT
+        })
+    })
+}
+
+#[cfg(feature = "gate-sieve")]
+impl GateSieve {
+    fn new(stream: &CudaStream, sub_mat: &[i32]) -> Result<Self, DriverError> {
+        let flag = |name: &str| matches!(std::env::var(name).as_deref(), Ok("1"));
+        let check = flag("HSPZ_GATE_SIEVE_CHECK");
+        // SAFETY: empty, or one word no kernel reads; all are replaced before use.
+        unsafe {
+            Ok(Self {
+                requested: sieve_request().0,
+                gather: sieve_request().1,
+                count: check || flag("HSPZ_GATE_SIEVE_COUNT"),
+                sub_mat: sub_mat.to_vec(),
+                ref_has_x: false,
+                ref_pk: uninitialized(stream, 0)?,
+                qry_pk: [uninitialized(stream, 0)?, uninitialized(stream, 0)?],
+                qry_bad: [uninitialized(stream, 0)?, uninitialized(stream, 0)?],
+                args: None,
+                classes: None,
+                words: sieve_words(),
+                masked: sieve_masked(),
+                said: String::new(),
+                cand_bits: uninitialized(stream, 1)?,
+                guard: SieveGuard::new(sieve_guard_period()),
+                host: check.then(SieveHost::default),
+            })
+        }
+    }
+
+    /// Frees the previous unit's query planes. The pass that read them has
+    /// drained the stream, as it has for the query buffers `swap_query` replaces.
+    fn release_query(&mut self, stream: &CudaStream) -> Result<(), DriverError> {
+        self.args = None;
+        // What the last launches of one query said about its hits says nothing
+        // about the next query's: start it with a sample.
+        self.guard = SieveGuard::new(self.guard.period);
+        for strand in 0..2 {
+            // SAFETY: empty buffers, never read.
+            unsafe {
+                self.qry_pk[strand] = uninitialized(stream, 0)?;
+                self.qry_bad[strand] = uninitialized(stream, 0)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One thread per packed group, grid-stride.
+#[cfg(feature = "gate-sieve")]
+fn pack_launch(groups: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((groups as u32).div_ceil(SCAN_BLOCK).clamp(1, 1 << 14), 1, 1),
+        block_dim: (SCAN_BLOCK, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+#[cfg(feature = "gate-sieve")]
+impl Engine {
+    /// Words per row of bucket edges, as a shift: the next power of two above
+    /// `n_buckets` (a row holds `n_buckets + 1` edges), so a row of up to seven
+    /// buckets is one 32-byte sector.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn bounds_row_shift(&self) -> u32 {
+        (self.n_buckets + 1).next_power_of_two().trailing_zeros()
+    }
+
+    /// Round 119: the two tables the group line reads, once per reference: every
+    /// k-mer's hits per bucket in four bits (`bucket_nibbles`, the size of the
+    /// index table), and a row of bucket edges for each k-mer with a count
+    /// above 14 (`bucket_overflow_rows`).
+    ///
+    /// Left empty, which keeps the count and the scatter, when
+    /// `HSPZ_HITS_BUCKETED=0`, the window is not the planes' one, the run is
+    /// `--paired` (a pair takes a slice of a k-mer's positions; `set_pairs`
+    /// drops the tables, because the pairs arrive after the engine is built),
+    /// the group kernels are off or under their check (which compares the raw
+    /// anchors), there are more than eight buckets, the seed has more than 12
+    /// care bases (the counts would be a gibibyte, far past the L2, and that
+    /// case is not measured), or the rows would
+    /// take more than the estimate allows them (`plan::unit_device_bytes`: a
+    /// quarter of a byte per reference base, at least 64 MiB).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn build_bucket_tables(&mut self) -> Result<(), DriverError> {
+        if self.hits_bucketed == HitsBucketed::Off
+            || !self.bucket_planes
+            || self.paired.is_some()
+            || self.find_hits_groups != FindHitsGroups::On
+            || self.n_buckets == 0
+            || self.n_buckets > 8
+            || self.index_table.len() > 1 << 24
+        {
+            return Ok(());
+        }
+        let n_kmers = self.index_table.len() as u32;
+        let row_shift = self.bounds_row_shift();
+        let t = Instant::now();
+        // SAFETY: `bucket_nibbles` writes every word of both buffers.
+        let (mut nibbles, mut sat) = unsafe {
+            (
+                uninitialized::<u32>(&self.stream, n_kmers as usize)?,
+                uninitialized::<u32>(&self.stream, n_kmers as usize)?,
+            )
+        };
+        let sblocks = n_kmers.div_ceil(SCAN_BLOCK);
+        let mut d_sums = DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+        let scan = LaunchConfig {
+            grid_dim: (sblocks, 1, 1),
+            block_dim: (SCAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one thread per k-mer, each writing its own two words; then the
+        // in-block scan of `sat` with its block totals.
+        unsafe {
+            self.module.bucket_nibbles(
+                &self.stream,
+                elementwise(),
+                &self.index_table,
+                &self.pos_table,
+                self.seed_size,
+                self.bucket_shift,
+                self.n_buckets,
+                n_kmers,
+                &mut nibbles,
+                &mut sat,
+            )?;
+            self.module
+                .scan_blocks(&self.stream, scan, &mut sat, &mut d_sums, n_kmers)?;
+        }
+        // Once per reference, so the block totals take the host's way.
+        let mut sums = d_sums.to_host_vec(&self.stream)?;
+        let mut rows = 0u32;
+        for sum in sums.iter_mut() {
+            let here = *sum;
+            *sum = rows;
+            rows += here;
+        }
+        let row_bytes = (rows as usize * 4) << row_shift;
+        let allowed = (self.ref_len as usize / 4).max(64 << 20);
+        if rows >= 1 << 24 || row_bytes > allowed {
+            if self.timing {
+                eprintln!(
+                    "  bucket order from the seeds: off for this reference, {rows} k-mers need a row \
+                     of edges ({} MiB, {} allowed)",
+                    row_bytes >> 20,
+                    allowed >> 20
+                );
+            }
+            return Ok(());
+        }
+        if rows > 0 {
+            let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
+            // SAFETY: the scan's last step, then one thread per k-mer: a
+            // saturated one writes its own row, which `rows` counted, and its
+            // own word.
+            unsafe {
+                self.module
+                    .add_block_offsets(&self.stream, scan, &mut sat, &d_offsets, n_kmers)?;
+                self.buf_bucket_bounds = uninitialized(&self.stream, (rows as usize) << row_shift)?;
+                self.module.bucket_overflow_rows(
+                    &self.stream,
+                    elementwise(),
+                    &self.index_table,
+                    &self.pos_table,
+                    self.seed_size,
+                    self.bucket_shift,
+                    self.n_buckets,
+                    row_shift,
+                    n_kmers,
+                    &sat,
+                    &mut nibbles,
+                    &mut self.buf_bucket_bounds,
+                )?;
+            }
+            self.stream.synchronize()?;
+        }
+        self.buf_bucket_nibbles = nibbles;
+        if self.timing {
+            eprintln!(
+                "  bucket order from the seeds: {} MiB of counts per k-mer, {rows} k-mers with a row of \
+                 edges ({:.1} MiB), built in {:.1} ms{}",
+                (n_kmers as usize * 4) >> 20,
+                row_bytes as f64 / (1 << 20) as f64,
+                t.elapsed().as_secs_f64() * 1e3,
+                if matches!(self.hits_bucketed, HitsBucketed::Check(_)) {
+                    " (check)"
+                } else {
+                    ""
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Round 119: one chunk's bucket order written from its seeds
+    /// into `buf_sorted_anchor`. Returns the block sums of the scan, which a
+    /// queued kernel may still read.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn launch_hits_bucketed(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        num_seeds: u32,
+    ) -> Result<DeviceBuffer<u32>, DriverError> {
+        // One warp of the two kernels below per run of 32 seeds.
+        let num_runs = num_seeds.div_ceil(32);
+        let counts_len = self.n_buckets * num_runs;
+        let row_shift = self.bounds_row_shift();
+        let by_runs = LaunchConfig {
+            grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+            block_dim: (BLOCK_SIZE, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: `run_bucket_counts` writes every count before the scan reads
+        // it, and every live seed's word before the group kernel reads it.
+        unsafe {
+            reserve(
+                &mut self.buf_seed_counts,
+                &self.stream,
+                counts_len as usize,
+                &mut self.pipeline_syncs,
+            )?;
+            reserve(
+                &mut self.buf_seed_nib,
+                &self.stream,
+                num_seeds as usize,
+                &mut self.pipeline_syncs,
+            )?;
+        }
+        let stage = self.stage();
+        // SAFETY: one thread per seed slot; lane 0 of run `r` writes the
+        // `n_buckets` slots `b * num_runs + r`.
+        unsafe {
+            self.module.run_bucket_counts(
+                &self.stream,
+                by_runs,
+                &self.seed_slots[slot],
+                &self.buf_bucket_nibbles,
+                &self.buf_bucket_bounds,
+                start_seed_index,
+                num_seeds,
+                self.n_buckets,
+                row_shift,
+                num_runs,
+                &mut self.buf_seed_counts,
+                &mut self.buf_seed_nib,
+            )?;
+        }
+        self.end_stage(stage, "run_bucket_counts")?;
+
+        let sblocks = counts_len.div_ceil(SCAN_BLOCK);
+        let mut d_sums = DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+        let scan = LaunchConfig {
+            grid_dim: (sblocks, 1, 1),
+            block_dim: (SCAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let stage = self.stage();
+        // SAFETY: the three launches of the bucket pass's own scan, over the
+        // runs' histogram instead of the blocks'.
+        unsafe {
+            self.module.scan_blocks(
+                &self.stream,
+                scan,
+                &mut self.buf_seed_counts,
+                &mut d_sums,
+                counts_len,
+            )?;
+            self.module.scan_exclusive_one_block(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &mut d_sums,
+                sblocks,
+            )?;
+            self.module.add_block_offsets(
+                &self.stream,
+                scan,
+                &mut self.buf_seed_counts,
+                &d_sums,
+                counts_len,
+            )?;
+        }
+        self.end_stage(stage, "run_bucket_scan")?;
+
+        let stage = self.stage();
+        // SAFETY: one thread per seed slot, as `find_hits_groups`; the scanned
+        // counts and the table's rows give every hit of the chunk its own slot
+        // in `0..iter_num_hits`.
+        unsafe {
+            self.module.find_hits_groups_bucketed(
+                &self.stream,
+                by_runs,
+                &self.pos_table,
+                &self.buf_bucket_bounds,
+                &self.buf_seed_nib,
+                &self.seed_slots[slot],
+                self.seed_size,
+                &self.buf_seed_lo,
+                &self.buf_seed_counts,
+                self.n_buckets,
+                row_shift,
+                num_runs,
+                start_seed_index,
+                num_seeds,
+                &mut self.buf_sorted_anchor,
+            )?;
+        }
+        self.end_stage(stage, "find_hits_bucketed")?;
+        Ok(d_sums)
+    }
+
+    /// Round 119, `HSPZ_HITS_BUCKETED=check`: the count and the scatter have
+    /// just written this chunk's bucket order; write it again from the seeds
+    /// into a scratch buffer and compare the two on the host. The order inside
+    /// a bucket differs by design, so each bucket's anchors are compared as a
+    /// sorted list: the same multiset in the same bucket.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn check_hits_bucketed(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        num_seeds: u32,
+        num_hits: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = num_hits as usize;
+        self.sync_pipeline()?;
+        let mut want = copy_prefix(&self.buf_sorted_anchor, &self.stream, n)?;
+        // Zeroed scratch: a slot the seed-driven kernel never wrote cannot pass
+        // on what the scatter left there.
+        let mut scratch = DeviceBuffer::<u64>::zeroed(&self.stream, n)?;
+        std::mem::swap(&mut self.buf_sorted_anchor, &mut scratch);
+        let launched = self.launch_hits_bucketed(slot, start_seed_index, num_seeds);
+        let synced = self.sync_pipeline();
+        std::mem::swap(&mut self.buf_sorted_anchor, &mut scratch);
+        let _sums = launched?;
+        synced?;
+        let mut got = copy_prefix(&scratch, &self.stream, n)?;
+        let (shift, top) = (self.bucket_shift, self.n_buckets - 1);
+        let bucket_of = |a: u64| ((a as u32) >> shift).min(top);
+        let mut lo = 0usize;
+        while lo < n {
+            let b = bucket_of(want[lo]);
+            let mut hi = lo + 1;
+            while hi < n && bucket_of(want[hi]) == b {
+                hi += 1;
+            }
+            if let Some(p) = (lo..hi).find(|&p| bucket_of(got[p]) != b) {
+                return Err(format!(
+                    "hits-bucketed check: slot {p} of {n} (chunk seeds {start_seed_index}+{num_seeds}) \
+                     holds anchor {:#018x} of bucket {}, in the range of bucket {b}",
+                    got[p],
+                    bucket_of(got[p])
+                )
+                .into());
+            }
+            want[lo..hi].sort_unstable();
+            got[lo..hi].sort_unstable();
+            if let Some(p) = (lo..hi).find(|&p| got[p] != want[p]) {
+                return Err(format!(
+                    "hits-bucketed check: bucket {b} of a chunk of {n} hits (seeds \
+                     {start_seed_index}+{num_seeds}) differs at sorted rank {}: {:#018x} from the \
+                     seeds, {:#018x} from the scatter",
+                    p - lo,
+                    got[p],
+                    want[p]
+                )
+                .into());
+            }
+            lo = hi;
+        }
+        // How many of the chunk's seeds had a saturated count and read a row.
+        let words = copy_prefix(&self.buf_seed_nib, &self.stream, num_seeds as usize)?;
+        let saturated = words
+            .iter()
+            .filter(|&&w| w & (w >> 1) & (w >> 2) & (w >> 3) & 0x1111_1111 != 0)
+            .count();
+        hits_bucketed_totals::CHECKED_SEEDS.fetch_add(u64::from(num_seeds), Relaxed);
+        hits_bucketed_totals::SATURATED_SEEDS.fetch_add(saturated as u64, Relaxed);
+        hits_bucketed_totals::CHECKED_CHUNKS.fetch_add(1, Relaxed);
+        hits_bucketed_totals::CHECKED_HITS.fetch_add(n as u64, Relaxed);
+        Ok(())
+    }
+
+    /// Packs the resident reference into its planes, on the device.
+    fn sieve_pack_reference(&mut self, ref_enc: &[u8]) -> Result<(), DriverError> {
+        if !self.sieve.requested || ref_enc.is_empty() {
+            return Ok(());
+        }
+        self.sieve.ref_has_x = memchr::memchr(crate::sequence::X_NT, ref_enc).is_some();
+        let groups = sieve::groups(ref_enc.len());
+        // SAFETY: `pack_planes` writes every group before the gate reads one; the
+        // reference has no bad plane, so that argument is never written.
+        unsafe {
+            self.sieve.ref_pk = uninitialized(&self.stream, groups)?;
+            self.module.pack_planes(
+                &self.stream,
+                pack_launch(groups),
+                &self.ref_seq,
+                self.ref_len,
+                groups as u32,
+                sieve::REF_FILL,
+                0,
+                &mut self.sieve.ref_pk,
+                &mut self.sieve.cand_bits,
+            )?;
+        }
+        if let Some(host) = self.sieve.host.as_mut() {
+            host.ref_enc = ref_enc.to_vec();
+            host.ref_pk = sieve::pack(ref_enc, sieve::REF_FILL).0;
+            let device = copy_prefix(&self.sieve.ref_pk, &self.stream, groups)?;
+            let wrong = device
+                .iter()
+                .zip(&host.ref_pk)
+                .filter(|(d, h)| d != h)
+                .count();
+            sieve_totals::PLANE_MISMATCHES
+                .fetch_add(wrong as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Decides whether the bound holds for this unit and packs both query strands.
+    fn sieve_pack_query(&mut self, query: &[u8], query_rc: &[u8]) -> Result<(), DriverError> {
+        if !self.sieve.requested {
+            return Ok(());
+        }
+        let x = crate::sequence::X_NT;
+        let qry_has_x = memchr::memchr(x, query).is_some() || memchr::memchr(x, query_rc).is_some();
+        // Plane positions are 32-bit and carry four groups of padding on each side.
+        let too_long = |len: usize| len > (u32::MAX - 64 * sieve::PADG) as usize;
+        let decision = if query.is_empty() || self.sieve.ref_pk.is_empty() {
+            Err("an empty sequence".to_string())
+        } else if too_long(self.ref_len as usize) || too_long(query.len()) {
+            Err("a sequence too long for 32-bit plane positions".to_string())
+        } else {
+            sieve::classes(
+                &self.sieve.sub_mat,
+                self.xdrop,
+                self.sieve.ref_has_x,
+                qry_has_x,
+                self.sieve.masked,
+            )
+        };
+        let state = match &decision {
+            Ok(c) => format!(
+                "on — match {}, transition {}, transversion {}; {} right + {} left bases{}{}{}",
+                c.um,
+                c.uti,
+                c.utv,
+                sieve::RIGHT,
+                sieve::LEFT,
+                if self.sieve.masked {
+                    ""
+                } else {
+                    ", query without a mask plane"
+                },
+                if self.sieve.words == (sieve::RIGHT_WORDS, sieve::LEFT_WORDS) {
+                    String::new()
+                } else {
+                    format!(
+                        ", an undecided side carried to {} right, {} left",
+                        32 * self.sieve.words.0,
+                        32 * self.sieve.words.1
+                    )
+                },
+                match self.sieve.gather {
+                    Some(true) => "; gathered reference",
+                    Some(false) => "",
+                    None => "; reference gathered on the plain gate only",
+                }
+            ),
+            Err(why) => format!("off — {why}"),
+        };
+        if self.timing && state != self.sieve.said {
+            eprintln!("  gate sieve: {state}");
+            self.sieve.said = state;
+        }
+        self.sieve.classes = decision.ok();
+        self.sieve.args = self.sieve.classes.map(|c| c.kernel_args());
+        if self.sieve.args.is_none() {
+            return Ok(());
+        }
+
+        let fill = if self.sieve.masked {
+            sieve::REF_FILL
+        } else {
+            sieve::QRY_FILL
+        };
+        for (strand, enc) in [query, query_rc].into_iter().enumerate() {
+            // `--paired` swaps in the plus strand alone; a strand that is not
+            // there is never gated, and its planes stay empty.
+            if enc.is_empty() {
+                continue;
+            }
+            let groups = sieve::groups(enc.len());
+            let seq = if strand == 0 {
+                &self.query_seq
+            } else {
+                &self.query_rc_seq
+            };
+            // Without the mask plane the kernels never read it: one word that
+            // nothing writes stands in for it.
+            let masked = self.sieve.masked;
+            let bad_len = if masked { groups } else { 1 };
+            // SAFETY: `pack_planes` writes every group of the planes it is asked
+            // for before the gate reads one.
+            unsafe {
+                self.sieve.qry_pk[strand] = uninitialized(&self.stream, groups)?;
+                self.sieve.qry_bad[strand] = uninitialized(&self.stream, bad_len)?;
+                self.module.pack_planes(
+                    &self.stream,
+                    pack_launch(groups),
+                    seq,
+                    enc.len() as u32,
+                    groups as u32,
+                    fill,
+                    masked as u32,
+                    &mut self.sieve.qry_pk[strand],
+                    &mut self.sieve.qry_bad[strand],
+                )?;
+            }
+            if let Some(host) = self.sieve.host.as_mut() {
+                let (pk, bad) = sieve::pack(enc, fill);
+                let d_pk = copy_prefix(&self.sieve.qry_pk[strand], &self.stream, groups)?;
+                let mut wrong = d_pk.iter().zip(&pk).filter(|(d, h)| d != h).count();
+                if masked {
+                    let d_bad = copy_prefix(&self.sieve.qry_bad[strand], &self.stream, groups)?;
+                    wrong += d_bad.iter().zip(&bad).filter(|(d, h)| d != h).count();
+                }
+                sieve_totals::PLANE_MISMATCHES
+                    .fetch_add(wrong as u64, std::sync::atomic::Ordering::Relaxed);
+                host.qry_enc[strand] = enc.to_vec();
+                host.qry_pk[strand] = pk;
+                host.qry_bad[strand] = bad;
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard's sample of one gate launch: how many of its `n` hits the bound
+    /// passed to the exact gate. Block sums on the device, one small copy.
+    fn sieve_count_candidates(&mut self, n: u32) -> Result<u64, DriverError> {
+        let words = n.div_ceil(32);
+        let blocks = words.div_ceil(SCAN_BLOCK);
+        // SAFETY: `count_bits` writes one sum per launched block before the copy.
+        let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
+        unsafe {
+            self.module.count_bits(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (blocks, 1, 1),
+                    block_dim: (SCAN_BLOCK, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &self.sieve.cand_bits,
+                &mut d_sums,
+                words,
+            )?;
+        }
+        let sums = d_sums.to_host_vec(&self.stream)?;
+        self.absorb_sync()?;
+        Ok(sums.iter().map(|&c| u64::from(c)).sum())
+    }
+
+    /// The count and check diagnostics for one gate launch: reads the candidate
+    /// words back and, under `check`, replays every hit on the host. Returns the
+    /// candidate count.
+    fn sieve_audit(&mut self, rev: bool, n: u32, bucket_pass: bool) -> Result<u64, DriverError> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let words = n.div_ceil(32) as usize;
+        let cand = copy_prefix(&self.sieve.cand_bits, &self.stream, words)?;
+        self.absorb_sync()?;
+        let candidates: u64 = cand.iter().map(|w| u64::from(w.count_ones())).sum();
+        sieve_totals::HITS.fetch_add(u64::from(n), Relaxed);
+        sieve_totals::CANDIDATES.fetch_add(candidates, Relaxed);
+        let (Some(host), Some(classes)) = (self.sieve.host.as_ref(), self.sieve.classes) else {
+            return Ok(candidates);
+        };
+
+        // The anchors the gate read and the keep bits it wrote, in the gate's
+        // order: sorted slots under the bucket pass, raw hits otherwise.
+        let anchors = if bucket_pass {
+            copy_prefix(&self.buf_sorted_anchor, &self.stream, n as usize)?
+        } else {
+            copy_prefix(&self.buf_anchor, &self.stream, n as usize)?
+        };
+        let keep_bits = copy_prefix(&self.buf_flags_bits, &self.stream, words)?;
+        let bit = |bits: &[u32], i: usize| bits[i / 32] >> (i % 32) & 1 != 0;
+        let device_keep = |i: usize| bit(&keep_bits, i);
+
+        let strand = rev as usize;
+        let (xdrop, t_min, sub_mat) = (self.xdrop, self.gate_thresh, &self.sieve.sub_mat);
+        let carried = self.sieve.words;
+        let masked = self.sieve.masked;
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |t| t.get())
+            .min(16);
+        let per = (n as usize).div_ceil(threads).max(1);
+        let tallies: Vec<[u64; 4]> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..n as usize)
+                .step_by(per)
+                .map(|start| {
+                    let (anchors, cand, device_keep) = (&anchors, &cand, &device_keep);
+                    scope.spawn(move || {
+                        // kept, candidate mismatches, flag mismatches, kept but rejected
+                        let mut t = [0u64; 4];
+                        let end = (start + per).min(n as usize);
+                        for (i, &anchor) in anchors.iter().enumerate().take(end).skip(start) {
+                            let (rl, ql) = (anchor as u32, (anchor >> 32) as u32);
+                            let model_cand = sieve::candidate(
+                                &host.ref_pk,
+                                &host.qry_pk[strand],
+                                &host.qry_bad[strand],
+                                rl,
+                                ql,
+                                &classes,
+                                xdrop,
+                                t_min,
+                                carried,
+                                masked,
+                            );
+                            let (right, left) = sieve::exact_sides(
+                                &host.ref_enc,
+                                &host.qry_enc[strand],
+                                rl,
+                                ql,
+                                sub_mat,
+                                xdrop,
+                            );
+                            let keep = right.wrapping_add(left) >= t_min;
+                            let device_cand = bit(cand, i);
+                            t[0] += keep as u64;
+                            t[1] += (model_cand != device_cand) as u64;
+                            t[2] += (keep != device_keep(i)) as u64;
+                            t[3] += (keep && !device_cand) as u64;
+                        }
+                        t
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| w.join().expect("sieve check worker"))
+                .collect()
+        });
+        let sum = |k: usize| tallies.iter().map(|t| t[k]).sum::<u64>();
+        sieve_totals::CHECKED.fetch_add(u64::from(n), Relaxed);
+        sieve_totals::KEPT.fetch_add(sum(0), Relaxed);
+        sieve_totals::CANDIDATE_MISMATCHES.fetch_add(sum(1), Relaxed);
+        sieve_totals::FLAG_MISMATCHES.fetch_add(sum(2), Relaxed);
+        sieve_totals::KEPT_BUT_REJECTED.fetch_add(sum(3), Relaxed);
+        Ok(candidates)
+    }
+}
+
+/// Round 116: in which order a bucketed chunk's survivors reach `find_hsps`.
+///
+/// The bucket pass sorts a chunk's hits by reference window. Until round 116
+/// the scatter also wrote every hit's raw id, the survivors were mapped back
+/// through it and sorted, and `find_hsps` read `buf_anchor` by raw id: the
+/// order of before the pass, kept because it was the order of before. Nothing
+/// that reaches the output depends on it: `find_hsps` extends each survivor on
+/// its own, and the host orders the chunk's HSPs with `hsp::by_diagonal`, which
+/// compares all four fields of a segment, so two segments it calls equal are
+/// the same sixteen bytes and the sorted list is the same whatever order they
+/// arrived in. So the survivors are taken by sorted slot, `find_hsps` reads the
+/// sorted anchors, and the ids are neither written nor sorted.
+///
+/// `HSPZ_SURVIVOR_ORDER=raw` restores the ids. The paths that show an order
+/// (`dump_raw`, the census, `HSPZ_BUCKET_ORDER_CHECK`) and the scatter of
+/// before round 114 keep them too.
+#[cfg(all(feature = "ref-loc-buckets", feature = "gate-sieve"))]
+fn survivor_slots_request() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_SURVIVOR_ORDER").as_deref() {
+        Err(_) | Ok("slots") => true,
+        Ok("raw") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_SURVIVOR_ORDER={other:?} is not slots or raw; using slots");
+            true
+        }
+    })
+}
+
+/// Round 114: how the bucket kernels learn which lanes of a warp share a
+/// bucket. `HSPZ_BUCKET_VOTES` unset or `match`: one `match.any`
+/// (`bucket_count_match`, `bucket_scatter_match`). `loop`: one vote per bucket,
+/// the kernels of rounds 83 to 113. Both write the same buffers
+/// (`HSPZ_BUCKET_ORDER_CHECK` proves the permutation on the device).
+#[cfg(feature = "ref-loc-buckets")]
+fn bucket_match_request() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_BUCKET_VOTES").as_deref() {
+        Err(_) | Ok("match") => true,
+        Ok("loop") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_BUCKET_VOTES={other:?} is not match or loop; using match");
+            true
+        }
+    })
+}
+
+/// Round 110 (`find-hits-groups`): which kernel expands a chunk's seeds.
+/// `HSPZ_FIND_HITS_GROUPS` unset: runs of 32 seeds per warp
+/// (`find_hits_groups`). `0`: one warp or one thread per seed, as before round
+/// 110. `check`: both, refusing the run at the first anchor that differs.
+#[cfg(feature = "find-hits-groups")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindHitsGroups {
+    Off,
+    On,
+    Check,
+}
+
+#[cfg(feature = "find-hits-groups")]
+fn find_hits_groups_request() -> FindHitsGroups {
+    // Read once, so a value that is not understood is reported once and not by
+    // every engine.
+    static REQUEST: std::sync::OnceLock<FindHitsGroups> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_FIND_HITS_GROUPS").as_deref() {
+        Err(_) | Ok("1") => FindHitsGroups::On,
+        Ok("0") => FindHitsGroups::Off,
+        Ok("check") => FindHitsGroups::Check,
+        Ok(other) => {
+            eprintln!(
+                "warning: HSPZ_FIND_HITS_GROUPS={other:?} is not 0, 1 or check; using 1 (runs of \
+                     32 seeds per warp)"
+            );
+            FindHitsGroups::On
+        }
+    })
+}
+
+/// Chunks and hits the group kernel expanded, and those whose anchors the two
+/// kernels agreed on.
+#[cfg(feature = "find-hits-groups")]
+pub mod find_hits_groups_totals {
+    use std::sync::atomic::AtomicU64;
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_HITS: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Round 119: how a bucketed chunk's anchors get into bucket order.
+///
+/// Until this round the hits were written in raw order (`find_hits`), counted
+/// per bucket (`bucket_count`) and scattered: 32 bytes moved per hit after the
+/// position was read. But a k-mer's positions ascend, so its hits of one bucket
+/// are one contiguous slice of `pos_table`, and how many each bucket gets is a
+/// property of the k-mer. With those counts in a table (`build_bucket_tables`),
+/// a pass over the seeds gives every run of 32 seeds its place in every bucket
+/// (`run_bucket_counts` and a scan), and `find_hits_groups_bucketed` writes each
+/// anchor once, where it belongs. No raw anchor is written, nothing is counted
+/// from anchors and nothing is scattered. The order inside a bucket is not the
+/// raw order, which survivors by sorted slot (round 116) made free.
+///
+/// `HSPZ_HITS_BUCKETED` unset or `1`: on wherever it applies (a chunk whose
+/// survivors go by sorted slot, a reference with the tables). `0`: the count
+/// and the scatter. `check`, or `check:N` for the first N chunks, runs the
+/// count and the scatter, then this path into a scratch buffer, and compares
+/// the two bucket by bucket on the host (each bucket as a sorted list).
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HitsBucketed {
+    Off,
+    On,
+    Check(u32),
+}
+
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+fn hits_bucketed_request() -> HitsBucketed {
+    static REQUEST: std::sync::OnceLock<HitsBucketed> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| {
+        let Ok(text) = std::env::var("HSPZ_HITS_BUCKETED") else {
+            return HitsBucketed::On;
+        };
+        match text.as_str() {
+            "0" => HitsBucketed::Off,
+            "1" => HitsBucketed::On,
+            "check" => HitsBucketed::Check(u32::MAX),
+            other => match other.strip_prefix("check:").and_then(|n| n.parse().ok()) {
+                Some(n) => HitsBucketed::Check(n),
+                None => {
+                    eprintln!(
+                        "warning: HSPZ_HITS_BUCKETED={other:?} is not 0, 1, check or check:N; using 1"
+                    );
+                    HitsBucketed::On
+                }
+            },
+        }
+    })
+}
+
+/// Chunks and hits whose bucket order was written from the seeds, and those
+/// compared with the scatter's.
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+pub mod hits_bucketed_totals {
+    use std::sync::atomic::AtomicU64;
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_HITS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_SEEDS: AtomicU64 = AtomicU64::new(0);
+    pub static SATURATED_SEEDS: AtomicU64 = AtomicU64::new(0);
 }
 
 /// `MAX_BLOCKS x MAX_THREADS`, the geometry KegAlign uses for its two
@@ -4596,15 +6358,49 @@ pub fn resolve_max_hits(ctx: &Arc<CudaContext>, requested: u32) -> u32 {
 /// Tightest free VRAM across the first `n` devices. Planning must not assume
 /// device 0 is the smallest card in a heterogeneous node.
 pub fn min_free_bytes(n: usize) -> Result<u64, Box<dyn std::error::Error>> {
-    let n = n.max(1);
+    Ok(open_devices(n)?.1)
+}
+
+/// What [`open_devices`] returns: the contexts to hold, and the tightest free
+/// VRAM among their devices.
+pub type OpenDevices = (Vec<Arc<CudaContext>>, u64);
+
+/// The primary context of each of the first `n` devices, and the tightest free
+/// VRAM among them (round 112).
+///
+/// The contexts are returned for the caller to hold until its workers are done.
+/// A primary context that is released after the probe is torn down, and the
+/// worker that runs on the device builds it again: about a second per worker on
+/// an A100 node, on top of 1.6 s for probing eight cards one after another.
+/// While the caller holds them a worker's `CudaContext::new` only takes another
+/// reference, and here they are created at the same time, one thread per
+/// device.
+pub fn open_devices(n: usize) -> Result<OpenDevices, DriverError> {
+    let opened: Vec<Result<(Arc<CudaContext>, u64), DriverError>> = std::thread::scope(|scope| {
+        let probes: Vec<_> = (0..n.max(1))
+            .map(|device| {
+                scope.spawn(move || {
+                    // Creating the context binds it to this thread, which is
+                    // what the memory query reads.
+                    let ctx = CudaContext::new(device)?;
+                    let (free, _) = device_memory();
+                    Ok((ctx, free as u64))
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|probe| probe.join().expect("device probe panicked"))
+            .collect()
+    });
+    let mut contexts = Vec::with_capacity(opened.len());
     let mut min_free = u64::MAX;
-    for i in 0..n {
-        let ctx = CudaContext::new(i)?;
-        let _ = ctx.bind_to_thread();
-        let (free, _) = device_memory();
-        min_free = min_free.min(free as u64);
+    for device in opened {
+        let (ctx, free) = device?;
+        min_free = min_free.min(free);
+        contexts.push(ctx);
     }
-    Ok(min_free)
+    Ok((contexts, min_free))
 }
 
 /// Visible CUDA devices.
@@ -4676,6 +6472,43 @@ impl Stage {
 
 #[cfg(test)]
 mod tests {
+    /// The sieve's guard: a sample every `period` launches, the plain gate
+    /// after a sample that passed more than half of its hits, the sieve again
+    /// after one that did not; a tiny sample decides nothing and period 0
+    /// never samples.
+    #[cfg(feature = "gate-sieve")]
+    #[test]
+    fn sieve_guard_samples_holds_and_releases() {
+        use super::{GuardStep, SieveGuard};
+        let run = |g: &mut SieveGuard, n: usize| -> Vec<GuardStep> {
+            (0..n).map(|_| g.next_batch()).collect()
+        };
+        let (sample, sieve, plain) = (GuardStep::Sample, GuardStep::Sieve, GuardStep::Plain);
+
+        let mut g = SieveGuard::new(4);
+        assert_eq!(run(&mut g, 5), [sample, sieve, sieve, sieve, sample]);
+        g.observe(600_000, 1_000_000);
+        assert_eq!(run(&mut g, 4), [plain, plain, plain, sample]);
+        // Exactly half does not hold, and a sample below the minimum is ignored.
+        g.observe(500_000, 1_000_000);
+        assert_eq!(run(&mut g, 4), [sieve, sieve, sieve, sample]);
+        g.observe(60_000, 60_000);
+        assert_eq!(run(&mut g, 3), [sieve, sieve, sieve]);
+
+        // A hold does not outlive its period when the next sample is too small
+        // to decide.
+        let mut g = SieveGuard::new(4);
+        assert_eq!(run(&mut g, 1), [sample]);
+        g.observe(900_000, 1_000_000);
+        assert_eq!(run(&mut g, 4), [plain, plain, plain, sample]);
+        g.observe(1_000, 1_000);
+        assert_eq!(run(&mut g, 4), [sieve, sieve, sieve, sample]);
+
+        let mut off = SieveGuard::new(0);
+        off.observe(1_000_000, 1_000_000);
+        assert_eq!(run(&mut off, 3), [sieve, sieve, sieve]);
+    }
+
     #[cfg(feature = "ref-loc-buckets")]
     use super::ref_bucket_policy;
     #[cfg(feature = "find-hits-warp")]
@@ -4773,28 +6606,28 @@ mod tests {
 
         // L4-like: 48 MiB L2 -> 36 MiB budget. Window 25 (32 MiB) plus the
         // ~3 MiB overhead fits; window 26 (64 MiB) does not.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 48 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 48 << 20, false);
         assert!(on, "L4-like L2 must fit a legal window");
         assert_eq!(shift, 25, "L4-like L2 must land on the 32 MiB window");
 
         // A 40 MiB L2 (A100-like) -> 30 MiB budget: 32 MiB + overhead misses,
         // so it settles on 16 MiB.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 40 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 40 << 20, false);
         assert!(on, "40 MiB L2 must fit a legal window");
         assert_eq!(shift, 24, "40 MiB L2 must land on shift 24");
 
         // RTX-4090-like: 72 MiB L2 -> 54 MiB budget: 32 MiB fits, 64 MiB does not.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 72 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 72 << 20, false);
         assert!(on, "4090-like L2 must fit a legal window");
         assert_eq!(shift, 25, "4090-like L2 must land on the 32 MiB window");
 
         // T4-like: 4 MiB L2 cannot fit even the smallest legal (16 MiB) window.
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 4 << 20);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 4 << 20, false);
         assert!(!on, "T4-like L2 must auto-off");
         assert_eq!(shift, 24, "off still reports the smallest legal shift");
 
         // L2 attribute unavailable (0): off regardless of the arithmetic.
-        let (_shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 0);
+        let (_shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, 0, false);
         assert!(!on, "an unavailable L2 attribute must auto-off");
 
         // Boundary: an L2 sized so the 16 MiB window plus overhead lands on the
@@ -4803,9 +6636,40 @@ mod tests {
         let exact_budget = (1u64 << 24) + overhead;
         let l2_bytes = exact_budget / 2 * 3;
         assert_eq!((l2_bytes / 3) * 2, exact_budget, "budget must hit exactly");
-        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, l2_bytes);
+        let (shift, _n, on) = ref_bucket_policy(REF_LEN, MAX_HITS, l2_bytes, false);
         assert!(on, "an exact-boundary budget must count as a fit");
         assert_eq!(shift, 24, "boundary case still picks the 16 MiB window");
+    }
+
+    /// Round 106: under the sieve the window is sized for the packed planes, a
+    /// quarter of a byte per base, against half of the L2, and the batch size no
+    /// longer enters. An A100 (40 MiB), whose byte rule cannot fit any window at
+    /// its production batch size, lands on 64 Mbp windows (16 MiB of planes, 7
+    /// buckets for a 427 Mbp bin), the measured optimum; so does the L4; the
+    /// 4090 takes 128 Mbp; a T4 stays off.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[test]
+    fn ref_bucket_policy_sizes_the_window_for_packed_planes() {
+        const REF_LEN: u32 = 427_000_000;
+        const A100_HITS: u32 = 332_401_664;
+
+        let (_, _, on) = ref_bucket_policy(REF_LEN, A100_HITS, 40 << 20, false);
+        assert!(
+            !on,
+            "the byte rule has no window for an A100 at production batches"
+        );
+        for (l2, shift, buckets) in [(40u64 << 20, 26, 7), (48 << 20, 26, 7), (72 << 20, 27, 4)] {
+            let got = ref_bucket_policy(REF_LEN, A100_HITS, l2, true);
+            assert_eq!(got, (shift, buckets, true), "L2 {} MiB", l2 >> 20);
+        }
+        // T4-like: half of 4 MiB holds no legal window even as planes.
+        let (shift, _, on) = ref_bucket_policy(REF_LEN, A100_HITS, 4 << 20, true);
+        assert!(!on && shift == 24);
+        // The batch size does not enter the plane rule.
+        assert_eq!(
+            ref_bucket_policy(REF_LEN, 16_711_680, 40 << 20, true),
+            ref_bucket_policy(REF_LEN, A100_HITS, 40 << 20, true)
+        );
     }
 
     /// Round 87 (blocks): the autotune decision rule on synthetic settled
