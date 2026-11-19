@@ -36,8 +36,8 @@ sequenceDiagram
 ## D.2 — Bound each anchor from packed bases first
 <!-- @id: d-sieve -->
 WHAT GOES IN: The warp's 32 anchors, 2-bit packed planes of the reference and of the query strand, and three class scores taken from the substitution matrix.
-WHAT HAPPENS: Each lane bounds its own anchor: over blocks of eight bases it counts matches and transitions across 64 bases to the right and 96 to the left (a side that has decided nothing there is carried on, 32 bases at a time, up to 128 and 160), stops at the first query base that is not an uppercase A, C, G or T, and checks whether the bound has fallen by more than X-drop. An anchor whose two sides are certified and sum below the keep threshold is rejected, and one ballot collects the rest.
-WHAT COMES OUT: A 32-bit candidate mask per warp, about 0.02% of the anchors between human and mouse: the only ones the exact scorer of D.3 still walks.
+WHAT HAPPENS: Each lane bounds its own anchor: over blocks of eight bases it counts matches and transitions across 64 bases to the right and 96 to the left (a side that has decided nothing there is carried on, 32 bases at a time, up to 128 and 160), and checks whether the bound has fallen by more than X-drop; a base that is not an uppercase A, C, G or T is packed as a fill base and bounded like any other (with `HSPZ_GATE_SIEVE_MASK=1` the walk stops at the first such query base instead). An anchor whose two sides are certified and sum below the keep threshold is rejected, and one ballot collects the rest.
+WHAT COMES OUT: A 32-bit candidate mask per warp, about 0.04% of the anchors between human and mouse: the only ones the exact scorer of D.3 still walks.
 INVARIANT: The bound never undercuts the exact score, so a rejected anchor would have failed the exact comparison too and the keep bits are unchanged; when a scoring matrix or X-drop breaks that guarantee, the host switches the bound off for the run and says why.
 
 ```mermaid
@@ -119,8 +119,8 @@ sequenceDiagram
 <!-- @id: d-ref-buckets -->
 WHAT GOES IN: One chunk's packed anchors, when reference-locality bucketing is on for this engine (`HSPZ_REF_BUCKETS`).
 WHAT HAPPENS: A stable counting sort groups the anchors into at most 32 reference-address buckets, so consecutive warps gather from one cached window (a warp learns which of its lanes share a bucket from one match instruction, 0.1.0); the gate then writes one keep bit per anchor. With the bound of D.2 on, a window is as long as its packed planes fit half of the L2 (64 Mbp on an A100), and the pass runs whenever such a window exists; without the bound the window is its bytes against three quarters of the L2, and `auto` times both paths before it chooses.
-WHAT COMES OUT: Survivor IDs mapped back through each anchor's raw index and sorted into ascending raw hit order.
-INVARIANT: The materializer sees the same survivors in the same order as without bucketing, so the HSP set and file bytes are unchanged.
+WHAT COMES OUT: The survivors as slots of the sorted anchor array, in bucket order, which is where the materializer reads them (0.1.0); with `HSPZ_SURVIVOR_ORDER=raw` they are mapped back through each anchor's raw index and sorted into ascending raw hit order.
+INVARIANT: The materializer sees the same survivors, and the host sorts a chunk's HSPs with a comparison over every field of a segment, so the HSP set and file bytes are unchanged whatever order the survivors arrive in.
 
 ```mermaid
 sequenceDiagram

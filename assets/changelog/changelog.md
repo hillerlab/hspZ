@@ -38,7 +38,7 @@ All notable changes to `hspZ` are documented here, newest first.
 
 ## [0.1.0] — 2026-11-19
 
-Exact speed-ups, all on by default. A whole genome takes less than a sixth of the time and every byte of the output
+Exact speed-ups, all on by default. A whole genome takes a seventh of the time and every byte of the output
 is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
 schedules planned on 0.0.x numbers no longer hold.
 
@@ -47,10 +47,10 @@ to that run's (3,864 files, 865,049,792 bytes, 15,917,736 HSPs):
 
 | cards | 0.0.5 | 0.1.0 | |
 | ---: | ---: | ---: | --- |
-| 1 | 3,491.8 s | **555–560 s** | 6.3× |
-| 8 | 576.9 s | **89.8 s** | 6.4× |
+| 1 | 3,491.8 s | **496–503 s** | 7.0× |
+| 8 | 576.9 s | **80.9 s** | 7.1× |
 
-Change by change (the last five rows against the build before them on the same card):
+Change by change (the last seven rows against the build before them on the same card):
 
 | change | one card | eight cards |
 | --- | --- | --- |
@@ -61,29 +61,41 @@ Change by change (the last five rows against the build before them on the same c
 | the sieve's bound carried on for sides that have not decided | 656 → 588 s, 649 → 581 s | 111 → 100 s |
 | start-up: the seed table built by partitions, the devices opened once | 588 → 583 s, 581 → 576 s | 100 → 91 s |
 | the bucket pass without its loop of votes | 581 → 560 s, 575 → 555 s | 92.7 → 89.8 s |
+| a batch's survivors taken in bucket order | 560 → 531 s, 554 → 525 s | 88.6 → 85.7 s |
+| the sieve's bound without the query's mask plane | 531 → 503 s, 527 → 496 s | 86.5 → 80.9 s |
 
-The same build takes 555 to 560 s on two cards of one node, so a difference of 1% between two runs is not a
-result, and the eight-card control of the last row (92.7 s) was taken hours after the 91 s of the row above
-it, on a node whose host-side phases had drifted by about a second. Two, four and six cards were measured
-only before the last five changes: 380.0, 218.1 and 149.4 s
+The same build takes 496 to 503 s on two cards of one node, so a difference of 1% between two runs is not a
+result, and the eight-card control of the bucket-pass row (92.7 s) was taken hours after the 91 s of the row
+above it, on a node whose host-side phases had drifted by about a second. Two, four and six cards were measured
+only before the last seven changes: 380.0, 218.1 and 149.4 s
 (1,771.8, 942.9 and 648.0 s with 0.0.5). All times are with `--time`, which itself costs about 3%. Other species
 pairs and other GPU classes were not measured for this release, except where a bullet says so.
 
-- **The score-gate sieve: the score gate of hg38 × mm39 on one A100 from 3,109 s to 243 s.** The gate was 89% of a
+- **The score-gate sieve: the score gate of hg38 × mm39 on one A100 from 3,109 s to 215 s.** The gate was 89% of a
   whole-genome run. It scores every seed hit exactly, one hit per warp, and rejects all but about 0.01% of them.
   Now each lane first bounds the score of *its own* hit from 2-bit packed bases, and the warp scores exactly only
-  the hits whose bound reaches the threshold or could not be certified: about 0.02% of them between human and
+  the hits whose bound reaches the threshold or could not be certified: about 0.04% of them between human and
   mouse. A hit is rejected only when an upper bound on its score is below the threshold, so the keep decisions,
   the HSP set and the files do not change.
-  - **How it works.** The reference and both query strands are packed on the device into two bit planes, plus
-    one plane marking query bases that are not an uppercase A, C, G or T. For its own hit a lane reads six
-    reference and seven query words, aligns them on the hit's diagonal, and walks 64 bases to the right and 96
-    to the left in blocks of eight: two population counts per block give the matches and transitions, and three
-    class scores taken from the substitution matrix (match, transition, transversion; 100, −31, −114 by default)
-    turn them into an upper bound on the X-drop extension. The walk stops at a marked query base, which ends the
-    exact extension too. If both sides are certified and their bounds sum below the threshold, the hit is
-    rejected without being scored. That first window is one branch-free block of 407 instructions for 32 hits;
-    exact scoring costs about 229 per hit.
+  - **How it works.** The reference and both query strands are packed on the device into two bit planes; a
+    base that is not an uppercase A, C, G or T is packed as a fill base (C in the reference, G in the query).
+    For its own hit a lane reads six reference and seven query words, aligns them on the hit's diagonal, and
+    walks 64 bases to the right and 96 to the left in blocks of eight: two population counts per block give the
+    matches and transitions, and three class scores taken from the substitution matrix (match, transition,
+    transversion; 100, −31, −114 by default) turn them into an upper bound on the X-drop extension. A class
+    score is the largest real score of any pair of symbols packed into that class, fill bases included, so the
+    bound is never below the real score. A side is certified once its bound has dropped by X-drop; if both
+    sides are certified and their bounds sum below the threshold, the hit is rejected without being scored.
+    That first window is one branch-free block for 32 hits; exact scoring costs about 229 instructions per hit.
+  - **No mask plane for the query.** The bound first read a third query plane marking the bases outside ACGT
+    and stopped its walk at the first of them, as the exact extension does. Packing those bases as G makes
+    them one more pair of codes under the class scores, exactly as such reference bases already were: a third
+    of the first window's loads, the tests for the marked base and a bit reversal of the left words go away,
+    and the plane is not built. The bound is looser there, so the exact scorer sees 0.037% of the hits of unit
+    0 instead of 0.023%, and the gate still takes 4.29 s instead of 4.85 s (4.58 against 5.14 s at
+    `--hspthresh 2400`); the whole genome goes from 531 to 503 s and from 527 to 496 s on two cards, and from
+    86.5 to 80.9 s on eight. `HSPZ_GATE_SIEVE_MASK=1` restores the plane, and `HSPZ_GATE_SIEVE=gather` and
+    `auto` keep it.
   - **A side that has not decided is carried on.** Inside 64 and 96 bases a side often has neither met a
     marked base nor dropped by X-drop; it used to abstain, and the hit went to the exact scorer: 1.4% of the
     hits between human and mouse, each costing as much as bounding about 29 hits, so they were 29% of the
@@ -101,10 +113,12 @@ pairs and other GPU classes were not measured for this release, except where a b
     of 0.0.4; a batch the sieve does not gate skips it. `HSPZ_REF_BUCKETS=0` turns the pass off and `auto` runs
     the trial.
   - **When it switches itself off.** The class scores are derived from the matrix in use, and the sieve runs
-    only if every query base outside ACGT ends an extension (its scores are below `-xdrop`) and mismatches drift
-    downward. So it is off, and `--time` prints the reason, with `--ambiguous n` or `iupac`, with `--xdrop` at
-    1000 or above under default scoring, with IUPAC codes other than N in the query, and with matrices that do
-    not meet those conditions. IUPAC codes in the reference only loosen the bound.
+    only if a match scores at least 0, a transition and a transversion at most 0, and a random pair drifts
+    downward. So it is off, and `--time` prints the reason, with `--ambiguous n` or `iupac` and with matrices
+    that do not meet those conditions. IUPAC codes in either sequence only loosen the bound (the transversion
+    class becomes −100). With the mask plane (`HSPZ_GATE_SIEVE_MASK=1`, `gather`, `auto`) a marked query base
+    must also end an extension, so there the sieve is off with `--xdrop` at 1000 or above under default
+    scoring and with IUPAC codes other than N in the query.
   - **Measured.** With the sieve and its bucket pass alone the one-card run took 772.9 s (2, 4, 6 and 8 cards:
     380.0, 218.1, 149.4 and 136.9 s); in the same session and on the same node the default build of 0.0.6 took
     3,546.6 s. At `--hspthresh 2400`, the make_lastz_chains setting, one card took 933.8 s before the plane-sized
@@ -126,8 +140,8 @@ pairs and other GPU classes were not measured for this release, except where a b
     loads the bound's reference words through shared memory instead of once per lane; that is faster where
     memory bandwidth binds (L4 with its bucket pass off: 30.5 s against 41.0 s) and slower on an A100 (19.0 s
     against 16.0 s), so per-lane loads are the default. `auto` gathers only when the bucket pass is off.
-  - **Costs.** Device memory grows by a quarter of a byte per reference base and three quarters per query base
-    (under 0.5 GB for 500 Mbp bins). The first run on a machine compiles a larger kernel module (2.6 s against
+  - **Costs.** Device memory grows by a quarter of a byte per reference base and half a byte per query base
+    (three quarters with the mask plane; under 0.5 GB for 500 Mbp bins). The first run on a machine compiles a larger kernel module (2.6 s against
     0.8 s on an L4, then cached).
   - **Guard.** Where the bound rejects little, such as long unmasked satellite arrays, a hit would pay the
     bound on top of exact scoring, and the bound's own time per hit is about 20% of exact scoring on an A100
@@ -139,7 +153,8 @@ pairs and other GPU classes were not measured for this release, except where a b
   - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
     IUPAC codes, both sequence ends, five X-drops, two matrices), each walked at three window lengths and four
     thresholds, finds no certified bound below the exact score, no kept hit rejected and no rejection taken
-    back by a longer window, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 45
+    back by a longer window, and catches three deliberately low bounds; it runs with and without the mask
+    plane. `assets/tests/sieve-identity.sh` runs 54
     option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
     `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
     exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`
@@ -168,6 +183,17 @@ pairs and other GPU classes were not measured for this release, except where a b
   kernels, and `HSPZ_BUCKET_ORDER_CHECK=<n>` proves the permutation on the device for the first n batches (on
   an A100 it passed on the first 100 batches of unit 0, and `sieve-identity.sh` runs it on every batch with 1,
   4, 8, 16 and 31 windows).
+- **A batch's survivors are taken in bucket order: 29 s less per genome on one card.** The bucket pass sorts a
+  batch's hits by reference window for the gate. It also wrote every hit's place in the unsorted batch, the
+  survivors were mapped back through it and sorted, and the extension read the unsorted anchors: the order
+  of before the pass, kept because it had been the order. Nothing in the output depends on it. Each
+  survivor is extended on its own, and the host sorts a batch's HSPs with a comparison over all four fields of
+  a segment, so two segments it calls equal are the same bytes whatever order they arrived in. Now the
+  scatter writes the sorted anchors alone (16 bytes moved per hit instead of 20), the survivors are the sorted
+  slots of the kept bits, the extension reads the sorted anchors, and nothing is sorted. Unit 0 on an A100:
+  scatter 1,826 → 1,412 ms, the survivor sort 145 → 0 ms, GPU time 9.88 → 9.34 s; the whole genome 560 → 531 s
+  and 554 → 525 s, eight cards 88.6 → 85.7 s. `HSPZ_SURVIVOR_ORDER=raw` restores the earlier path, and
+  `--dump-raw`, the census and `HSPZ_BUCKET_ORDER_CHECK`, which show an order, keep it.
 - **Start-up: the seed table of a reference bin in a second instead of eight; the devices opened once.**
   With eight cards a run was start-up plus its slowest worker: each worker built its first seed table in 7 to
   9 s while seven others did the same, and the devices were opened twice (probed one after another for free
