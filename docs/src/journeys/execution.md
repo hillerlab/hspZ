@@ -68,7 +68,7 @@ sequenceDiagram
 ## H.4 — Overlap only order-neutral work
 <!-- @id: h-overlap -->
 WHAT GOES IN: The current GPU batch and the next query-seed, query-bin or reference-bin preparation.
-WHAT HAPPENS: Host seed producers run several batches ahead of the GPU and their uploads overlap current kernels; the next unit's query bin is packed, and the next visit's reference built or loaded, on threads beside the current unit (0.1.0); host dependencies still synchronize at count boundaries.
+WHAT HAPPENS: Host seed producers run several batches ahead of the GPU and their uploads overlap current kernels; the next unit's query bin is packed, and the next visit's reference built or loaded, on threads beside the current unit (0.1.0); the next batch's upload is issued, and the previous batch's HSPs are sorted and deduplicated, inside the current batch while its kernels are queued (0.1.1); host dependencies still synchronize at count boundaries.
 WHAT COMES OUT: Less exposed host/copy time without changing the batch sequence.
 INVARIANT: Overlap never reorders MAX_HITS chunks, survivor compaction, or returned HSP vectors.
 

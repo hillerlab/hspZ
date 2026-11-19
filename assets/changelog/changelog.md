@@ -36,6 +36,50 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.1.1] — 2026-11-20
+
+One exact speed-up of the batch loop. Host code only: the kernels are those of 0.1.0 and every byte of the
+output is the same.
+
+hg38 × mm39 on A100 80GB cards, production defaults, the inputs of the 0.1.0 runs, old and new interleaved on
+the same cards, the same bytes in every run:
+
+| cards | 0.1.0 | 0.1.1 | |
+| ---: | ---: | ---: | --- |
+| 1, without `--time` | 396.9, 397.8 s | **376.9, 376.0 s** | −5.3% |
+| 1, with `--time` | 422.4, 422.2 s | **400.2, 399.3 s** | −5.3% |
+| 2, with `--time` | 220.3, 220.2 s | **208.7, 208.9 s** | −5.2% |
+
+The rows with `--time` come from two sessions joined by a build measured in both (406.1 to 406.5 s on one
+card, 210.5 to 210.7 s on two, in each); the row without it is one session. Eight cards were not measured for
+this release: six of the node's cards were in use.
+
+- **Nothing is allocated per batch.** Between its kernels every batch allocated and freed nine small device
+  buffers: the block sums and the offsets of the hit-count scan, of the survivor count and of the scan of
+  finished extensions, the sums of the bucket scan, a statistics word that only a diagnostic build reads, and
+  the reduced output. Three of them were zeroed, each small upload was waited for, and the driver was asked
+  for the device's free memory once per chunk, for a peak that can only move when something is allocated. A
+  whole genome is 149,177 batches. The buffers belong to the engine now and grow like every other one; none
+  needs zeroing, because every element a kernel reads is written first; an upload is queued and not waited
+  for; the memory is sampled only after an allocation. Unit 0 on an A100, without `--time`: 10.50 → 10.19 s
+  (−3.0%); the whole genome 397.4 → 381.8 s on one card, 220.3 → 210.6 s on two with `--time`.
+- **The host's work between two batches is done while kernels run.** What remained between two batches was
+  host work with the card idle: taking the next seed batch and starting its upload, and sorting and
+  deduplicating the HSPs of the batch just finished. The engine now offers the run loop two moments inside a
+  batch at which kernels are queued and nothing is waited for: after the seed counts and their scan, and
+  after the first chunk's score gate and survivor count. The next upload is issued in the first; the previous
+  batch's HSPs are sorted and deduplicated in the second, chunk by chunk with the function and the input of
+  before. Whatever a batch does not reach is done after it, so nothing depends on a moment being offered.
+  Unit 0: 10.30 → 10.17 s (−1.2%); the whole genome 381.8 → 376.5 s on one card, 210.7 → 208.8 s on two
+  (with more than one worker the seeds are generated on the device and only the sort moves).
+  `HSPZ_LEAN_BATCHES=0` restores the order of 0.1.0; `--dump-raw` keeps the sort inside its batch.
+- **`--time` costs a one-card genome 6%, not the 3% the 0.1.0 notes give**: 422 s with it and 397 s without,
+  on the same build. Its events are host work between kernels, so its between-stage gaps overstate what a
+  run without it waits. The times of earlier releases in this file are with `--time` and stay comparable
+  with each other. `HSPZ_HOST_TRACE=1` prints one line at the end of a run without it: the time the host
+  spent inside the batch calls, and how much of that it waited for the card, worked while kernels were
+  queued, or worked with nothing queued (0.37 s of unit 0's 7.45 s: 113 µs per batch are left there).
+
 ## [0.1.0] — 2026-11-19
 
 Exact speed-ups, all on by default. A whole genome takes an eighth of the time and every byte of the output
