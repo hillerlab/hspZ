@@ -62,6 +62,10 @@ const SIEVE_SCATTER: u32 = 1;
 /// six lanes load the six groups of one hit, five hits per round.
 #[cfg(feature = "gate-sieve")]
 const SIEVE_GATHER: u32 = 2;
+/// [`SIEVE_SCATTER`] over a query packed without a mask plane
+/// (`sieve::QRY_FILL`, round 117): only a drop certifies a side.
+#[cfg(feature = "gate-sieve")]
+const SIEVE_OPEN: u32 = 3;
 /// Shared `u64` slots one warp gathers into: six rows of 32 hits, each row 4
 /// slots longer so that neighbouring rows fall on different banks.
 #[cfg(feature = "gate-sieve")]
@@ -77,7 +81,7 @@ pub mod device {
     use super::NO_SIEVE;
     use super::{FULL_MASK, NUC, NUM_WARPS, SCAN_BLOCK, SegmentPair, WARP_SIZE};
     #[cfg(feature = "gate-sieve")]
-    use super::{GATHER_ROW, GATHER_SLOTS, SIEVE_GATHER, SIEVE_SCATTER};
+    use super::{GATHER_ROW, GATHER_SLOTS, SIEVE_GATHER, SIEVE_OPEN, SIEVE_SCATTER};
     #[cfg(feature = "dense-anchors")]
     use crate::gpu::sieve;
     use cuda_device::{DisjointSlice, SharedArray, kernel, launch_bounds, thread, warp};
@@ -1392,6 +1396,72 @@ pub mod device {
         }
     }
 
+    /// [`bucket_scatter_match`] without the raw hit ids (round 116): the same
+    /// `sorted_anchor`, word for word, and nothing else. For a chunk whose
+    /// survivors go to `find_hsps` by sorted slot: twelve bytes of a hit's twenty
+    /// were the scatter's own stores, four of them the id. A copy rather than a
+    /// shared body, as for `emit_bits_plain`.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn bucket_scatter_match_anchors(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        incl: &[u32],
+        mut sorted_anchor: DisjointSlice<u64>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_PREFIX: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+        static mut BLOCK_TOTAL: SharedArray<u32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        let anchor = if live { anchors[i as usize] } else { 0 };
+        let b = if live {
+            let raw = (anchor as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        let before = own & warp::lanemask_lt();
+        if lane < n_buckets {
+            unsafe { WARP_PREFIX[warp_id * 32 + lane as usize] = 0 };
+        }
+        // As in `bucket_count_match`: the barrier orders the zero and the count.
+        warp::sync_mask(FULL_MASK);
+        if live && before == 0 {
+            unsafe { WARP_PREFIX[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_PREFIX[w * 32 + tid as usize] };
+                unsafe { WARP_PREFIX[w * 32 + tid as usize] = prefix };
+                prefix += count;
+            }
+            unsafe { BLOCK_TOTAL[tid as usize] = prefix };
+        }
+        thread::sync_threads();
+
+        if live {
+            let bu = b as usize;
+            let block_base = incl[(b * n_blocks + bid) as usize] - unsafe { BLOCK_TOTAL[bu] };
+            let out = block_base + unsafe { WARP_PREFIX[warp_id * 32 + bu] } + before.count_ones();
+            // SAFETY: the block bases and local ranks partition `0..n` exactly,
+            // one slot per hit.
+            unsafe { *sorted_anchor.get_unchecked_mut(out as usize) = anchor };
+        }
+    }
+
     /// Runs only the promoted score gate and writes one byte for every hit.
     /// The rare survivors are materialized later from a stable compacted ID
     /// list, so the common reject path writes neither an HSP nor a `u32` flag.
@@ -1560,6 +1630,62 @@ pub mod device {
         );
     }
 
+    /// [`mark_score_survivors_sieve`] over a query without a mask plane (round 117):
+    /// `qry_bad` is not read.
+    #[cfg(feature = "gate-sieve")]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_sieve_open(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            false,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_OPEN,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
     /// [`mark_score_survivors_reordered`] behind the same bound.
     #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
     #[kernel]
@@ -1602,6 +1728,62 @@ pub mod device {
             core::ptr::null_mut(),
             flags_bits.as_mut_ptr(),
             SIEVE_SCATTER,
+            ref_pk.as_ptr(),
+            qry_pk.as_ptr(),
+            qry_bad.as_ptr(),
+            um,
+            ua,
+            ub,
+            ubias,
+            count,
+            words,
+            cand_bits.as_mut_ptr(),
+        );
+    }
+
+    /// [`mark_score_survivors_reordered_sieve`] over a query without a mask plane (round 117):
+    /// `qry_bad` is not read.
+    #[cfg(all(feature = "gate-sieve", feature = "ref-loc-buckets"))]
+    #[kernel]
+    #[launch_bounds(super::HSP_THREADS)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn mark_score_survivors_reordered_sieve_open(
+        ref_seq: &[u8],
+        query_seq: &[u8],
+        ref_len: u32,
+        query_len: u32,
+        sub_mat: &[i32],
+        xdrop: i32,
+        hspthresh: i32,
+        num_hits: u32,
+        anchors: &[u64],
+        mut flags_bits: DisjointSlice<u32>,
+        ref_pk: &[u64],
+        qry_pk: &[u64],
+        qry_bad: &[u32],
+        um: i32,
+        ua: i32,
+        ub: i32,
+        ubias: i32,
+        count: u32,
+        words: u32,
+        mut cand_bits: DisjointSlice<u32>,
+    ) {
+        score_gate(
+            thread::threadIdx_x(),
+            ref_seq,
+            query_seq,
+            ref_len,
+            query_len,
+            sub_mat,
+            xdrop,
+            hspthresh,
+            num_hits,
+            anchors,
+            true,
+            core::ptr::null_mut(),
+            flags_bits.as_mut_ptr(),
+            SIEVE_OPEN,
             ref_pk.as_ptr(),
             qry_pk.as_ptr(),
             qry_bad.as_ptr(),
@@ -1931,7 +2113,16 @@ pub mod device {
             // load the anchor, write it to shared, sync the warp and have every lane
             // read it back, with nothing to overlap the load latency. Round 58.
             let my_idx = base + lane_id;
-            let my_anchor = if my_idx < num_hits {
+            // The sieve kernels load without the slice's bounds test, which is
+            // 16 instructions and a trap per chunk for an index the two
+            // comparisons already bound (`base < num_hits` is the loop's own
+            // condition). The plain gate kernels keep the checked load and
+            // their machine code.
+            let my_anchor = if sieve_mode != NO_SIEVE {
+                let at = if my_idx < num_hits { my_idx } else { base };
+                // SAFETY: `at < num_hits <= anchors.len()`.
+                unsafe { *anchors.get_unchecked(at as usize) }
+            } else if my_idx < num_hits {
                 anchors[my_idx as usize]
             } else {
                 anchors[base as usize]
@@ -1943,13 +2134,19 @@ pub mod device {
             // Each lane bounds the hit it just loaded; a hit whose bound is
             // certified below the threshold cannot be kept and is never scored.
             let mut rem = 0u32;
+            // A literal, like the mode: without the mask plane its loads and the
+            // terminal tests fold away.
+            #[cfg(feature = "gate-sieve")]
+            let masked = sieve_mode != SIEVE_OPEN;
+            #[cfg(not(feature = "gate-sieve"))]
+            let masked = true;
             if sieve_mode != NO_SIEVE {
                 // SAFETY: the host packed both planes for these sequences, and a
                 // lane past `num_hits` holds the chunk's first anchor.
                 #[cfg(not(feature = "gate-sieve"))]
                 let (mut right, mut left) = unsafe {
                     sieve::bound_at(
-                        ref_pk, qry_pk, qry_bad, my_lo, my_hi, um, ua, ub, ubias, xdrop,
+                        ref_pk, qry_pk, qry_bad, my_lo, my_hi, masked, um, ua, ub, ubias, xdrop,
                     )
                 };
                 #[cfg(feature = "gate-sieve")]
@@ -1968,6 +2165,7 @@ pub mod device {
                             qry_bad.add(qg as usize),
                             o,
                             qs,
+                            true,
                             um,
                             ua,
                             ub,
@@ -1976,7 +2174,7 @@ pub mod device {
                         )
                     } else {
                         sieve::bound_at(
-                            ref_pk, qry_pk, qry_bad, my_lo, my_hi, um, ua, ub, ubias, xdrop,
+                            ref_pk, qry_pk, qry_bad, my_lo, my_hi, masked, um, ua, ub, ubias, xdrop,
                         )
                     }
                 };
@@ -1996,8 +2194,8 @@ pub mod device {
                         // never exceeds.
                         right = unsafe {
                             sieve::right_word(
-                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, right, um, ua, ub,
-                                ubias, xdrop,
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, right, masked, um,
+                                ua, ub, ubias, xdrop,
                             )
                         };
                         word += 1;
@@ -2010,8 +2208,8 @@ pub mod device {
                         // SAFETY: as above, up to `sieve::LEFT_WORDS_MAX`.
                         left = unsafe {
                             sieve::left_word(
-                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, left, um, ua, ub,
-                                ubias, xdrop,
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, left, masked, um, ua,
+                                ub, ubias, xdrop,
                             )
                         };
                         word += 1;

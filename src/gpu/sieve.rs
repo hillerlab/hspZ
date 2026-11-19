@@ -25,8 +25,9 @@
 //!
 //! * the running maximum under `u` is no smaller than under `s`, and the
 //!   drawdown `M - P` is no larger, so the X-drop under `u` fires no earlier;
-//! * a query base that is not an uppercase `ACGT` is *terminal*: its score is
-//!   below `-xdrop`, so the exact walk stops at or before it;
+//! * with the query's mask plane, a query base that is not an uppercase `ACGT`
+//!   is *terminal*: its score is below `-xdrop`, so the exact walk stops at or
+//!   before it;
 //! * over blocks of 8 bases, with `B_j` the `u` prefix sum at the end of block
 //!   `j` and `m_j` its matches, no prefix inside block `j` exceeds
 //!   `B_{j-1} + um * m_j` (matches first; needs `uti, utv <= 0 <= um`), and
@@ -51,11 +52,18 @@
 //! lengthen the `u` walk, which cannot lower `best`; the query padding is
 //! terminal, like the query end is for the exact walk.
 //!
+//! The bound can also read the query *without* its mask plane (round 115):
+//! every query symbol outside `ACGT` is then packed as [`QRY_FILL`] and is one
+//! more pair of codes under the class maxima, as every such reference symbol
+//! already is. Nothing is terminal; a side certifies by a drop alone, which the
+//! first point covers, and the query padding only lengthens the `u` walk like
+//! the reference's.
+//!
 //! [`classes`] decides when all of this holds for a scoring matrix, and
 //! switches the sieve off when it does not.
 
 #[cfg(any(test, feature = "gate-sieve"))]
-use crate::sequence::{A_NT, C_NT, E_NT, L_NT, N_NT, NUC, T_NT, X_NT};
+use crate::sequence::{A_NT, C_NT, E_NT, G_NT, L_NT, N_NT, NUC, T_NT, X_NT};
 
 /// 32-base groups of padding in front of and behind every packed plane, so a
 /// lane can read its six reference and seven query groups, and the two more on
@@ -90,6 +98,12 @@ pub const LEFT: u32 = 96;
 /// meets a mammalian query as a match least often.
 #[cfg(any(test, feature = "gate-sieve"))]
 pub const REF_FILL: u32 = C_NT as u32;
+/// 2-bit code every query symbol outside `ACGT` is packed as when the bound
+/// reads the query without its mask plane (round 115). Against [`REF_FILL`] it
+/// is a transversion, so two masked stretches laid over each other fall at the
+/// steepest class score and certify a drop within a block or two.
+#[cfg(any(test, feature = "gate-sieve"))]
+pub const QRY_FILL: u32 = G_NT as u32;
 /// Largest `xdrop` and class score the bound's 32-bit arithmetic is used for.
 /// 160 bases of scores this size stay below 2^28.
 #[cfg(any(test, feature = "gate-sieve"))]
@@ -132,9 +146,10 @@ impl Classes {
 ///
 /// The reference is packed without a mask plane: every symbol outside `ACGT`
 /// (soft-masked, `N`, other IUPAC codes, the record separator) takes the code
-/// [`REF_FILL`], so each class maximum runs over those pairs too. A query base
-/// outside `ACGT` ends the bound's walk, which is right only if it ends the
-/// exact walk: every score against it must be below `-xdrop`.
+/// [`REF_FILL`], so each class maximum runs over those pairs too. The query is
+/// packed the same way with [`QRY_FILL`] unless `masked`: with its mask plane a
+/// query base outside `ACGT` ends the bound's walk, which is right only if it
+/// ends the exact walk, so every score against it must then be below `-xdrop`.
 ///
 /// Soft-masked bases, `N` and separators are assumed present in both
 /// sequences. Other IUPAC codes are rare and change the answer (they score
@@ -146,6 +161,7 @@ pub fn classes(
     xdrop: i32,
     ref_has_x: bool,
     qry_has_x: bool,
+    masked: bool,
 ) -> Result<Classes, String> {
     if !(0..=MAX_ABS).contains(&xdrop) {
         return Err(format!("xdrop {xdrop} is outside 0..={MAX_ABS}"));
@@ -175,31 +191,42 @@ pub fn classes(
         }
     }
 
-    // A query base outside ACGT must stop the exact walk.
-    for q in L_NT..=E_NT {
-        if !present(q, qry_has_x) {
-            continue;
-        }
-        for r in A_NT..=E_NT {
-            if present(r, ref_has_x) && score(r, q) >= -xdrop {
-                return Err(format!(
-                    "a {} query base scores {} and does not end an extension at xdrop {xdrop}",
-                    name(q),
-                    score(r, q)
-                ));
+    // With the mask plane, a query base outside ACGT ends the bound's walk, so
+    // it must stop the exact walk.
+    if masked {
+        for q in L_NT..=E_NT {
+            if !present(q, qry_has_x) {
+                continue;
+            }
+            for r in A_NT..=E_NT {
+                if present(r, ref_has_x) && score(r, q) >= -xdrop {
+                    return Err(format!(
+                        "a {} query base scores {} and does not end an extension at xdrop {xdrop}",
+                        name(q),
+                        score(r, q)
+                    ));
+                }
             }
         }
     }
 
+    // Without it, a query symbol outside ACGT is one more pair of codes: it is
+    // packed as `QRY_FILL`, and its scores go into the class maxima like the
+    // reference's do.
+    let last_q = if masked { T_NT } else { E_NT };
     let (mut um, mut uti, mut utv) = (i32::MIN, i32::MIN, i32::MIN);
     for r in A_NT..=E_NT {
         if !present(r, ref_has_x) {
             continue;
         }
         let code = if r <= T_NT { r as u32 } else { REF_FILL };
-        for q in A_NT..=T_NT {
+        for q in A_NT..=last_q {
+            if !present(q, qry_has_x) {
+                continue;
+            }
+            let qcode = if q <= T_NT { q as u32 } else { QRY_FILL };
             let s = score(r, q);
-            match code ^ q as u32 {
+            match code ^ qcode {
                 0 => um = um.max(s),
                 2 => uti = uti.max(s),
                 _ => utv = utv.max(s),
@@ -256,36 +283,41 @@ pub fn funnel(lo: u32, hi: u32, s: u32) -> u32 {
     (((lo as u64) | ((hi as u64) << 32)) >> s) as u32
 }
 
-/// Mismatch, transition and valid planes of one reference group against the
-/// query group that the hit's diagonal lays over it.
+/// Mismatch and transition planes of one reference group against the query
+/// group that the hit's diagonal lays over it.
 #[inline(always)]
-fn planes(r: u64, qp: u64, qn: u64, bp: u32, bn: u32, qs: u32) -> (u32, u32, u32) {
+fn planes(r: u64, qp: u64, qn: u64, qs: u32) -> (u32, u32) {
     let qh = funnel(qp as u32, qn as u32, qs);
     let ql = funnel((qp >> 32) as u32, (qn >> 32) as u32, qs);
     let xh = (r as u32) ^ qh;
     let xl = ((r >> 32) as u32) ^ ql;
-    (xh | xl, xh & !xl, !funnel(bp, bn, qs))
+    (xh | xl, xh & !xl)
 }
 
-/// One block of 8 bases at bit `sh` of a stream word.
+/// The valid plane over the same group, from the query's mask plane.
+#[inline(always)]
+fn valid(bp: u32, bn: u32, qs: u32) -> u32 {
+    !funnel(bp, bn, qs)
+}
+
+/// One block of 8 bases at bit `sh` of a stream word: its matches `m` and
+/// transitions `t` among the bases that count.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn block(
-    st: (i32, i32, i32, bool),
+    st: Side,
     mv: u32,
     tvv: u32,
-    tv: u32,
     sh: u32,
     um: i32,
     a: i32,
     b: i32,
     bias: i32,
     xdrop: i32,
-) -> (i32, i32, i32, bool) {
+) -> Side {
     let (sum, peak, best, done) = st;
     let m = ((mv >> sh) & 0xff).count_ones() as i32;
     let t = ((tvv >> sh) & 0xff).count_ones() as i32;
-    let terminal = (tv >> sh) & 0xff != 0xff;
     let cand = sum.wrapping_add(um.wrapping_mul(m));
     let best = if !done && cand > best { cand } else { best };
     let next = sum
@@ -293,45 +325,99 @@ fn block(
         .wrapping_add(b.wrapping_mul(t))
         .wrapping_add(bias);
     let peak = if next > peak { next } else { peak };
-    let done = done || terminal || peak.wrapping_sub(next) > xdrop;
+    let done = done || peak.wrapping_sub(next) > xdrop;
     (next, peak, best, done)
 }
 
 /// One stream word (32 bases in extension order from bit 0) of one side.
+///
+/// With the mask plane (`masked`), a terminal base certifies the side at the
+/// end of its word, not of its block (round 115). The blocks after it in the
+/// word hold no base that counts, so their `m` is 0 and their candidate is the
+/// prefix sum at the end of the block before, which is at most the candidate of
+/// the block that held the terminal base (`a*m + b*t + bias <= um*m`) and only
+/// falls from there: `best` is what a test per block leaves. A side that is
+/// certified never changes `best`, so the words after a terminal base need no
+/// memory of it either.
+///
+/// Without it every base counts and only a drop certifies.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 fn word(
-    st: (i32, i32, i32, bool),
-    alive: bool,
+    st: Side,
     mm: u32,
     tr: u32,
     vd: u32,
+    masked: bool,
     um: i32,
     a: i32,
     b: i32,
     bias: i32,
     xdrop: i32,
-) -> ((i32, i32, i32, bool), bool) {
-    // The valid bases before this word's first terminal base. Nothing is valid
-    // once an earlier word held one.
-    let tv = if alive { vd & !vd.wrapping_add(1) } else { 0 };
-    let mv = !mm & tv;
-    let tvv = tr & tv;
-    let st = block(st, mv, tvv, tv, 0, um, a, b, bias, xdrop);
-    let st = block(st, mv, tvv, tv, 8, um, a, b, bias, xdrop);
-    let st = block(st, mv, tvv, tv, 16, um, a, b, bias, xdrop);
-    let st = block(st, mv, tvv, tv, 24, um, a, b, bias, xdrop);
-    (st, alive && tv == u32::MAX)
+) -> Side {
+    let (mv, tvv, terminal) = if masked {
+        // The valid bases before this word's first terminal base.
+        let tv = vd & !vd.wrapping_add(1);
+        (!mm & tv, tr & tv, vd != u32::MAX)
+    } else {
+        (!mm, tr, false)
+    };
+    let st = block(st, mv, tvv, 0, um, a, b, bias, xdrop);
+    let st = block(st, mv, tvv, 8, um, a, b, bias, xdrop);
+    let st = block(st, mv, tvv, 16, um, a, b, bias, xdrop);
+    let (sum, peak, best, done) = block(st, mv, tvv, 24, um, a, b, bias, xdrop);
+    (sum, peak, best, done || terminal)
+}
+
+/// A word of the left side, whose extension order descends from bit 31. With
+/// the mask plane it is reversed, because the first terminal base is found
+/// from bit 0. Without it nothing depends on the order of the bits inside a
+/// block (a block is two population counts), so the blocks are taken from the
+/// top byte down and the word is left as it is.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn word_left(
+    st: Side,
+    mm: u32,
+    tr: u32,
+    vd: u32,
+    masked: bool,
+    um: i32,
+    a: i32,
+    b: i32,
+    bias: i32,
+    xdrop: i32,
+) -> Side {
+    if masked {
+        word(
+            st,
+            mm.reverse_bits(),
+            tr.reverse_bits(),
+            vd.reverse_bits(),
+            true,
+            um,
+            a,
+            b,
+            bias,
+            xdrop,
+        )
+    } else {
+        let st = block(st, !mm, tr, 24, um, a, b, bias, xdrop);
+        let st = block(st, !mm, tr, 16, um, a, b, bias, xdrop);
+        let st = block(st, !mm, tr, 8, um, a, b, bias, xdrop);
+        block(st, !mm, tr, 0, um, a, b, bias, xdrop)
+    }
 }
 
 /// The bound from the six reference groups around the hit, already loaded.
 ///
 /// `o` is the hit's bit inside reference group `r3`; `qry_pk`/`qry_bad` point
 /// at the query group aligned with `r0` and `qs` is the shift between them.
-/// Returns the right and the left side after the static words.
+/// Returns the right and the left side after the static words. `masked` says
+/// whether the query has a mask plane; without one `qry_bad` is not read.
 ///
 /// # Safety
-/// `qry_pk` and `qry_bad` must be readable for seven elements.
+/// `qry_pk` must be readable for seven elements, and `qry_bad` too if `masked`.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn bound_words(
@@ -345,6 +431,7 @@ pub unsafe fn bound_words(
     qry_bad: *const u32,
     o: u32,
     qs: u32,
+    masked: bool,
     um: i32,
     a: i32,
     b: i32,
@@ -362,44 +449,48 @@ pub unsafe fn bound_words(
             *qry_pk.add(6),
         )
     };
-    let (b0, b1, b2, b3, b4, b5, b6) = unsafe {
-        (
-            *qry_bad,
-            *qry_bad.add(1),
-            *qry_bad.add(2),
-            *qry_bad.add(3),
-            *qry_bad.add(4),
-            *qry_bad.add(5),
-            *qry_bad.add(6),
-        )
+    let (b0, b1, b2, b3, b4, b5, b6) = if masked {
+        unsafe {
+            (
+                *qry_bad,
+                *qry_bad.add(1),
+                *qry_bad.add(2),
+                *qry_bad.add(3),
+                *qry_bad.add(4),
+                *qry_bad.add(5),
+                *qry_bad.add(6),
+            )
+        }
+    } else {
+        (0, 0, 0, 0, 0, 0, 0)
     };
-    let (m0, t0, v0) = planes(r0, q0, q1, b0, b1, qs);
-    let (m1, t1, v1) = planes(r1, q1, q2, b1, b2, qs);
-    let (m2, t2, v2) = planes(r2, q2, q3, b2, b3, qs);
-    let (m3, t3, v3) = planes(r3, q3, q4, b3, b4, qs);
-    let (m4, t4, v4) = planes(r4, q4, q5, b4, b5, qs);
-    let (m5, t5, v5) = planes(r5, q5, q6, b5, b6, qs);
+    let ((m0, t0), v0) = (planes(r0, q0, q1, qs), valid(b0, b1, qs));
+    let ((m1, t1), v1) = (planes(r1, q1, q2, qs), valid(b1, b2, qs));
+    let ((m2, t2), v2) = (planes(r2, q2, q3, qs), valid(b2, b3, qs));
+    let ((m3, t3), v3) = (planes(r3, q3, q4, qs), valid(b3, b4, qs));
+    let ((m4, t4), v4) = (planes(r4, q4, q5, qs), valid(b4, b5, qs));
+    let ((m5, t5), v5) = (planes(r5, q5, q6, qs), valid(b5, b6, qs));
 
     // Right: from bit `o` of group 3 upward.
     let st = (0i32, 0i32, 0i32, false);
-    let (st, alive) = word(
+    let st = word(
         st,
-        true,
         funnel(m3, m4, o),
         funnel(t3, t4, o),
         funnel(v3, v4, o),
+        masked,
         um,
         a,
         b,
         bias,
         xdrop,
     );
-    let (right, _) = word(
+    let right = word(
         st,
-        alive,
         funnel(m4, m5, o),
         funnel(t4, t5, o),
         funnel(v4, v5, o),
+        masked,
         um,
         a,
         b,
@@ -407,39 +498,38 @@ pub unsafe fn bound_words(
         xdrop,
     );
 
-    // Left: from the bit below `o` of group 3 downward, reversed so that the
-    // extension order ascends from bit 0.
+    // Left: from the bit below `o` of group 3 downward.
     let st = (0i32, 0i32, 0i32, false);
-    let (st, alive) = word(
+    let st = word_left(
         st,
-        true,
-        funnel(m2, m3, o).reverse_bits(),
-        funnel(t2, t3, o).reverse_bits(),
-        funnel(v2, v3, o).reverse_bits(),
+        funnel(m2, m3, o),
+        funnel(t2, t3, o),
+        funnel(v2, v3, o),
+        masked,
         um,
         a,
         b,
         bias,
         xdrop,
     );
-    let (st, alive) = word(
+    let st = word_left(
         st,
-        alive,
-        funnel(m1, m2, o).reverse_bits(),
-        funnel(t1, t2, o).reverse_bits(),
-        funnel(v1, v2, o).reverse_bits(),
+        funnel(m1, m2, o),
+        funnel(t1, t2, o),
+        funnel(v1, v2, o),
+        masked,
         um,
         a,
         b,
         bias,
         xdrop,
     );
-    let (left, _) = word(
+    let left = word_left(
         st,
-        alive,
-        funnel(m0, m1, o).reverse_bits(),
-        funnel(t0, t1, o).reverse_bits(),
-        funnel(v0, v1, o).reverse_bits(),
+        funnel(m0, m1, o),
+        funnel(t0, t1, o),
+        funnel(v0, v1, o),
+        masked,
         um,
         a,
         b,
@@ -458,10 +548,14 @@ pub unsafe fn bound_words(
 /// start at bit `qs + o` are one funnel over two groups, not two funnels over
 /// three, and the bitwise planes commute with the funnel.
 ///
+/// Without a mask plane (`masked` false) every bit is valid and `qry_bad` is
+/// not read.
+///
 /// # Safety
 /// The planes must hold reference groups `r..=r + 1` and query groups
 /// `q..=q + 2`.
 #[inline(always)]
+#[allow(clippy::too_many_arguments)]
 unsafe fn stream(
     ref_pk: *const u64,
     qry_pk: *const u64,
@@ -470,6 +564,7 @@ unsafe fn stream(
     q: usize,
     o: u32,
     qs: u32,
+    masked: bool,
 ) -> (u32, u32, u32) {
     let s = qs + o;
     let (q, s) = (q + (s >> 5) as usize, s & 31);
@@ -479,11 +574,12 @@ unsafe fn stream(
         let xh = funnel(r0 as u32, r1 as u32, o) ^ funnel(q0 as u32, q1 as u32, s);
         let xl = funnel((r0 >> 32) as u32, (r1 >> 32) as u32, o)
             ^ funnel((q0 >> 32) as u32, (q1 >> 32) as u32, s);
-        (
-            xh | xl,
-            xh & !xl,
-            !funnel(*qry_bad.add(q), *qry_bad.add(q + 1), s),
-        )
+        let vd = if masked {
+            valid(*qry_bad.add(q), *qry_bad.add(q + 1), s)
+        } else {
+            u32::MAX
+        };
+        (xh | xl, xh & !xl, vd)
     }
 }
 
@@ -508,6 +604,7 @@ pub unsafe fn right_word(
     qs: u32,
     w: u32,
     st: Side,
+    masked: bool,
     um: i32,
     a: i32,
     b: i32,
@@ -515,9 +612,8 @@ pub unsafe fn right_word(
     xdrop: i32,
 ) -> Side {
     let (r, q) = ((rg + 3 + w) as usize, (qg + 3 + w) as usize);
-    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs) };
-    // An uncertified side has met no terminal base, so it is still alive.
-    word(st, !st.3, mm, tr, vd, um, a, b, bias, xdrop).0
+    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs, masked) };
+    word(st, mm, tr, vd, masked, um, a, b, bias, xdrop)
 }
 
 /// Word `w` (counted from 0) of the left side, as [`right_word`]: it starts at
@@ -540,6 +636,7 @@ pub unsafe fn left_word(
     qs: u32,
     w: u32,
     st: Side,
+    masked: bool,
     um: i32,
     a: i32,
     b: i32,
@@ -547,20 +644,8 @@ pub unsafe fn left_word(
     xdrop: i32,
 ) -> Side {
     let (r, q) = ((rg + 2 - w) as usize, (qg + 2 - w) as usize);
-    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs) };
-    word(
-        st,
-        !st.3,
-        mm.reverse_bits(),
-        tr.reverse_bits(),
-        vd.reverse_bits(),
-        um,
-        a,
-        b,
-        bias,
-        xdrop,
-    )
-    .0
+    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs, masked) };
+    word_left(st, mm, tr, vd, masked, um, a, b, bias, xdrop)
 }
 
 /// Whether a side is worth one more word: it has not certified, and the two
@@ -595,6 +680,7 @@ pub unsafe fn bound_at(
     qry_bad: *const u32,
     ref_loc: u32,
     query_loc: u32,
+    masked: bool,
     um: i32,
     a: i32,
     b: i32,
@@ -615,6 +701,7 @@ pub unsafe fn bound_at(
             qry_bad.add(qg as usize),
             o,
             qs,
+            masked,
             um,
             a,
             b,
@@ -643,9 +730,10 @@ pub fn candidate(
     xdrop: i32,
     t_min: i32,
     words: Words,
+    masked: bool,
 ) -> bool {
     let (right, left) = lane_bound(
-        ref_pk, qry_pk, qry_bad, ref_loc, query_loc, classes, xdrop, t_min, words,
+        ref_pk, qry_pk, qry_bad, ref_loc, query_loc, classes, xdrop, t_min, words, masked,
     );
     passes(right, left, t_min)
 }
@@ -665,6 +753,7 @@ pub fn lane_bound(
     xdrop: i32,
     t_min: i32,
     words: Words,
+    masked: bool,
 ) -> (Side, Side) {
     let (rg, qg, o, qs) = locate(ref_loc, query_loc);
     assert!(
@@ -687,15 +776,21 @@ pub fn lane_bound(
     // just checked.
     unsafe {
         let (rp, qp, bp) = (ref_pk.as_ptr(), qry_pk.as_ptr(), qry_bad.as_ptr());
-        let (mut right, mut left) = bound_at(rp, qp, bp, ref_loc, query_loc, um, a, b, bias, xdrop);
+        let (mut right, mut left) = bound_at(
+            rp, qp, bp, ref_loc, query_loc, masked, um, a, b, bias, xdrop,
+        );
         let mut w = RIGHT_WORDS;
         while w < words.0 && carry(right, left, t_min) {
-            right = right_word(rp, qp, bp, rg, qg, o, qs, w, right, um, a, b, bias, xdrop);
+            right = right_word(
+                rp, qp, bp, rg, qg, o, qs, w, right, masked, um, a, b, bias, xdrop,
+            );
             w += 1;
         }
         let mut w = LEFT_WORDS;
         while w < words.1 && carry(left, right, t_min) {
-            left = left_word(rp, qp, bp, rg, qg, o, qs, w, left, um, a, b, bias, xdrop);
+            left = left_word(
+                rp, qp, bp, rg, qg, o, qs, w, left, masked, um, a, b, bias, xdrop,
+            );
             w += 1;
         }
         (right, left)
@@ -748,7 +843,14 @@ mod tests {
     use crate::sequence::encode;
 
     fn default_classes() -> Classes {
-        classes(&build_sub_mat("", 910, None).unwrap(), 910, false, false).unwrap()
+        classes(
+            &build_sub_mat("", 910, None).unwrap(),
+            910,
+            false,
+            false,
+            true,
+        )
+        .unwrap()
     }
 
     #[test]
@@ -770,34 +872,86 @@ mod tests {
     fn an_iupac_code_loosens_the_reference_and_switches_the_query_off() {
         let m = build_sub_mat("", 910, None).unwrap();
         assert_eq!(
-            classes(&m, 910, true, false).unwrap(),
+            classes(&m, 910, true, false, true).unwrap(),
             Classes {
                 um: 100,
                 uti: -31,
                 utv: -100
             }
         );
-        let why = classes(&m, 910, false, true).unwrap_err();
+        let why = classes(&m, 910, false, true, true).unwrap_err();
         assert!(why.contains("IUPAC query base scores -100"), "{why}");
         // Below 100 it does end an extension.
-        assert!(classes(&build_sub_mat("", 99, None).unwrap(), 99, true, true).is_ok());
+        assert!(classes(&build_sub_mat("", 99, None).unwrap(), 99, true, true, true).is_ok());
     }
 
     /// A soft-masked or `N` base scores -1000: terminal only below that xdrop.
     #[test]
     fn the_sieve_is_off_once_a_masked_base_no_longer_ends_an_extension() {
-        assert!(classes(&build_sub_mat("", 999, None).unwrap(), 999, false, false).is_ok());
+        assert!(
+            classes(
+                &build_sub_mat("", 999, None).unwrap(),
+                999,
+                false,
+                false,
+                true
+            )
+            .is_ok()
+        );
         for xdrop in [1000, 1200] {
             let why = classes(
                 &build_sub_mat("", xdrop, None).unwrap(),
                 xdrop,
                 false,
                 false,
+                true,
             )
             .unwrap_err();
             assert!(why.contains("soft-masked query base scores -1000"), "{why}");
         }
-        assert!(classes(&build_sub_mat("", 910, None).unwrap(), -1, false, false).is_err());
+        assert!(
+            classes(
+                &build_sub_mat("", 910, None).unwrap(),
+                -1,
+                false,
+                false,
+                true
+            )
+            .is_err()
+        );
+    }
+
+    /// Without the mask plane a query symbol outside `ACGT` is one more pair of
+    /// codes under the class maxima: nothing has to end an extension, so the
+    /// sieve stays on at any xdrop and with IUPAC codes in the query, which only
+    /// loosen the transversion class as they do in the reference.
+    #[test]
+    fn without_the_mask_plane_the_query_symbols_join_the_class_maxima() {
+        let blastz = Classes {
+            um: 100,
+            uti: -31,
+            utv: -114,
+        };
+        let m = build_sub_mat("", 910, None).unwrap();
+        assert_eq!(classes(&m, 910, false, false, false).unwrap(), blastz);
+        let loose = Classes {
+            utv: -100,
+            ..blastz
+        };
+        assert_eq!(classes(&m, 910, false, true, false).unwrap(), loose);
+        assert_eq!(classes(&m, 910, true, true, false).unwrap(), loose);
+        for xdrop in [1000, 1200, 5000] {
+            let m = build_sub_mat("", xdrop, None).unwrap();
+            assert_eq!(classes(&m, xdrop, false, false, false).unwrap(), blastz);
+        }
+        // A scored `N` is at or above 0 in the transversion class: still off.
+        for ambiguous in ["n", "iupac", "n,10,20", "iupac,200,10"] {
+            let m = build_sub_mat(ambiguous, 910, None).unwrap();
+            assert!(
+                classes(&m, 910, false, false, false).is_err(),
+                "{ambiguous}"
+            );
+        }
     }
 
     /// `--ambiguous n` and `iupac` score `N` at 0 or better, so it neither ends
@@ -806,7 +960,7 @@ mod tests {
     fn the_sieve_is_off_when_n_is_scored() {
         for ambiguous in ["n", "iupac", "n,10,20", "iupac,200,10"] {
             let m = build_sub_mat(ambiguous, 910, None).unwrap();
-            assert!(classes(&m, 910, false, false).is_err(), "{ambiguous}");
+            assert!(classes(&m, 910, false, false, true).is_err(), "{ambiguous}");
         }
     }
 
@@ -818,7 +972,7 @@ mod tests {
             m[r * NUC + q] = -20;
         }
         assert_eq!(
-            classes(&m, 910, false, false).unwrap(),
+            classes(&m, 910, false, false, true).unwrap(),
             Classes {
                 um: 100,
                 uti: -20,
@@ -827,7 +981,7 @@ mod tests {
         );
         // A rewarded transition, and a matrix that does not drift down.
         m[2] = 5;
-        assert!(classes(&m, 910, false, false).is_err());
+        assert!(classes(&m, 910, false, false, true).is_err());
         let mut flat = build_sub_mat("", 910, None).unwrap();
         for r in 0..4 {
             for q in 0..4 {
@@ -837,7 +991,7 @@ mod tests {
             }
         }
         assert!(
-            classes(&flat, 910, false, false)
+            classes(&flat, 910, false, false, true)
                 .unwrap_err()
                 .contains("no negative drift")
         );
@@ -856,8 +1010,11 @@ mod tests {
                 }
             }
         }
-        let c = classes(&m, 910, false, false).unwrap();
-        assert_eq!((c.um, c.uti, c.utv), (100, -1000, -1000));
+        for masked in [true, false] {
+            let c = classes(&m, 910, false, false, masked).unwrap();
+            assert_eq!((c.um, c.uti, c.utv), (100, -1000, -1000));
+        }
+        let c = classes(&m, 910, false, false, true).unwrap();
         assert!(c.uti >= -MAX_ABS && c.utv >= -MAX_ABS);
         assert_eq!(c.kernel_args(), (100, 1100, 0, -8000));
     }
@@ -931,15 +1088,23 @@ mod tests {
 
     /// The matrices and xdrops the property runs over, each with whether the
     /// reference and the query may hold IUPAC codes.
-    fn regimes() -> Vec<(Vec<i32>, i32, bool, bool)> {
+    fn regimes(masked: bool) -> Vec<(Vec<i32>, i32, bool, bool)> {
         let mut out = Vec::new();
         for xdrop in [910, 600, 340, 99, 30] {
             let m = build_sub_mat("", xdrop, None).unwrap();
             out.push((m.clone(), xdrop, false, false));
             out.push((m.clone(), xdrop, true, false));
-            if xdrop < 100 {
-                out.push((m, xdrop, true, true));
+            // With the mask plane an IUPAC code in the query must be terminal.
+            if xdrop < 100 || !masked {
+                out.push((m.clone(), xdrop, true, true));
+                out.push((m, xdrop, false, true));
             }
+        }
+        // Without it a masked base need not end an extension either.
+        if !masked {
+            let m = build_sub_mat("", 1200, None).unwrap();
+            out.push((m.clone(), 1200, false, false));
+            out.push((m, 1200, true, true));
         }
         // Milder transitions and a harsher match, as a custom matrix would give.
         let mut m = build_sub_mat("", 910, None).unwrap();
@@ -968,13 +1133,14 @@ mod tests {
     /// The property: a certified side of the bound is never below the exact
     /// side, and a hit the exact gate keeps is always a candidate. `tamper`
     /// replaces the class scores, to show that the run notices a wrong bound.
-    fn run_property(cases: u64, seed: u64, tamper: Option<Classes>) -> Tally {
+    fn run_property(cases: u64, seed: u64, tamper: Option<Classes>, masked: bool) -> Tally {
         let mut rng = Rng(seed);
-        let regimes = regimes();
+        let regimes = regimes(masked);
         let mut tally = Tally::default();
         for case in 0..cases {
             let (sub, xdrop, ref_x, qry_x) = &regimes[(case % regimes.len() as u64) as usize];
-            let cls = classes(sub, *xdrop, *ref_x, *qry_x).expect("regime keeps the sieve on");
+            let cls =
+                classes(sub, *xdrop, *ref_x, *qry_x, masked).expect("regime keeps the sieve on");
             let cls = tamper.unwrap_or(cls);
 
             // A reference, and a query that copies a stretch of it at some
@@ -995,7 +1161,7 @@ mod tests {
             decorate(&mut q, &mut rng, *qry_x);
             let (renc, qenc) = (encode(&r), encode(&q));
             let (rpk, _) = pack(&renc, REF_FILL);
-            let (qpk, qbad) = pack(&qenc, REF_FILL);
+            let (qpk, qbad) = pack(&qenc, if masked { REF_FILL } else { QRY_FILL });
 
             for _ in 0..24 {
                 // On the shared diagonal most of the time, anywhere otherwise;
@@ -1020,8 +1186,9 @@ mod tests {
                         (3, 4),
                         (RIGHT_WORDS_MAX, LEFT_WORDS_MAX),
                     ] {
-                        let (right, left) =
-                            lane_bound(&rpk, &qpk, &qbad, rl, ql, &cls, *xdrop, t_min, words);
+                        let (right, left) = lane_bound(
+                            &rpk, &qpk, &qbad, rl, ql, &cls, *xdrop, t_min, words, masked,
+                        );
                         let cand = passes(right, left, t_min);
                         // A certified side bounds the exact side; a hit the exact
                         // gate keeps is a candidate; and carrying the bound on
@@ -1082,37 +1249,88 @@ mod tests {
             // Group `i` of the window against the query, as `bound_words` has it.
             let group = |i: i64| {
                 let (r, q) = ((rg as i64 + i) as usize, (qg as i64 + i) as usize);
-                planes(rpk[r], qpk[q], qpk[q + 1], qbad[q], qbad[q + 1], qs)
+                let (m, t) = planes(rpk[r], qpk[q], qpk[q + 1], qs);
+                (m, t, valid(qbad[q], qbad[q + 1], qs))
             };
             for i in -2i64..=6 {
                 let (m0, t0, v0) = group(i);
                 let (m1, t1, v1) = group(i + 1);
-                let want = (funnel(m0, m1, o), funnel(t0, t1, o), funnel(v0, v1, o));
-                // SAFETY: `PADG` groups of padding surround both planes.
-                let got = unsafe {
-                    stream(
-                        rpk.as_ptr(),
-                        qpk.as_ptr(),
-                        qbad.as_ptr(),
-                        (rg as i64 + i) as usize,
-                        (qg as i64 + i) as usize,
-                        o,
-                        qs,
-                    )
-                };
-                assert_eq!(got, want, "group {i} at ({rl}, {ql}), o {o}, qs {qs}");
+                for masked in [true, false] {
+                    let vd = if masked { funnel(v0, v1, o) } else { u32::MAX };
+                    let want = (funnel(m0, m1, o), funnel(t0, t1, o), vd);
+                    // SAFETY: `PADG` groups of padding surround both planes.
+                    let got = unsafe {
+                        stream(
+                            rpk.as_ptr(),
+                            qpk.as_ptr(),
+                            qbad.as_ptr(),
+                            (rg as i64 + i) as usize,
+                            (qg as i64 + i) as usize,
+                            o,
+                            qs,
+                            masked,
+                        )
+                    };
+                    assert_eq!(got, want, "group {i} at ({rl}, {ql}), o {o}, qs {qs}");
+                }
             }
+        }
+    }
+
+    /// Without the mask plane a left word is walked from its top byte down
+    /// instead of being reversed: the same four blocks in the same order.
+    #[test]
+    fn a_left_word_walked_down_is_the_reversed_word_walked_up() {
+        let mut rng = Rng(0xfeed_5eed_0bad_cafe);
+        let (um, a, b, bias) = default_classes().kernel_args();
+        for _ in 0..200_000 {
+            let (mm, tr) = (rng.next() as u32, rng.next() as u32);
+            let tr = tr & mm;
+            let st = (
+                rng.below(4000) as i32 - 2000,
+                rng.below(3000) as i32,
+                rng.below(3000) as i32,
+                rng.chance(200),
+            );
+            let st = (st.0, st.1.max(st.0), st.2, st.3);
+            let down = word_left(st, mm, tr, u32::MAX, false, um, a, b, bias, 910);
+            let up = word(
+                st,
+                mm.reverse_bits(),
+                tr.reverse_bits(),
+                u32::MAX,
+                false,
+                um,
+                a,
+                b,
+                bias,
+                910,
+            );
+            assert_eq!(down, up, "mm {mm:#x} tr {tr:#x} from {st:?}");
         }
     }
 
     #[test]
     fn a_certified_bound_is_never_below_the_exact_gate() {
-        let tally = run_property(40_000, 0x9e37_79b9_7f4a_7c15, None);
+        let tally = run_property(40_000, 0x9e37_79b9_7f4a_7c15, None, true);
         // The property is vacuous unless most sides certify and most hits are
         // rejected, as they are on real sequence.
         assert!(tally.certified * 10 > tally.hits * 8, "{tally:?}");
         assert!(tally.rejected * 10 > tally.hits * 6, "{tally:?}");
         // Carrying the bound on must reject some of what the static window left.
+        assert!(tally.rejected_carried > tally.rejected, "{tally:?}");
+    }
+
+    /// The same property without the query's mask plane, where only a drop
+    /// certifies a side: over the same regimes, plus the ones the mask plane
+    /// cannot serve (IUPAC codes in the query at any xdrop, an xdrop above the
+    /// score of a masked base).
+    #[test]
+    fn the_bound_without_the_mask_plane_is_never_below_the_exact_gate() {
+        let tally = run_property(40_000, 0x9e37_79b9_7f4a_7c15, None, false);
+        eprintln!("without the mask plane: {tally:?}");
+        assert!(tally.certified * 10 > tally.hits * 6, "{tally:?}");
+        assert!(tally.rejected * 10 > tally.hits * 5, "{tally:?}");
         assert!(tally.rejected_carried > tally.rejected, "{tally:?}");
     }
 
@@ -1138,8 +1356,10 @@ mod tests {
                 utv: -114,
             },
         ] {
-            let tally = run_property(4_000, 7, Some(wrong));
-            assert!(tally.violations > 0, "{wrong:?} went unnoticed: {tally:?}");
+            for masked in [true, false] {
+                let tally = run_property(4_000, 7, Some(wrong), masked);
+                assert!(tally.violations > 0, "{wrong:?} went unnoticed: {tally:?}");
+            }
         }
     }
 
@@ -1148,7 +1368,9 @@ mod tests {
     #[test]
     #[ignore = "long: 12 million hits"]
     fn bound_holds_on_ten_million_hits() {
-        let tally = run_property(500_000, 20_261_118, None);
+        let tally = run_property(500_000, 20_261_118, None, true);
+        let open = run_property(500_000, 20_261_118, None, false);
+        assert_eq!(open.violations, 0, "{open:?}");
         eprintln!("{tally:?}");
         assert!(tally.hits >= 10_000_000 && tally.violations == 0);
     }

@@ -85,7 +85,8 @@ arm seed-14of22              on  "$R" "$Q" -s 14of22
 arm notransition             on  "$R" "$Q" -n
 arm xdrop-600                on  "$R" "$Q" -x 600
 arm xdrop-999                on  "$R" "$Q" -x 999
-arm xdrop-1200               off "$R" "$Q" -x 1200
+# Without the query's mask plane (round 117) a masked base need not end an extension: the sieve stays on.
+arm xdrop-1200               on  "$R" "$Q" -x 1200
 arm ambiguous-n              off "$R" "$Q" -a n
 arm ambiguous-iupac          off "$R" "$Q" -a iupac
 arm strand-plus              on  "$R" "$Q" -S plus
@@ -120,8 +121,8 @@ EOF
 arm scoring-mild-transitions on  "$R" "$Q" -c "$W/mild.q"
 grep -q 'transition -20' "$W/scoring-mild-transitions.1.err" || { echo "scoring arm: class scores did not follow the matrix"; fail=$((fail+1)); }
 
-# IUPAC codes other than N: in the reference they loosen the transversion class
-# to -100; in the query they are not terminal, so the sieve must switch off.
+# IUPAC codes other than N loosen the transversion class to -100, in the reference and (without the mask
+# plane, round 117) in the query; with the plane a query code is not terminal and the sieve must switch off.
 python3 - "$R" "$Q" "$W" <<'EOF'
 import sys
 ref, qry, out = sys.argv[1:4]
@@ -141,7 +142,8 @@ spike(qry, out + "/qry_iupac.fa", 5003)
 EOF
 arm iupac-in-reference       on  "$W/ref_iupac.fa" "$Q"
 grep -q 'transversion -100' "$W/iupac-in-reference.1.err" || { echo "iupac arm: transversion class is not -100"; fail=$((fail+1)); }
-arm iupac-in-query           off "$R" "$W/qry_iupac.fa"
+arm iupac-in-query           on  "$R" "$W/qry_iupac.fa"
+grep -q 'transversion -100' "$W/iupac-in-query.1.err" || { echo "iupac-in-query: transversion class is not -100"; fail=$((fail+1)); }
 
 # The guard. Two diverged copies of one tandem array: nearly every hit extends, so
 # the bound rejects almost nothing; the guard must see that on its first sample
@@ -171,9 +173,9 @@ grep -q '^#sieve guard' "$W/defaults.1.err" && { echo "defaults: the guard held 
 
 # Bucket pass with a window sized for the packed planes: a chunk the sieve does
 # not gate skips the pass. Forced on here (the local card's L2 is too small for
-# the rule to choose it): a query with IUPAC codes switches the sieve off for
+# the rule to choose it): with the mask plane a query with IUPAC codes switches the sieve off for
 # the unit, and on the tandem array the guard holds the plain gate.
-ENVV="HSPZ_REF_BUCKETS=1" arm buckets-iupac-in-query    off "$R" "$W/qry_iupac.fa"
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_GATE_SIEVE_MASK=1" arm buckets-iupac-in-query    off "$R" "$W/qry_iupac.fa"
 ENVV="HSPZ_REF_BUCKETS=1" arm buckets-satellite-guard   on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 
 # Round 111: an undecided side of the bound is carried on to 128 right / 160 left bases by default. These arms run
@@ -205,6 +207,34 @@ ENVV="HSPZ_BUCKET_VOTES=loop HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23 HSPZ_BU
 for a in bucket-order-shift-26 bucket-order-shift-21 bucket-order-small-chunks bucket-order-loop-kernels; do
   grep -q '^#bucket-check chunk=' "$W/$a.1.err" || { echo "$a: the permutation check did not run"; fail=$((fail+1)); }
 done
+
+# Round 116: a bucketed chunk's survivors go to find_hsps by sorted slot: the scatter writes no raw id and nothing
+# is sorted back. Every arm above that runs the bucket pass without the permutation check takes that path, against
+# a control in raw order (below, the control's own switch). The arms with the check keep the ids, and there the
+# anchors-only scatter runs beside the checked one and must write the same anchors word for word.
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_SURVIVOR_ORDER=raw" arm survivors-raw-order       on  "$R" "$Q"
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_SURVIVOR_ORDER=raw" arm survivors-raw-order-2400  on  "$R" "$Q" -H 2400
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23" arm survivors-slots-chunks   on  "$R" "$Q" -C 60000
+for a in bucket-order-shift-26 bucket-order-shift-24 bucket-order-shift-23 bucket-order-shift-22 bucket-order-shift-21 bucket-order-small-chunks; do
+  n=$(grep -c '^#bucket-check-anchors-only' "$W/$a.1.err"); ok=$(grep -c '^#bucket-check-anchors-only .* equal=ok' "$W/$a.1.err")
+  { [ "$n" -gt 0 ] && [ "$n" = "$ok" ]; } || { echo "$a: the anchors-only scatter differs or did not run ($ok of $n)"; fail=$((fail+1)); }
+done
+grep -q '^  sort_survivors' "$W/buckets-forced.1.err" && { echo "buckets-forced: survivors were sorted back to raw order"; fail=$((fail+1)); }
+grep -q '^  sort_survivors' "$W/survivors-raw-order.1.err" || { echo "survivors-raw-order: the raw-order path did not run"; fail=$((fail+1)); }
+
+# Round 117: the bound without the query's mask plane is the default and every arm above without a gather
+# setting runs it, the host recomputing each walk the same way. These arms keep the plane (the kernels of rounds
+# 104 to 116 with the terminal base tested once per word), where the sieve is off at xdrop 1200 and with IUPAC
+# codes in the query.
+ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane                on  "$R" "$Q"
+ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-2400           on  "$R" "$Q" -H 2400
+ENVV="HSPZ_GATE_SIEVE_MASK=1 HSPZ_REF_BUCKETS=1" arm mask-plane-buckets        on  "$R" "$Q"
+ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-xdrop-1200     off "$R" "$Q" -x 1200
+ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-iupac-query    off "$R" "$W/qry_iupac.fa"
+ENVV="HSPZ_GATE_SIEVE_MASK=1" arm mask-plane-satellite      on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q 'query without a mask plane' "$W/defaults.1.err" || { echo "defaults: the query still has its mask plane"; fail=$((fail+1)); }
+grep -q 'query without a mask plane' "$W/mask-plane.1.err" && { echo "mask-plane: the plane was dropped"; fail=$((fail+1)); }
+grep -q 'query without a mask plane' "$W/gather.1.err" && { echo "gather: the gathered arm lost its mask plane"; fail=$((fail+1)); }
 
 echo
 grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \
