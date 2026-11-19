@@ -19,7 +19,7 @@
 
 use crate::Fallible;
 use crate::cli::RunArgs;
-use crate::gpu::{DeviceProfile, Engine, EngineConfig, HitStats, Lifecycle};
+use crate::gpu::{DeviceProfile, Engine, EngineConfig, HitStats, Lifecycle, Lull};
 use crate::hsp::{self, SegmentPair};
 use crate::partition::{Partitioner, Plan};
 use crate::plan::{self, PackedBin, RecordMeta};
@@ -337,6 +337,48 @@ impl SeedSlot {
     }
 }
 
+/// A batch whose HSPs are still to be sorted and deduplicated: its interval,
+/// its strand, and its `MAX_HITS` chunks as they came off the device.
+type PendingBatch = Option<(usize, bool, Vec<Vec<SegmentPair>>)>;
+
+/// Round 121: sorts and deduplicates the batch in `pending`, one chunk at a time
+/// as the engine does, and appends its HSPs to their interval and strand.
+fn settle_pending(
+    pending: &mut PendingBatch,
+    out: &mut [(Vec<SegmentPair>, Vec<SegmentPair>)],
+    engine: &mut Engine,
+) {
+    let Some((interval, rev, chunks)) = pending.take() else {
+        return;
+    };
+    let t = Instant::now();
+    let dst = if rev {
+        &mut out[interval].1
+    } else {
+        &mut out[interval].0
+    };
+    for mut chunk in chunks {
+        crate::hsp::dedup_and_order(&mut chunk, None);
+        dst.extend_from_slice(&chunk);
+    }
+    engine.phases.add("host sort + dedup", t.elapsed());
+}
+
+/// Round 121: `HSPZ_LEAN_BATCHES` unset or `1`: the host work between two
+/// batches (the next upload, the last batch's sort and dedup) is done inside a
+/// batch while its kernels are queued. `0`: between batches, as before.
+fn lean_batches() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_LEAN_BATCHES").as_deref() {
+        Err(_) | Ok("1") => true,
+        Ok("0") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_LEAN_BATCHES={other:?} is not 0 or 1; using 1");
+            true
+        }
+    })
+}
+
 /// How the host seed stream is generated (round 107), as `(producers, threads
 /// per producer)`.
 ///
@@ -425,6 +467,10 @@ pub(crate) fn seed_and_filter_all(
     if engine.device_seeds {
         let _ = (q.fwd, q.rc, threads);
         engine.async_seed_copy = false;
+        // Round 121: a batch's HSPs are sorted and deduplicated under the next
+        // batch's score gate (see the host-seed loop below).
+        let defer = lean_batches() && !engine.dump_raw;
+        let mut pending: PendingBatch = None;
         for b in &batches {
             let n_seeds = engine.generate_seeds(0, b.rev, b.range, shape, transitions)?;
             #[cfg(feature = "device-seeds-check")]
@@ -435,12 +481,25 @@ pub(crate) fn seed_and_filter_all(
             }
             if n_seeds > 0 {
                 pass.stats.seeds += n_seeds as u64;
-                let o = engine.seed_and_filter(0, b.rev).map_err(|e| {
+                let o = {
+                    let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
+                        if lull == Lull::Gate {
+                            settle_pending(&mut pending, &mut out, engine);
+                        }
+                        Ok(())
+                    };
+                    engine.seed_and_filter_with(0, b.rev, defer, &mut work)
+                }
+                .map_err(|e| {
                     format!(
                         "interval {} range {}-{} rev {}: {e}",
                         b.interval, b.range.0, b.range.1, b.rev
                     )
                 })?;
+                settle_pending(&mut pending, &mut out, engine);
+                if !o.chunks.is_empty() {
+                    pending = Some((b.interval, b.rev, o.chunks));
+                }
                 pass.stats.seed_hits += o.num_hits as u64;
                 pass.stats.raw_hsps += o.raw_hsps as u64;
                 let dst = &mut out[b.interval];
@@ -459,6 +518,7 @@ pub(crate) fn seed_and_filter_all(
                 );
             }
         }
+        settle_pending(&mut pending, &mut out, engine);
         for (fw, rc) in out {
             pass.stats.hsps += (fw.len() + rc.len()) as u64;
             pass.intervals.push((fw, rc));
@@ -608,6 +668,17 @@ pub(crate) fn seed_and_filter_all(
                 }
             };
 
+            // Round 121 (`HSPZ_LEAN_BATCHES`, on unless `0`): what the host did
+            // between two batches, with the card idle, it does inside the next
+            // batch while kernels are queued: the upload of the batch after is
+            // issued once this batch's counts are queued, and a batch's HSPs are
+            // sorted and deduplicated under the next batch's score gate.
+            let defer = lean_batches() && !engine.dump_raw;
+            // The upload is only issued ahead when it has a slot of its own.
+            let lean = overlap && lean_batches();
+            // The batch whose HSPs are still to be deduplicated: interval, strand,
+            // and its chunks as they came off the device.
+            let mut pending: PendingBatch = None;
             let mut cur = take(0)?;
             // Batch 0's upload, so the loop can always be one upload ahead.
             if overlap {
@@ -620,7 +691,7 @@ pub(crate) fn seed_and_filter_all(
                 // done, so its producer keeps that time too.
                 let mut next = None;
                 if overlap {
-                    if i + 1 < batches.len() {
+                    if !lean && i + 1 < batches.len() {
                         let slot = take(i + 1)?;
                         engine.upload_seeds((i + 1) % 2, slot.seeds())?;
                         next = Some(slot);
@@ -633,14 +704,38 @@ pub(crate) fn seed_and_filter_all(
                 let n_seeds = cur.seeds().len();
                 if n_seeds > 0 {
                     pass.stats.seeds += n_seeds as u64;
-                    let o = engine
-                        .seed_and_filter(if overlap { i % 2 } else { 0 }, b.rev)
-                        .map_err(|e| {
-                            format!(
-                                "interval {} range {}-{} rev {}: {e}",
-                                b.interval, b.range.0, b.range.1, b.rev
-                            )
-                        })?;
+                    let o = {
+                        let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
+                            match lull {
+                                Lull::Counts => {
+                                    if lean && next.is_none() && i + 1 < batches.len() {
+                                        let slot = take(i + 1)?;
+                                        engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                                        next = Some(slot);
+                                    }
+                                }
+                                Lull::Gate => settle_pending(&mut pending, &mut out, engine),
+                            }
+                            Ok(())
+                        };
+                        engine.seed_and_filter_with(
+                            if overlap { i % 2 } else { 0 },
+                            b.rev,
+                            defer,
+                            &mut work,
+                        )
+                    }
+                    .map_err(|e| {
+                        format!(
+                            "interval {} range {}-{} rev {}: {e}",
+                            b.interval, b.range.0, b.range.1, b.rev
+                        )
+                    })?;
+                    // A call that left early never reached its lulls.
+                    settle_pending(&mut pending, &mut out, engine);
+                    if !o.chunks.is_empty() {
+                        pending = Some((b.interval, b.rev, o.chunks));
+                    }
                     pass.stats.seed_hits += o.num_hits as u64;
                     pass.stats.raw_hsps += o.raw_hsps as u64;
                     let dst = &mut out[b.interval];
@@ -659,6 +754,13 @@ pub(crate) fn seed_and_filter_all(
                     );
                 }
 
+                if lean && next.is_none() && i + 1 < batches.len() {
+                    // The batch had no seeds or left before its first lull.
+                    let slot = take(i + 1)?;
+                    engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                    next = Some(slot);
+                }
+
                 // This slot's upload finished before its compute started, and its
                 // compute has finished: a producer may overwrite it. A send only
                 // fails when every producer is gone, which is after the last claim.
@@ -673,6 +775,7 @@ pub(crate) fn seed_and_filter_all(
                 let _ = free_tx.send(done);
             }
             let _ = free_tx.send(cur);
+            settle_pending(&mut pending, &mut out, engine);
             Ok(())
         })?;
 
@@ -4812,6 +4915,18 @@ pub(crate) fn report_counts(stats: &Stats) {
     eprintln!("#seed hits: {}", stats.seed_hits);
     eprintln!("#raw HSPs: {}", stats.raw_hsps);
     eprintln!("#HSPs: {}", stats.hsps);
+    if crate::gpu::host_trace::on() {
+        use crate::gpu::host_trace as t;
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = |ns: &std::sync::atomic::AtomicU64| ns.load(Relaxed) as f64 / 1e9;
+        let (batch, blocked, lull) = (s(&t::BATCH_NS), s(&t::BLOCKED_NS), s(&t::LULL_NS));
+        eprintln!(
+            "host trace: {} batch calls, {batch:.3} s inside them: {blocked:.3} s blocked on the card, \
+             {lull:.3} s of host work under queued kernels, {:.3} s of host work with nothing queued",
+            t::BATCHES.load(Relaxed),
+            batch - blocked - lull
+        );
+    }
     #[cfg(feature = "gate-sieve")]
     for line in crate::gpu::sieve_totals::report() {
         eprintln!("{line}");
