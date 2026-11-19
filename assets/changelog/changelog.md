@@ -38,7 +38,7 @@ All notable changes to `hspZ` are documented here, newest first.
 
 ## [0.1.0] — 2026-11-19
 
-Exact speed-ups, all on by default. A whole genome takes under a fifth of the time and every byte of the output
+Exact speed-ups, all on by default. A whole genome takes about a sixth of the time and every byte of the output
 is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
 schedules planned on 0.0.x numbers no longer hold.
 
@@ -47,10 +47,10 @@ to that run's (3,864 files, 865,049,792 bytes, 15,917,736 HSPs):
 
 | cards | 0.0.5 | 0.1.0 | |
 | ---: | ---: | ---: | --- |
-| 1 | 3,491.8 s | **648–656 s** | 5.3× |
-| 8 | 576.9 s | **111.6 s** | 5.2× |
+| 1 | 3,491.8 s | **581–588 s** | 6.0× |
+| 8 | 576.9 s | **100.5 s** | 5.7× |
 
-Change by change (the last two rows against the build before them on the same card, in both orders):
+Change by change (the last three rows against the build before them on the same card):
 
 | change | one card | eight cards |
 | --- | --- | --- |
@@ -58,16 +58,17 @@ Change by change (the last two rows against the build before them on the same ca
 | one worker per card | | 137 → 126 s |
 | host side: seeds produced ahead, query packs ahead, inputs read together | 775 → 712 s, 765 → 703 s | 125 → 119 s |
 | `find_hits` by runs of 32 seeds per warp | 711 → 656 s, 703 → 648 s | 120 → 112 s |
+| the sieve's bound carried on for sides that have not decided | 656 → 588 s, 649 → 581 s | 111 → 100 s |
 
-The same build takes 648 to 656 s on two cards of one node, so a difference of 1% between two runs is not a
-result. Two, four and six cards were measured only before the last two changes: 380.0, 218.1 and 149.4 s
+The same build takes 581 to 588 s on two cards of one node, so a difference of 1% between two runs is not a
+result. Two, four and six cards were measured only before the last three changes: 380.0, 218.1 and 149.4 s
 (1,771.8, 942.9 and 648.0 s with 0.0.5). All times are with `--time`, which itself costs about 3%. Other species
 pairs and other GPU classes were not measured for this release, except where a bullet says so.
 
-- **The score-gate sieve: the score gate of hg38 × mm39 on one A100 from 3,109 s to 307 s.** The gate was 89% of a
+- **The score-gate sieve: the score gate of hg38 × mm39 on one A100 from 3,109 s to 243 s.** The gate was 89% of a
   whole-genome run. It scores every seed hit exactly, one hit per warp, and rejects all but about 0.01% of them.
   Now each lane first bounds the score of *its own* hit from 2-bit packed bases, and the warp scores exactly only
-  the hits whose bound reaches the threshold or could not be certified: about 1.5% of them between human and
+  the hits whose bound reaches the threshold or could not be certified: about 0.02% of them between human and
   mouse. A hit is rejected only when an upper bound on its score is below the threshold, so the keep decisions,
   the HSP set and the files do not change.
   - **How it works.** The reference and both query strands are packed on the device into two bit planes, plus
@@ -77,8 +78,17 @@ pairs and other GPU classes were not measured for this release, except where a b
     class scores taken from the substitution matrix (match, transition, transversion; 100, −31, −114 by default)
     turn them into an upper bound on the X-drop extension. The walk stops at a marked query base, which ends the
     exact extension too. If both sides are certified and their bounds sum below the threshold, the hit is
-    rejected without being scored. The bound is one branch-free block of 407 instructions for 32 hits; exact
-    scoring costs about 229 per hit.
+    rejected without being scored. That first window is one branch-free block of 407 instructions for 32 hits;
+    exact scoring costs about 229 per hit.
+  - **A side that has not decided is carried on.** Inside 64 and 96 bases a side often has neither met a
+    marked base nor dropped by X-drop; it used to abstain, and the hit went to the exact scorer: 1.4% of the
+    hits between human and mouse, each costing as much as bounding about 29 hits, so they were 29% of the
+    gate. Such a side now keeps walking, 32 bases at a time, up to 128 to the right and 160 to the left, for as
+    long as the hit is undecided (once the two bounds reach the threshold it goes to the exact scorer whatever
+    follows). The proof does not use the window's length. Each lane carries its own side and loads only its own
+    words, so the lanes that are done wait instead of working. On unit 0 of hg38 × mm39 the exact scorer sees
+    0.023% of the hits instead of 1.42% and the gate takes 4.87 s instead of 6.21 s; the whole genome goes from
+    656 to 588 s. `HSPZ_SIEVE_WORDS=2,3` restores the first window alone.
   - **The bucket pass is sized for the packed bases.** The reference-locality pass in front of the gate (0.0.4)
     sorts a batch's hits into reference windows that fit the L2. The sieve reads a quarter of a byte per base,
     so its windows are four times longer in bases (64 Mbp on an A100 or an L4), the pass needs fewer buckets, and
@@ -107,7 +117,8 @@ pairs and other GPU classes were not measured for this release, except where a b
 
     On the L4 the plane-sized pass without the trial takes the unit's GPU time from 43.6 s to 37.5 s more (the
     node's CPUs were shared that day, so its wall times are not quoted).
-  - **Runtime switch.** `HSPZ_GATE_SIEVE=0` scores every hit exactly, as 0.0.6 did. `HSPZ_GATE_SIEVE=gather`
+  - **Runtime switch.** `HSPZ_SIEVE_WORDS=R,L` sets how many 32-base words a side may be carried to (2 to 4 on
+    the right, 3 to 5 on the left; unset is `4,5`). `HSPZ_GATE_SIEVE=0` scores every hit exactly, as 0.0.6 did. `HSPZ_GATE_SIEVE=gather`
     loads the bound's reference words through shared memory instead of once per lane; that is faster where
     memory bandwidth binds (L4 with its bucket pass off: 30.5 s against 41.0 s) and slower on an A100 (19.0 s
     against 16.0 s), so per-lane loads are the default. `auto` gathers only when the bucket pass is off.
@@ -122,8 +133,9 @@ pairs and other GPU classes were not measured for this release, except where a b
     without it (RX 6500 XT); the output is the same either way. `HSPZ_GATE_SIEVE_GUARD=<n>` sets the interval
     and `0` removes the guard; a run where the guard acted prints a `#sieve guard:` line.
   - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
-    IUPAC codes, both sequence ends, five X-drops, two matrices) finds no certified bound below the exact score
-    and no kept hit rejected, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 33
+    IUPAC codes, both sequence ends, five X-drops, two matrices), each walked at three window lengths and four
+    thresholds, finds no certified bound below the exact score, no kept hit rejected and no rejection taken
+    back by a longer window, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 38
     option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
     `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
     exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`

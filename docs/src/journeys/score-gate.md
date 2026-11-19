@@ -36,8 +36,8 @@ sequenceDiagram
 ## D.2 — Bound each anchor from packed bases first
 <!-- @id: d-sieve -->
 WHAT GOES IN: The warp's 32 anchors, 2-bit packed planes of the reference and of the query strand, and three class scores taken from the substitution matrix.
-WHAT HAPPENS: Each lane bounds its own anchor: over blocks of eight bases it counts matches and transitions across 64 bases to the right and 96 to the left, stops at the first query base that is not an uppercase A, C, G or T, and checks whether the bound has fallen by more than X-drop. An anchor whose two sides are certified and sum below the keep threshold is rejected, and one ballot collects the rest.
-WHAT COMES OUT: A 32-bit candidate mask per warp, about 1.5% of the anchors between human and mouse: the only ones the exact scorer of D.3 still walks.
+WHAT HAPPENS: Each lane bounds its own anchor: over blocks of eight bases it counts matches and transitions across 64 bases to the right and 96 to the left (a side that has decided nothing there is carried on, 32 bases at a time, up to 128 and 160), stops at the first query base that is not an uppercase A, C, G or T, and checks whether the bound has fallen by more than X-drop. An anchor whose two sides are certified and sum below the keep threshold is rejected, and one ballot collects the rest.
+WHAT COMES OUT: A 32-bit candidate mask per warp, about 0.02% of the anchors between human and mouse: the only ones the exact scorer of D.3 still walks.
 INVARIANT: The bound never undercuts the exact score, so a rejected anchor would have failed the exact comparison too and the keep bits are unchanged; when a scoring matrix or X-drop breaks that guarantee, the host switches the bound off for the run and says why.
 
 ```mermaid
