@@ -36,8 +36,16 @@
 //! So with `J` the first block that holds a terminal base or certifies a drop,
 //! the exact side is at most `best = max(0, max_{j <= J} B_{j-1} + um * m_j)`.
 //! A lane rejects its hit iff both sides have such a `J` inside their window
-//! (64 bases to the right, 96 to the left) and `best_right + best_left < t_min`. A side
-//! without one *abstains* and the hit goes to the exact gate.
+//! and `best_right + best_left < t_min`. A side without one *abstains* and the
+//! hit goes to the exact gate.
+//!
+//! The window is not fixed. Every lane reads 64 bases to the right and 96 to the
+//! left; a side that has not found its `J` there is carried on one word (32
+//! bases) at a time, up to [`Words`] (round 111). None of the three points above
+//! uses the window's length, so a side that certifies later is certified by the
+//! same argument, and `best` only grows along the walk: once
+//! `best_right + best_left >= t_min` the hit goes to the exact gate whatever
+//! the rest of the walk holds, and carrying it on is pointless.
 //!
 //! Reference bases past the end of the sequence read as padding. They only
 //! lengthen the `u` walk, which cannot lower `best`; the query padding is
@@ -50,8 +58,25 @@
 use crate::sequence::{A_NT, C_NT, E_NT, L_NT, N_NT, NUC, T_NT, X_NT};
 
 /// 32-base groups of padding in front of and behind every packed plane, so a
-/// lane can read its six reference and seven query groups without a bounds test.
-pub const PADG: u32 = 4;
+/// lane can read its six reference and seven query groups, and the two more on
+/// either side that a carried bound may ask for, without a bounds test.
+pub const PADG: u32 = 6;
+/// Words (32 bases each) every lane reads on the right and on the left.
+pub const RIGHT_WORDS: u32 = 2;
+pub const LEFT_WORDS: u32 = 3;
+/// The most words a side can be carried to. [`PADG`] and the 32-bit arithmetic
+/// are sized for these.
+pub const RIGHT_WORDS_MAX: u32 = 4;
+pub const LEFT_WORDS_MAX: u32 = 5;
+
+/// How far an undecided side is carried: `(right, left)` words in all, between
+/// the static `(RIGHT_WORDS, LEFT_WORDS)` and `(RIGHT_WORDS_MAX, LEFT_WORDS_MAX)`.
+pub type Words = (u32, u32);
+
+/// One side's walk so far: the class-score prefix sum at the end of the last
+/// block, its running maximum, the bound `best`, and whether the side is
+/// certified (a terminal base or a certified drop was reached).
+pub type Side = (i32, i32, i32, bool);
 /// Bases the bound reads to the right of a hit (the hit position included).
 #[cfg(feature = "gate-sieve")]
 pub const RIGHT: u32 = 64;
@@ -63,7 +88,7 @@ pub const LEFT: u32 = 96;
 #[cfg(any(test, feature = "gate-sieve"))]
 pub const REF_FILL: u32 = C_NT as u32;
 /// Largest `xdrop` and class score the bound's 32-bit arithmetic is used for.
-/// 96 bases of scores this size stay below 2^27.
+/// 160 bases of scores this size stay below 2^28.
 #[cfg(any(test, feature = "gate-sieve"))]
 const MAX_ABS: i32 = 1 << 20;
 
@@ -293,8 +318,7 @@ fn word(
 ///
 /// `o` is the hit's bit inside reference group `r3`; `qry_pk`/`qry_bad` point
 /// at the query group aligned with `r0` and `qs` is the shift between them.
-/// Returns whether each side is certified and its bound: `(right certified,
-/// left certified, right best, left best)`.
+/// Returns the right and the left side after the static words.
 ///
 /// # Safety
 /// `qry_pk` and `qry_bad` must be readable for seven elements.
@@ -316,7 +340,7 @@ pub unsafe fn bound_words(
     b: i32,
     bias: i32,
     xdrop: i32,
-) -> (bool, bool, i32, i32) {
+) -> (Side, Side) {
     let (q0, q1, q2, q3, q4, q5, q6) = unsafe {
         (
             *qry_pk,
@@ -412,7 +436,128 @@ pub unsafe fn bound_words(
         bias,
         xdrop,
     );
-    (right.3, left.3, right.2, left.2)
+    (right, left)
+}
+
+/// Mismatch, transition and valid bits of the 32 bases that start at bit `o` of
+/// reference group `r`, against the query laid over them: the query base under
+/// bit 0 of reference group `r` is bit `qs` of query group `q`.
+///
+/// It is `funnel(planes(r), planes(r + 1), o)`, which is how the static words
+/// are formed, taken straight from the packed words: 32 bits of a stream that
+/// start at bit `qs + o` are one funnel over two groups, not two funnels over
+/// three, and the bitwise planes commute with the funnel.
+///
+/// # Safety
+/// The planes must hold reference groups `r..=r + 1` and query groups
+/// `q..=q + 2`.
+#[inline(always)]
+unsafe fn stream(
+    ref_pk: *const u64,
+    qry_pk: *const u64,
+    qry_bad: *const u32,
+    r: usize,
+    q: usize,
+    o: u32,
+    qs: u32,
+) -> (u32, u32, u32) {
+    let s = qs + o;
+    let (q, s) = (q + (s >> 5) as usize, s & 31);
+    unsafe {
+        let (r0, r1) = (*ref_pk.add(r), *ref_pk.add(r + 1));
+        let (q0, q1) = (*qry_pk.add(q), *qry_pk.add(q + 1));
+        let xh = funnel(r0 as u32, r1 as u32, o) ^ funnel(q0 as u32, q1 as u32, s);
+        let xl = funnel((r0 >> 32) as u32, (r1 >> 32) as u32, o)
+            ^ funnel((q0 >> 32) as u32, (q1 >> 32) as u32, s);
+        (
+            xh | xl,
+            xh & !xl,
+            !funnel(*qry_bad.add(q), *qry_bad.add(q + 1), s),
+        )
+    }
+}
+
+/// Word `w` (counted from 0) of the right side, for a side carried past the
+/// static words: the hit's window starts at reference group `rg` and query
+/// group `qg` ([`locate`]), and stream word `w` starts at bit `o` of group
+/// `3 + w` of it. A side that is already certified is returned as it is.
+///
+/// # Safety
+/// The planes must hold groups `rg + 3 + w ..= rg + 4 + w` and
+/// `qg + 3 + w ..= qg + 5 + w`, which [`PADG`] guarantees up to
+/// [`RIGHT_WORDS_MAX`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn right_word(
+    ref_pk: *const u64,
+    qry_pk: *const u64,
+    qry_bad: *const u32,
+    rg: u32,
+    qg: u32,
+    o: u32,
+    qs: u32,
+    w: u32,
+    st: Side,
+    um: i32,
+    a: i32,
+    b: i32,
+    bias: i32,
+    xdrop: i32,
+) -> Side {
+    let (r, q) = ((rg + 3 + w) as usize, (qg + 3 + w) as usize);
+    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs) };
+    // An uncertified side has met no terminal base, so it is still alive.
+    word(st, !st.3, mm, tr, vd, um, a, b, bias, xdrop).0
+}
+
+/// Word `w` (counted from 0) of the left side, as [`right_word`]: it starts at
+/// bit `o` of group `2 - w` of the window, reversed so that the extension order
+/// ascends from bit 0.
+///
+/// # Safety
+/// The planes must hold groups `rg + 2 - w ..= rg + 3 - w` and
+/// `qg + 2 - w ..= qg + 4 - w`, which [`PADG`] guarantees up to
+/// [`LEFT_WORDS_MAX`].
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn left_word(
+    ref_pk: *const u64,
+    qry_pk: *const u64,
+    qry_bad: *const u32,
+    rg: u32,
+    qg: u32,
+    o: u32,
+    qs: u32,
+    w: u32,
+    st: Side,
+    um: i32,
+    a: i32,
+    b: i32,
+    bias: i32,
+    xdrop: i32,
+) -> Side {
+    let (r, q) = ((rg + 2 - w) as usize, (qg + 2 - w) as usize);
+    let (mm, tr, vd) = unsafe { stream(ref_pk, qry_pk, qry_bad, r, q, o, qs) };
+    word(
+        st,
+        !st.3,
+        mm.reverse_bits(),
+        tr.reverse_bits(),
+        vd.reverse_bits(),
+        um,
+        a,
+        b,
+        bias,
+        xdrop,
+    )
+    .0
+}
+
+/// Whether a side is worth one more word: it has not certified, and the two
+/// bounds do not already send the hit to the exact gate.
+#[inline(always)]
+pub fn carry(side: Side, other: Side, t_min: i32) -> bool {
+    !side.3 && side.2.wrapping_add(other.2) < t_min
 }
 
 /// Where a hit's packed groups are: the first of its six reference groups, the
@@ -445,7 +590,7 @@ pub unsafe fn bound_at(
     b: i32,
     bias: i32,
     xdrop: i32,
-) -> (bool, bool, i32, i32) {
+) -> (Side, Side) {
     let (rg, qg, o, qs) = locate(ref_loc, query_loc);
     unsafe {
         let r = ref_pk.add(rg as usize);
@@ -471,9 +616,8 @@ pub unsafe fn bound_at(
 
 /// Whether the bound sends a hit to the exact gate.
 #[inline(always)]
-pub fn passes(bound: (bool, bool, i32, i32), t_min: i32) -> bool {
-    let (right_done, left_done, right, left) = bound;
-    !right_done || !left_done || right.wrapping_add(left) >= t_min
+pub fn passes(right: Side, left: Side, t_min: i32) -> bool {
+    !right.3 || !left.3 || right.2.wrapping_add(left.2) >= t_min
 }
 
 /// Host model of one lane: whether the hit is a candidate for the exact gate.
@@ -488,15 +632,19 @@ pub fn candidate(
     classes: &Classes,
     xdrop: i32,
     t_min: i32,
+    words: Words,
 ) -> bool {
-    passes(
-        lane_bound(ref_pk, qry_pk, qry_bad, ref_loc, query_loc, classes, xdrop),
-        t_min,
-    )
+    let (right, left) = lane_bound(
+        ref_pk, qry_pk, qry_bad, ref_loc, query_loc, classes, xdrop, t_min, words,
+    );
+    passes(right, left, t_min)
 }
 
-/// Host model of one lane's bound, bounds-checked.
+/// Host model of one lane's bound, bounds-checked: the static words, then the
+/// right side and then the left carried on while [`carry`] says so, which is
+/// what a lane of the device does.
 #[cfg(any(test, feature = "gate-sieve"))]
+#[allow(clippy::too_many_arguments)]
 pub fn lane_bound(
     ref_pk: &[u64],
     qry_pk: &[u64],
@@ -505,31 +653,42 @@ pub fn lane_bound(
     query_loc: u32,
     classes: &Classes,
     xdrop: i32,
-) -> (bool, bool, i32, i32) {
-    let (rg, qg, _, _) = locate(ref_loc, query_loc);
+    t_min: i32,
+    words: Words,
+) -> (Side, Side) {
+    let (rg, qg, o, qs) = locate(ref_loc, query_loc);
     assert!(
-        rg as usize + 6 <= ref_pk.len(),
+        (RIGHT_WORDS..=RIGHT_WORDS_MAX).contains(&words.0)
+            && (LEFT_WORDS..=LEFT_WORDS_MAX).contains(&words.1),
+        "words out of range"
+    );
+    assert!(
+        rg + 3 >= words.1 && (rg + 4 + words.0) as usize <= ref_pk.len(),
         "reference groups out of range"
     );
     assert!(
-        qg as usize + 7 <= qry_pk.len() && qry_pk.len() == qry_bad.len(),
+        qg + 3 >= words.1
+            && (qg + 5 + words.0) as usize <= qry_pk.len()
+            && qry_pk.len() == qry_bad.len(),
         "query groups out of range"
     );
     let (um, a, b, bias) = classes.kernel_args();
-    // SAFETY: the six reference and seven query groups were just checked.
+    // SAFETY: the groups of the static window and of every carried word were
+    // just checked.
     unsafe {
-        bound_at(
-            ref_pk.as_ptr(),
-            qry_pk.as_ptr(),
-            qry_bad.as_ptr(),
-            ref_loc,
-            query_loc,
-            um,
-            a,
-            b,
-            bias,
-            xdrop,
-        )
+        let (rp, qp, bp) = (ref_pk.as_ptr(), qry_pk.as_ptr(), qry_bad.as_ptr());
+        let (mut right, mut left) = bound_at(rp, qp, bp, ref_loc, query_loc, um, a, b, bias, xdrop);
+        let mut w = RIGHT_WORDS;
+        while w < words.0 && carry(right, left, t_min) {
+            right = right_word(rp, qp, bp, rg, qg, o, qs, w, right, um, a, b, bias, xdrop);
+            w += 1;
+        }
+        let mut w = LEFT_WORDS;
+        while w < words.1 && carry(left, right, t_min) {
+            left = left_word(rp, qp, bp, rg, qg, o, qs, w, left, um, a, b, bias, xdrop);
+            w += 1;
+        }
+        (right, left)
     }
 }
 
@@ -768,8 +927,10 @@ mod tests {
         hits: u64,
         /// Hits with both sides certified.
         certified: u64,
-        /// Hits the bound rejects at a threshold of 3000.
+        /// Hits the static window rejects at a threshold of 3000.
         rejected: u64,
+        /// Hits the bound rejects at 3000 when carried to its longest window.
+        rejected_carried: u64,
         /// A certified side below the exact side, or a kept hit rejected.
         violations: u64,
     }
@@ -816,28 +977,103 @@ mod tests {
                 } else {
                     rng.below(rlen as u64 + 1) as u32
                 };
-                let (dr, dl, br, bl) = lane_bound(&rpk, &qpk, &qbad, rl, ql, &cls, *xdrop);
                 let (er, el) = exact_sides(&renc, &qenc, rl, ql, sub, *xdrop);
                 tally.hits += 1;
-                tally.certified += (dr && dl) as u64;
-                let mut wrong = (dr && br < er) || (dl && bl < el);
+                // The static window, then the bound carried one and two words
+                // further. How far a lane goes depends on the threshold, so every
+                // threshold is its own walk.
+                let mut wrong = false;
+                let mut said = String::new();
                 for t_min in [er + el, 3000, 2400, 1] {
-                    let cand = passes((dr, dl, br, bl), t_min);
-                    wrong |= er + el >= t_min && !cand;
-                    tally.rejected += (t_min == 3000 && !cand) as u64;
+                    let mut rejected_before = false;
+                    for words in [
+                        (RIGHT_WORDS, LEFT_WORDS),
+                        (3, 4),
+                        (RIGHT_WORDS_MAX, LEFT_WORDS_MAX),
+                    ] {
+                        let (right, left) =
+                            lane_bound(&rpk, &qpk, &qbad, rl, ql, &cls, *xdrop, t_min, words);
+                        let cand = passes(right, left, t_min);
+                        // A certified side bounds the exact side; a hit the exact
+                        // gate keeps is a candidate; and carrying the bound on
+                        // never takes back a rejection.
+                        let bad = (right.3 && right.2 < er)
+                            || (left.3 && left.2 < el)
+                            || (er + el >= t_min && !cand)
+                            || (rejected_before && cand);
+                        if bad && said.is_empty() {
+                            said = format!("{right:?} {left:?} words {words:?} t_min {t_min}");
+                        }
+                        wrong |= bad;
+                        rejected_before = !cand;
+                        if t_min == 3000 && words == (RIGHT_WORDS, LEFT_WORDS) {
+                            tally.certified += (right.3 && left.3) as u64;
+                            tally.rejected += !cand as u64;
+                        }
+                        if t_min == 3000 && words == (RIGHT_WORDS_MAX, LEFT_WORDS_MAX) {
+                            tally.rejected_carried += !cand as u64;
+                        }
+                    }
                 }
                 if wrong {
                     tally.violations += 1;
                     if tamper.is_none() {
                         panic!(
-                            "bound ({dr}, {dl}, {br}, {bl}) under the exact sides ({er}, {el}) \
-                             at ({rl}, {ql}), xdrop {xdrop}, case {case}"
+                            "bound {said} under the exact sides ({er}, {el}) at ({rl}, {ql}), \
+                             xdrop {xdrop}, case {case}"
                         );
                     }
                 }
             }
         }
         tally
+    }
+
+    /// The static words are formed from `planes` of whole groups, the carried
+    /// ones by `stream` straight from the packed words. Both must be the same
+    /// 32 bits: here every word a side can have is taken both ways, over random
+    /// packed sequence with bad bases, for every offset pair.
+    #[test]
+    fn a_carried_word_is_the_stream_the_static_words_come_from() {
+        let mut rng = Rng(0x0123_4567_89ab_cdef);
+        let base = |rng: &mut Rng| {
+            if rng.chance(60) {
+                b"NacgtRY"[rng.below(7) as usize]
+            } else {
+                b"ACGT"[rng.below(4) as usize]
+            }
+        };
+        let r: Vec<u8> = (0..700).map(|_| base(&mut rng)).collect();
+        let q: Vec<u8> = (0..700).map(|_| base(&mut rng)).collect();
+        let (rpk, _) = pack(&encode(&r), REF_FILL);
+        let (qpk, qbad) = pack(&encode(&q), REF_FILL);
+        for _ in 0..20_000 {
+            let (rl, ql) = (rng.below(701) as u32, rng.below(701) as u32);
+            let (rg, qg, o, qs) = locate(rl, ql);
+            // Group `i` of the window against the query, as `bound_words` has it.
+            let group = |i: i64| {
+                let (r, q) = ((rg as i64 + i) as usize, (qg as i64 + i) as usize);
+                planes(rpk[r], qpk[q], qpk[q + 1], qbad[q], qbad[q + 1], qs)
+            };
+            for i in -2i64..=6 {
+                let (m0, t0, v0) = group(i);
+                let (m1, t1, v1) = group(i + 1);
+                let want = (funnel(m0, m1, o), funnel(t0, t1, o), funnel(v0, v1, o));
+                // SAFETY: `PADG` groups of padding surround both planes.
+                let got = unsafe {
+                    stream(
+                        rpk.as_ptr(),
+                        qpk.as_ptr(),
+                        qbad.as_ptr(),
+                        (rg as i64 + i) as usize,
+                        (qg as i64 + i) as usize,
+                        o,
+                        qs,
+                    )
+                };
+                assert_eq!(got, want, "group {i} at ({rl}, {ql}), o {o}, qs {qs}");
+            }
+        }
     }
 
     #[test]
@@ -847,6 +1083,8 @@ mod tests {
         // rejected, as they are on real sequence.
         assert!(tally.certified * 10 > tally.hits * 8, "{tally:?}");
         assert!(tally.rejected * 10 > tally.hits * 6, "{tally:?}");
+        // Carrying the bound on must reject some of what the static window left.
+        assert!(tally.rejected_carried > tally.rejected, "{tally:?}");
     }
 
     /// The same run notices class scores that are too low: a match scored as

@@ -167,6 +167,17 @@ grep -q '^#sieve guard' "$W/defaults.1.err" && { echo "defaults: the guard held 
 ENVV="HSPZ_REF_BUCKETS=1" arm buckets-iupac-in-query    off "$R" "$W/qry_iupac.fa"
 ENVV="HSPZ_REF_BUCKETS=1" arm buckets-satellite-guard   on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 
+# Round 111: an undecided side of the bound is carried on to 128 right / 160 left bases by default. These arms run
+# the static window of rounds 104-110 and the middle setting; every other arm above runs the default with the host
+# recomputing each hit's walk.
+ENVV="HSPZ_SIEVE_WORDS=2,3" arm window-static             on  "$R" "$Q"
+ENVV="HSPZ_SIEVE_WORDS=2,3" arm window-static-2400        on  "$R" "$Q" -H 2400
+ENVV="HSPZ_SIEVE_WORDS=3,4" arm window-middle             on  "$R" "$Q"
+ENVV="HSPZ_SIEVE_WORDS=3,4 HSPZ_REF_BUCKETS=1" arm window-middle-buckets     on  "$R" "$Q" -C 60000
+ENVV="HSPZ_SIEVE_WORDS=2,3" arm window-static-satellite   on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q 'an undecided side carried to 128 right, 160 left' "$W/defaults.1.err" || { echo "defaults: the bound is not carried to its longest window"; fail=$((fail+1)); }
+grep -q 'an undecided side carried' "$W/window-static.1.err" && { echo "window-static: the static window was not used"; fail=$((fail+1)); }
+
 # Round 110: seeds expanded by runs of 32 per warp. `check` runs the per-seed kernel and the group kernel on each
 # chunk and stops at the first anchor that differs; small chunks cut the runs at arbitrary seeds.
 ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check           on  "$R" "$Q"

@@ -1135,8 +1135,12 @@ pub fn unit_device_bytes(
 
     // `gate-sieve`: 2-bit planes of the reference, 2-bit planes plus a bad
     // plane of both query strands, and the count diagnostic's candidate words.
+    // A plane has one group per 32 bases, one more, and the padding at both ends.
+    const PLANE_EXTRA: u128 = 1 + 2 * crate::gpu::sieve::PADG as u128;
     let sieve_b: u128 = if cfg!(feature = "gate-sieve") {
-        8 * (u128::from(ref_bp) / 32 + 9) + 2 * 12 * (u128::from(query_bp) / 32 + 9) + h.div_ceil(8)
+        8 * (u128::from(ref_bp) / 32 + PLANE_EXTRA)
+            + 2 * 12 * (u128::from(query_bp) / 32 + PLANE_EXTRA)
+            + h.div_ceil(8)
     } else {
         0
     };

@@ -1314,6 +1314,7 @@ pub mod device {
             0,
             0,
             0,
+            0,
             core::ptr::null_mut(),
         );
     }
@@ -1364,6 +1365,7 @@ pub mod device {
             0,
             0,
             0,
+            0,
             core::ptr::null_mut(),
         );
     }
@@ -1398,6 +1400,7 @@ pub mod device {
         ub: i32,
         ubias: i32,
         count: u32,
+        words: u32,
         mut cand_bits: DisjointSlice<u32>,
     ) {
         score_gate(
@@ -1423,6 +1426,7 @@ pub mod device {
             ub,
             ubias,
             count,
+            words,
             cand_bits.as_mut_ptr(),
         );
     }
@@ -1451,6 +1455,7 @@ pub mod device {
         ub: i32,
         ubias: i32,
         count: u32,
+        words: u32,
         mut cand_bits: DisjointSlice<u32>,
     ) {
         score_gate(
@@ -1476,6 +1481,7 @@ pub mod device {
             ub,
             ubias,
             count,
+            words,
             cand_bits.as_mut_ptr(),
         );
     }
@@ -1560,6 +1566,7 @@ pub mod device {
         ub: i32,
         ubias: i32,
         count: u32,
+        words: u32,
         mut cand_bits: DisjointSlice<u32>,
     ) {
         score_gate(
@@ -1585,6 +1592,7 @@ pub mod device {
             ub,
             ubias,
             count,
+            words,
             cand_bits.as_mut_ptr(),
         );
     }
@@ -1613,6 +1621,7 @@ pub mod device {
         ub: i32,
         ubias: i32,
         count: u32,
+        words: u32,
         mut cand_bits: DisjointSlice<u32>,
     ) {
         score_gate(
@@ -1638,6 +1647,7 @@ pub mod device {
             ub,
             ubias,
             count,
+            words,
             cand_bits.as_mut_ptr(),
         );
     }
@@ -1732,6 +1742,9 @@ pub mod device {
         ub: i32,
         ubias: i32,
         count: u32,
+        // Round 111: how far an undecided side of the bound is carried, as
+        // `right words | left words << 8` (`sieve::Words`).
+        words: u32,
         cand_bits: *mut u32,
     ) {
         // The anchor no longer travels through shared memory (round 58): the warp
@@ -1805,13 +1818,13 @@ pub mod device {
                 // SAFETY: the host packed both planes for these sequences, and a
                 // lane past `num_hits` holds the chunk's first anchor.
                 #[cfg(not(feature = "gate-sieve"))]
-                let bound = unsafe {
+                let (mut right, mut left) = unsafe {
                     sieve::bound_at(
                         ref_pk, qry_pk, qry_bad, my_lo, my_hi, um, ua, ub, ubias, xdrop,
                     )
                 };
                 #[cfg(feature = "gate-sieve")]
-                let bound = unsafe {
+                let (mut right, mut left) = unsafe {
                     if sieve_mode == SIEVE_GATHER {
                         let (r0, r1, r2, r3, r4, r5) = sieve_gather(w, lane_id, my_lo, ref_pk);
                         let (_, qg, o, qs) = sieve::locate(my_lo, my_hi);
@@ -1838,10 +1851,44 @@ pub mod device {
                         )
                     }
                 };
-                rem = warp::ballot_sync(
-                    FULL_MASK,
-                    my_idx < num_hits && sieve::passes(bound, hspthresh),
-                );
+                // Round 111: a side that has not certified inside the static
+                // window is carried on, one word at a time. A lane whose side is
+                // certified, or whose two bounds already reach the threshold, has
+                // nothing to carry; neither has a lane past the chunk's hits. No
+                // lane needs another lane's data for this, so each walks as far
+                // as its own hit asks and the warp waits for the longest walk.
+                let live = my_idx < num_hits;
+                if live && sieve::carry(right, left, hspthresh) {
+                    let (rg, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                    let mut word = sieve::RIGHT_WORDS;
+                    while word < (words & 0xff) && sieve::carry(right, left, hspthresh) {
+                        // SAFETY: the planes carry `sieve::PADG` groups of padding
+                        // for words up to `sieve::RIGHT_WORDS_MAX`, which the host
+                        // never exceeds.
+                        right = unsafe {
+                            sieve::right_word(
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, right, um, ua, ub,
+                                ubias, xdrop,
+                            )
+                        };
+                        word += 1;
+                    }
+                }
+                if live && sieve::carry(left, right, hspthresh) {
+                    let (rg, qg, o, qs) = sieve::locate(my_lo, my_hi);
+                    let mut word = sieve::LEFT_WORDS;
+                    while word < (words >> 8) && sieve::carry(left, right, hspthresh) {
+                        // SAFETY: as above, up to `sieve::LEFT_WORDS_MAX`.
+                        left = unsafe {
+                            sieve::left_word(
+                                ref_pk, qry_pk, qry_bad, rg, qg, o, qs, word, left, um, ua, ub,
+                                ubias, xdrop,
+                            )
+                        };
+                        word += 1;
+                    }
+                }
+                rem = warp::ballot_sync(FULL_MASK, live && sieve::passes(right, left, hspthresh));
                 if count != 0 && lane_id == 0 {
                     // SAFETY: `base < limit <= num_hits`, one word per chunk.
                     unsafe { *cand_bits.add((base / CHUNK) as usize) = rem };

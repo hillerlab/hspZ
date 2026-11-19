@@ -3450,6 +3450,7 @@ impl Engine {
                 if let Some((um, ua, ub, ubias)) = sieve_args {
                     let strand = rev as usize;
                     let count = (self.sieve.count || sieve_sample) as u32;
+                    let words = self.sieve.words.0 | self.sieve.words.1 << 8;
                     if !bucket_pass {
                         // SAFETY: the gate overwrites every word of the chunk.
                         unsafe {
@@ -3490,6 +3491,7 @@ impl Engine {
                                 ub,
                                 ubias,
                                 count,
+                                words,
                                 &mut self.sieve.cand_bits,
                             )?
                         };
@@ -4579,6 +4581,9 @@ struct GateSieve {
     /// `Classes::kernel_args` for the unit in place; `None` runs the plain gate.
     args: Option<(i32, i32, i32, i32)>,
     classes: Option<sieve::Classes>,
+    /// Round 111: how far an undecided side of the bound is carried
+    /// (`HSPZ_SIEVE_WORDS=R,L`).
+    words: sieve::Words,
     /// The state last printed under `--time`, so that a run prints it once per
     /// change rather than once per unit.
     said: String,
@@ -4672,6 +4677,41 @@ fn sieve_request() -> (bool, Option<bool>) {
     })
 }
 
+/// `HSPZ_SIEVE_WORDS=R,L`: the words (32 bases each) the bound may read on the
+/// right and on the left of a hit. Every lane reads 2 and 3; a side that has not
+/// certified by then is carried on up to `R` and `L`. Unset is the longest
+/// window, 4 and 5 (round 111); `2,3` is the static window of rounds 104 to 110.
+/// A value outside those ranges is reported once and ignored.
+#[cfg(feature = "gate-sieve")]
+fn sieve_words() -> sieve::Words {
+    const DEFAULT: sieve::Words = (sieve::RIGHT_WORDS_MAX, sieve::LEFT_WORDS_MAX);
+    static WORDS: std::sync::OnceLock<sieve::Words> = std::sync::OnceLock::new();
+    *WORDS.get_or_init(|| {
+        let Ok(text) = std::env::var("HSPZ_SIEVE_WORDS") else {
+            return DEFAULT;
+        };
+        let parsed = text.split_once(',').and_then(|(r, l)| {
+            let (r, l) = (r.trim().parse::<u32>().ok()?, l.trim().parse::<u32>().ok()?);
+            ((sieve::RIGHT_WORDS..=sieve::RIGHT_WORDS_MAX).contains(&r)
+                && (sieve::LEFT_WORDS..=sieve::LEFT_WORDS_MAX).contains(&l))
+            .then_some((r, l))
+        });
+        parsed.unwrap_or_else(|| {
+            eprintln!(
+                "warning: HSPZ_SIEVE_WORDS={text:?} is not R,L with R in {}..={} and L in {}..={}; \
+                 using {},{}",
+                sieve::RIGHT_WORDS,
+                sieve::RIGHT_WORDS_MAX,
+                sieve::LEFT_WORDS,
+                sieve::LEFT_WORDS_MAX,
+                DEFAULT.0,
+                DEFAULT.1,
+            );
+            DEFAULT
+        })
+    })
+}
+
 #[cfg(feature = "gate-sieve")]
 impl GateSieve {
     fn new(stream: &CudaStream, sub_mat: &[i32]) -> Result<Self, DriverError> {
@@ -4690,6 +4730,7 @@ impl GateSieve {
                 qry_bad: [uninitialized(stream, 0)?, uninitialized(stream, 0)?],
                 args: None,
                 classes: None,
+                words: sieve_words(),
                 said: String::new(),
                 cand_bits: uninitialized(stream, 1)?,
                 guard: SieveGuard::new(sieve_guard_period()),
@@ -4786,12 +4827,21 @@ impl Engine {
         };
         let state = match &decision {
             Ok(c) => format!(
-                "on — match {}, transition {}, transversion {}; {} right + {} left bases{}",
+                "on — match {}, transition {}, transversion {}; {} right + {} left bases{}{}",
                 c.um,
                 c.uti,
                 c.utv,
                 sieve::RIGHT,
                 sieve::LEFT,
+                if self.sieve.words == (sieve::RIGHT_WORDS, sieve::LEFT_WORDS) {
+                    String::new()
+                } else {
+                    format!(
+                        ", an undecided side carried to {} right, {} left",
+                        32 * self.sieve.words.0,
+                        32 * self.sieve.words.1
+                    )
+                },
                 match self.sieve.gather {
                     Some(true) => "; gathered reference",
                     Some(false) => "",
@@ -4908,6 +4958,7 @@ impl Engine {
 
         let strand = rev as usize;
         let (xdrop, t_min, sub_mat) = (self.xdrop, self.gate_thresh, &self.sieve.sub_mat);
+        let carried = self.sieve.words;
         let threads = std::thread::available_parallelism()
             .map_or(1, |t| t.get())
             .min(16);
@@ -4932,6 +4983,7 @@ impl Engine {
                                 &classes,
                                 xdrop,
                                 t_min,
+                                carried,
                             );
                             let (right, left) = sieve::exact_sides(
                                 &host.ref_enc,
