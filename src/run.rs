@@ -1289,6 +1289,8 @@ struct TimeFooter<'a> {
     prefetch: bool,
     est_query_ahead: u64,
     pack_ahead: bool,
+    est_pairs_at_once: u64,
+    pairs_at_once: bool,
 }
 
 impl TimeFooter<'_> {
@@ -1365,6 +1367,11 @@ impl TimeFooter<'_> {
             "  query packs ahead: {} ({:.0} MiB per worker, counted in the estimate when on)",
             self.pack_ahead,
             mib(self.est_query_ahead),
+        );
+        eprintln!(
+            "  seed-table pairs at once: {} ({:.0} MiB per worker, counted in the estimate when on)",
+            self.pairs_at_once,
+            mib(self.est_pairs_at_once),
         );
     }
 }
@@ -2533,7 +2540,14 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     let t = Instant::now();
     let devices = crate::gpu::device_count().max(1);
     let probe = args.gpus.max(1).min(devices);
-    let free = crate::gpu::min_free_bytes(probe)?;
+    // Held to the end of the run, so that each worker finds its device's
+    // context alive instead of building it again. They are opened after the
+    // inputs are in memory. Opening them on a thread during the read was
+    // tried: in some sessions the read beside it took a second longer and the
+    // wall did not move, in others it was worth about 1% at eight cards, and
+    // on one card it cost 0.2 s. Not enough for the exception it needs to "a
+    // bad replay fails before it costs a context".
+    let (_devices_open, free) = crate::gpu::open_devices(probe)?;
     // `min(gpus, n_records)` overcharges when the plan has fewer bins than records;
     // tighten it only if that is ever measured to reject a run that would have fit.
     // HSPZ_WORKER_CAP=units may start up to `--gpus` workers, so the budget assumes that many.
@@ -2894,9 +2908,22 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
     seed_producers(std::env::var("HSPZ_SEED_PRODUCERS").ok().as_deref(), 1, 1)?;
     // The estimate that the decision was made on, so a run can be checked
     // against its own measured RSS without re-deriving the model.
+    // The last rung: all the pairs of a reference build at once.
+    let pairs_at_once = seed::set_pairs_at_once(plan::host_pairs_at_once(
+        &est,
+        &visit_bins,
+        prefetch,
+        pack_ahead,
+        host_budget,
+    ));
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch)
         + if pack_ahead {
             plan::host_query_ahead_bytes(&est, &visit_bins)
+        } else {
+            0
+        }
+        + if pairs_at_once {
+            plan::host_pairs_at_once_bytes(&est, &visit_bins)
         } else {
             0
         };
@@ -3327,6 +3354,8 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             prefetch,
             est_query_ahead: est.query_ahead,
             pack_ahead,
+            est_pairs_at_once: est.pairs_at_once,
+            pairs_at_once,
         }
         .print();
     }
@@ -3866,7 +3895,8 @@ fn run_batch(
     // scope — so replan each job here and reject on any difference (or on
     // insufficient capacity, which never lowers the semantic cap).
     let exec_probe = workers_req.min(devices);
-    let exec_free = crate::gpu::min_free_bytes(exec_probe)?;
+    // Held to the end of the batch, as in a single run.
+    let (_devices_open, exec_free) = crate::gpu::open_devices(exec_probe)?;
     let exec_upper = match worker_cap {
         WorkerCap::Bins => workers_req.min(ref_meta.len().max(1)),
         WorkerCap::Units => workers_req,
@@ -4179,9 +4209,22 @@ fn run_batch(
     // Refuse a bad value here, before any unit runs; each pass resolves the count
     // for its own slot size.
     seed_producers(std::env::var("HSPZ_SEED_PRODUCERS").ok().as_deref(), 1, 1)?;
+    // Round 112, the last rung: all the pairs of a reference build at once.
+    let pairs_at_once = seed::set_pairs_at_once(plan::host_pairs_at_once(
+        &est,
+        &visit_bins,
+        prefetch,
+        pack_ahead,
+        host_budget,
+    ));
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch)
         + if pack_ahead {
             plan::host_query_ahead_bytes(&est, &visit_bins)
+        } else {
+            0
+        }
+        + if pairs_at_once {
+            plan::host_pairs_at_once_bytes(&est, &visit_bins)
         } else {
             0
         };
@@ -4703,6 +4746,8 @@ fn run_batch(
             prefetch,
             est_query_ahead: est.query_ahead,
             pack_ahead,
+            est_pairs_at_once: est.pairs_at_once,
+            pairs_at_once,
         }
         .print();
         for (j, a) in job_audits.iter().flatten().enumerate() {

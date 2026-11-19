@@ -180,6 +180,203 @@ impl SeedTable {
         }
     }
 
+    /// [`build`](Self::build) by partitions that fit a cache (round 112),
+    /// byte-identical to it.
+    ///
+    /// The two-pass builder below makes three random DRAM accesses per position:
+    /// a private 4^k count table, the cursor table and `pos_table` itself. With
+    /// eight builds at once (eight workers starting on an A100 node) that is what
+    /// they all wait for: 7 to 9 s per reference bin.
+    ///
+    /// Here every position is first written as a `(low k-mer bits, position)`
+    /// pair into the stream of its partition, the k-mer's high bits: at most 256
+    /// sequential streams per thread. Each partition is then sorted on its own:
+    /// a count table of the low bits (256 KiB for 12 care positions) and the few
+    /// MiB of `pos_table` that the partition owns both stay in cache.
+    ///
+    /// The pairs are 8 bytes per position, so they are not all held at once:
+    /// the partitions are taken in rounds of consecutive partitions whose pairs
+    /// fit `max_pairs` (a partition larger than that is a round of its own), and
+    /// every round scans the sequence again for its own partitions. The scan is
+    /// the cheap part.
+    ///
+    /// The order inside a k-mer's bucket is ascending position, as `build`
+    /// leaves it: thread ranges ascend, a partition's stream is laid out thread
+    /// by thread, each thread appends in position order, and the counting sort
+    /// is stable.
+    fn build_partitioned(
+        seq: &[u8],
+        shape: &Shape,
+        step: usize,
+        threads: usize,
+        start_offset: usize,
+        num_steps: usize,
+        max_pairs: usize,
+    ) -> Self {
+        let kbits = 2 * shape.kmer_size as u32;
+        // At most 256 partitions; at least 16 low bits when the k-mer has them.
+        let low_bits = kbits.min(16).max(kbits.saturating_sub(8));
+        let parts = 1usize << (kbits - low_bits);
+        let low_mask = (1u32 << low_bits) - 1;
+        let nk = 1usize << kbits;
+
+        let per = num_steps.div_ceil(threads);
+        let ranges: Vec<(usize, usize)> = (0..threads)
+            .map(|t| (t * per, ((t + 1) * per).min(num_steps)))
+            .collect();
+
+        // Pass A1: how many positions each thread sends to each partition.
+        let counts: Vec<Vec<u64>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = ranges
+                .iter()
+                .map(|&(lo, hi)| {
+                    scope.spawn(move || {
+                        let mut c = vec![0u64; parts];
+                        for_each_kmer(seq, shape, start_offset, step, lo, hi, |kmer, _| {
+                            c[(kmer >> low_bits) as usize] += 1;
+                        });
+                        c
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("seed count worker panicked"))
+                .collect()
+        });
+
+        // Where each partition's positions go in `pos_table`.
+        let mut part_start = vec![0u64; parts + 1];
+        for p in 0..parts {
+            part_start[p + 1] = part_start[p] + counts.iter().map(|c| c[p]).sum::<u64>();
+        }
+        let total_u64 = part_start[parts];
+        assert!(
+            total_u64 <= u64::from(u32::MAX),
+            "more than u32::MAX indexed positions in one reference bin"
+        );
+        let total = total_u64 as usize;
+
+        // Rounds of consecutive partitions whose pairs fit `max_pairs`.
+        let mut rounds: Vec<(usize, usize)> = Vec::new();
+        let mut first = 0;
+        while first < parts {
+            let mut end = first + 1;
+            while end < parts && part_start[end + 1] - part_start[first] <= max_pairs as u64 {
+                end += 1;
+            }
+            rounds.push((first, end));
+            first = end;
+        }
+        let widest = rounds
+            .iter()
+            .map(|&(a, b)| (part_start[b] - part_start[a]) as usize)
+            .max()
+            .unwrap_or(0);
+
+        let mut index_table = vec![0u32; nk];
+        let mut pos_table = vec![0u32; total];
+        // `low bits << 32 | position`, one round's worth.
+        let mut pairs = vec![0u64; widest];
+        let (idx, pos) = (
+            index_table.as_mut_ptr() as usize,
+            pos_table.as_mut_ptr() as usize,
+        );
+        for &(pa, pb) in &rounds {
+            let round_base = part_start[pa];
+
+            // Pass A2: this round's pairs. A partition's stream is one slice of
+            // `pairs`, thread after thread.
+            let mut cursors: Vec<Vec<u64>> = vec![vec![0u64; pb - pa]; threads];
+            for p in pa..pb {
+                let mut at = part_start[p] - round_base;
+                for (t, cursor) in cursors.iter_mut().enumerate() {
+                    cursor[p - pa] = at;
+                    at += counts[t][p];
+                }
+            }
+            {
+                let base = pairs.as_mut_ptr() as usize;
+                std::thread::scope(|scope| {
+                    for (&(lo, hi), mut cur) in ranges.iter().zip(cursors) {
+                        scope.spawn(move || {
+                            for_each_kmer(seq, shape, start_offset, step, lo, hi, |kmer, at| {
+                                let p = (kmer >> low_bits) as usize;
+                                if p < pa || p >= pb {
+                                    return;
+                                }
+                                let slot = &mut cur[p - pa];
+                                // SAFETY: `*slot` walks this thread's own run of
+                                // its partition's stream. The runs were laid out
+                                // from the pass-A1 counts, so they are disjoint,
+                                // they tile the round's pairs, and this pass meets
+                                // the same positions.
+                                unsafe {
+                                    *(base as *mut u64).add(*slot as usize) =
+                                        u64::from(kmer & low_mask) << 32 | u64::from(at);
+                                }
+                                *slot += 1;
+                            });
+                        });
+                    }
+                });
+            }
+
+            // Pass B: a stable counting sort of every partition of the round on
+            // its low bits.
+            let (pairs, part_start) = (&pairs, &part_start);
+            let next = std::sync::atomic::AtomicUsize::new(pa);
+            std::thread::scope(|scope| {
+                for _ in 0..threads.min(pb - pa) {
+                    let next = &next;
+                    scope.spawn(move || {
+                        let mut slot = vec![0u32; 1usize << low_bits];
+                        loop {
+                            let p = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if p >= pb {
+                                return;
+                            }
+                            let stream = &pairs[(part_start[p] - round_base) as usize
+                                ..(part_start[p + 1] - round_base) as usize];
+                            slot.fill(0);
+                            for &pair in stream {
+                                slot[(pair >> 32) as usize] += 1;
+                            }
+                            // Counts become bucket starts; the index keeps every
+                            // bucket's end, cumulative over the whole table.
+                            let mut run = part_start[p] as u32;
+                            for (low, s) in slot.iter_mut().enumerate() {
+                                let n = *s;
+                                *s = run;
+                                run += n;
+                                // SAFETY: k-mer `p << low_bits | low` belongs to
+                                // partition `p` alone, and one thread owns `p`.
+                                unsafe {
+                                    *(idx as *mut u32).add((p << low_bits) | low) = run;
+                                }
+                            }
+                            for &pair in stream {
+                                let s = &mut slot[(pair >> 32) as usize];
+                                // SAFETY: the buckets of partition `p` tile its
+                                // own span of `pos_table`, which this thread
+                                // owns; each slot is written once.
+                                unsafe {
+                                    *(pos as *mut u32).add(*s as usize) = pair as u32;
+                                }
+                                *s += 1;
+                            }
+                        }
+                    });
+                }
+            });
+        }
+
+        SeedTable {
+            index_table,
+            pos_table,
+        }
+    }
+
     /// [`build`](Self::build) across `threads` workers, byte-identical to it.
     ///
     /// The serial builder is 11.4 s on hg38 chr1 — 10.1% of that
@@ -217,6 +414,22 @@ impl SeedTable {
         let threads = threads.max(1).min(num_steps.max(1));
         if threads == 1 || num_steps < 1 << 16 {
             return Self::build(seq, shape, step as u32);
+        }
+        if partitioned_build(shape) {
+            let pairs = if pairs_at_once() {
+                usize::MAX
+            } else {
+                (build_pairs_bytes(threads, shape.kmer_size) / 8) as usize
+            };
+            return Self::build_partitioned(
+                seq,
+                shape,
+                step,
+                threads,
+                start_offset,
+                num_steps,
+                pairs,
+            );
         }
 
         let per = num_steps.div_ceil(threads);
@@ -397,6 +610,190 @@ pub fn chunk_seeds(seq: &[u8], shape: &Shape, transitions: bool, range: (u32, u3
     out
 }
 
+/// Bytes of `(k-mer, position)` pairs the partitioned builder holds at once:
+/// 512 MiB, or what the two-pass builder's count tables would take with this
+/// many threads if that is more. So a build never holds more beside its tables
+/// than it did before round 112, except on hosts with fewer than eight
+/// threads, where it may hold 512 MiB instead of 64 MiB per thread.
+pub fn build_pairs_bytes(threads: usize, kmer_size: usize) -> u64 {
+    (threads as u64 * (1u64 << (2 * kmer_size)) * 4).max(512 << 20)
+}
+
+/// `HSPZ_SEED_TABLE`: `two-pass` keeps the builder of before round 112
+/// (rollback, and the control arm of a measurement); `rounds` keeps the
+/// partitioned builder's pairs within [`build_pairs_bytes`] whatever memory the
+/// host has. Unset or `partitioned`: the partitioned builder, all pairs at once
+/// where the host budget allows. Any other value is reported once and ignored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SeedTableRequest {
+    Partitioned,
+    Rounds,
+    TwoPass,
+}
+
+fn seed_table_request() -> SeedTableRequest {
+    static REQUEST: std::sync::OnceLock<SeedTableRequest> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_SEED_TABLE").as_deref() {
+        Err(_) | Ok("partitioned") => SeedTableRequest::Partitioned,
+        Ok("rounds") => SeedTableRequest::Rounds,
+        Ok("two-pass") => SeedTableRequest::TwoPass,
+        Ok(other) => {
+            eprintln!(
+                "warning: HSPZ_SEED_TABLE={other:?} is not partitioned, rounds or two-pass; ignored"
+            );
+            SeedTableRequest::Partitioned
+        }
+    })
+}
+
+fn two_pass_forced() -> bool {
+    seed_table_request() == SeedTableRequest::TwoPass
+}
+
+/// Whether the partitioned builder holds all the pairs of a bin at once. Off
+/// until the run's host budget says they fit ([`set_pairs_at_once`]).
+static PAIRS_AT_ONCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The run's decision on [`build_pairs_at_once_bytes`], taken once, before any
+/// worker builds a table. Rounds only cost time (one more pass over the bases
+/// each: 1.0 against 1.4 s per build of a human reference bin with eight builds
+/// at once), so a host that cannot hold the pairs loses nothing else.
+///
+/// Returns what the builds will do: `HSPZ_SEED_TABLE=rounds` or `two-pass`
+/// overrides a budget that allows it.
+pub fn set_pairs_at_once(on: bool) -> bool {
+    PAIRS_AT_ONCE.store(on, std::sync::atomic::Ordering::Relaxed);
+    pairs_at_once()
+}
+
+fn pairs_at_once() -> bool {
+    PAIRS_AT_ONCE.load(std::sync::atomic::Ordering::Relaxed)
+        && seed_table_request() == SeedTableRequest::Partitioned
+}
+
+/// Whether [`SeedTable::build_parallel`] builds by cache-sized partitions: the
+/// sliding window it reads k-mers with holds shapes of up to 32 bases.
+pub fn partitioned_build(shape: &Shape) -> bool {
+    shape.size <= 32 && !two_pass_forced()
+}
+
+/// Bytes a reference build may hold beside its two tables while it runs, for a
+/// bin of at most `positions` indexed positions. The shape's length, which
+/// picks the builder too, is not known to the host budget, so this is the
+/// larger of the two builders' needs. A single partition with more pairs than
+/// [`build_pairs_bytes`] is held whole and is not counted here: with 256
+/// partitions that takes one leading four-base word in front of more than 67
+/// million positions of a bin.
+pub fn build_transient_bytes(threads: usize, kmer_size: usize, positions: u64) -> u64 {
+    let two_pass = threads as u64 * (1u64 << (2 * kmer_size)) * 4;
+    // One thread builds serially, with one count table and no pairs.
+    if two_pass_forced() || threads <= 1 {
+        two_pass
+    } else {
+        two_pass.max((8 * positions).min(build_pairs_bytes(threads, kmer_size)))
+    }
+}
+
+/// Bytes a build holds on top of [`build_transient_bytes`] when it keeps all the
+/// pairs of a bin of `positions` indexed positions at once; nothing where the
+/// request or the thread count rules that out.
+pub fn build_pairs_at_once_bytes(threads: usize, kmer_size: usize, positions: u64) -> u64 {
+    if seed_table_request() != SeedTableRequest::Partitioned || threads <= 1 {
+        return 0;
+    }
+    (8 * positions).saturating_sub(build_transient_bytes(threads, kmer_size, positions))
+}
+
+/// Calls `emit(kmer, position)` for every indexed position
+/// `start_offset + i * step`, `i` in `lo..hi`, whose window is all uppercase
+/// `ACGT`, in ascending order: what [`Shape::kmer_at`] returns there, from one
+/// window that slides over the bases in between (as in [`chunk_seeds_into`]).
+/// The shape must be at most 32 bases long.
+fn for_each_kmer(
+    seq: &[u8],
+    shape: &Shape,
+    start_offset: usize,
+    step: usize,
+    lo: usize,
+    hi: usize,
+    mut emit: impl FnMut(u32, u32),
+) {
+    if lo >= hi {
+        return;
+    }
+    let size = shape.size;
+    debug_assert!(size <= 32 && size > 0);
+    let runs = care_runs(shape);
+    let mut code = [N_NT; 256];
+    for (c, slot) in code.iter_mut().enumerate() {
+        *slot = nt_char_to_int(c as u8);
+    }
+    let keep = if size == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * size)) - 1
+    };
+    let first = start_offset + lo * step;
+    let last = start_offset + (hi - 1) * step;
+    let (mut window, mut run) = (0u64, 0usize);
+    for &c in &seq[first..first + size - 1] {
+        let v = code[c as usize];
+        if v == N_NT {
+            run = 0;
+        } else {
+            run += 1;
+            window = ((window << 2) | u64::from(v)) & keep;
+        }
+    }
+    let mut until = 0usize;
+    for pos in first..=last {
+        let v = code[seq[pos + size - 1] as usize];
+        if v == N_NT {
+            run = 0;
+        } else {
+            run += 1;
+            window = ((window << 2) | u64::from(v)) & keep;
+        }
+        if until == 0 {
+            until = step;
+            if run >= size {
+                let mut kmer = 0u64;
+                for &(down, mask, up) in &runs {
+                    kmer |= ((window >> down) & mask) << up;
+                }
+                emit(kmer as u32, pos as u32);
+            }
+        }
+        until -= 1;
+    }
+}
+
+/// The care positions of a shape as runs of adjacent positions, for pulling a
+/// k-mer out of a sliding window: window index `p` (0 is the oldest base) sits
+/// at bits `2 * (size - 1 - p)`, and a run of `r` adjacent care positions
+/// `pos[i]..=pos[i + r - 1]` moves as one field to bits `2 * (k - i - r)` of the
+/// k-mer, where `kmer = (kmer << 2) + code` over the care positions in order
+/// puts it. Each entry is `(shift down, mask, shift up)`.
+fn care_runs(shape: &Shape) -> Vec<(u32, u64, u32)> {
+    let (size, k) = (shape.size, shape.kmer_size);
+    let mut runs = Vec::with_capacity(k);
+    let mut i = 0;
+    while i < k {
+        let mut r = 1;
+        while i + r < k && shape.pos[i + r] == shape.pos[i + r - 1] + 1 {
+            r += 1;
+        }
+        let last = shape.pos[i + r - 1];
+        runs.push((
+            (2 * (size - 1 - last)) as u32,
+            (1u64 << (2 * r)) - 1,
+            (2 * (k - i - r)) as u32,
+        ));
+        i += r;
+    }
+    runs
+}
+
 /// [`chunk_seeds`] written straight into `dst`, returning how many seeds were
 /// written: the same values in the same order, without the `Vec` and the copy
 /// out of it (round 107). `dst` must hold [`max_seeds`] of the range's span;
@@ -424,25 +821,7 @@ pub fn chunk_seeds_into(
     }
     let size = shape.size;
     let k = shape.kmer_size;
-    // Window index `p` (0 is the oldest base) sits at bits `2 * (size - 1 - p)`.
-    // A run of `r` adjacent care positions `pos[i]..=pos[i + r - 1]` moves as one
-    // field to bits `2 * (k - i - r)` of the k-mer, which is where
-    // `kmer = (kmer << 2) + code` over the care positions in order puts it.
-    let mut runs: Vec<(u32, u64, u32)> = Vec::with_capacity(k);
-    let mut i = 0;
-    while i < k {
-        let mut r = 1;
-        while i + r < k && shape.pos[i + r] == shape.pos[i + r - 1] + 1 {
-            r += 1;
-        }
-        let last = shape.pos[i + r - 1];
-        runs.push((
-            (2 * (size - 1 - last)) as u32,
-            (1u64 << (2 * r)) - 1,
-            (2 * (k - i - r)) as u32,
-        ));
-        i += r;
-    }
+    let runs = care_runs(shape);
     let flips: Vec<u64> = (0..k)
         .filter(|&t| transitions && shape.transition[t])
         .map(|t| TRANSITION_MASK << (2 * t))
@@ -1060,6 +1439,71 @@ mod tests {
     /// hit order, hit order sets `MAX_HITS` chunk boundaries, and those decide
     /// the final HSP set. A bucket-order drift would change output with no
     /// change in any count, so this compares the vectors, not multisets.
+    /// Round 112: the partitioned builder against the serial one, over masked
+    /// runs, Ns and record separators, for shapes with one, four and 256
+    /// partitions, strides, thread counts on both sides of the partition
+    /// count, and pair budgets from one round to a round per partition.
+    #[test]
+    fn partitioned_seed_table_is_byte_identical_to_serial() {
+        let mut seq = Vec::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for i in 0..150_000u32 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            seq.push(match (x >> 11) % 64 {
+                0..=15 => b'A',
+                16..=31 => b'C',
+                32..=47 => b'G',
+                48..=58 => b'T',
+                59 => b'N',
+                60 => b'a',
+                61 => b'c',
+                62 => b'g',
+                _ => b't',
+            });
+            if i % 9_973 == 0 || i % 40_001 == 0 {
+                seq.push(crate::sequence::SEP);
+            }
+        }
+        // 4, 9 and 12 care positions: 8, 18 and 24 k-mer bits.
+        for spec in ["1111", "1101011011011", "12of19"] {
+            let shape = Shape::parse(spec).unwrap();
+            for step in [1usize, 2, 3] {
+                let want = SeedTable::build(&seq, &shape, step as u32);
+                let offset = (shape.size + 1) % step;
+                let start_offset = step - offset;
+                let num_steps = (seq.len() + offset).saturating_sub(shape.size) / step;
+                // All pairs at once, a few rounds, and a round per partition.
+                for (threads, max_pairs) in [
+                    (1usize, usize::MAX),
+                    (2, 40_000),
+                    (3, usize::MAX),
+                    (8, 1),
+                    (16, 9_000),
+                ] {
+                    let got = SeedTable::build_partitioned(
+                        &seq,
+                        &shape,
+                        step,
+                        threads,
+                        start_offset,
+                        num_steps,
+                        max_pairs,
+                    );
+                    assert!(
+                        got.index_table == want.index_table,
+                        "index_table differs: {spec} step {step} threads {threads} pairs {max_pairs}"
+                    );
+                    assert!(
+                        got.pos_table == want.pos_table,
+                        "pos_table differs: {spec} step {step} threads {threads} pairs {max_pairs}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn parallel_seed_table_is_byte_identical_to_serial() {
         // Deterministic pseudo-random DNA with the awkward cases mixed in:

@@ -1356,6 +1356,10 @@ pub struct HostEstimate {
     /// thread while the current unit runs (round 107). Charged on top of either
     /// shape, and only when [`host_query_ahead`] says it fits.
     pub query_ahead: u64,
+    /// What one reference build holds more when it keeps all its pairs at once
+    /// (round 112), per worker. Charged only when [`host_pairs_at_once`] says
+    /// it fits.
+    pub pairs_at_once: u64,
 }
 
 pub fn host_estimate(
@@ -1408,7 +1412,9 @@ pub(crate) fn host_estimate_sizes(
 ) -> HostEstimate {
     let index = (1u64 << (2 * kmer_size)) * 4; // index_table, 4 B/entry
     let pos = largest_ref / step.max(1) as u64 * 4; // pos_table, 4 B/indexed bp
-    let counts = threads as u64 * index; // build_parallel pass-1 transient
+    // What a build holds beside its tables while it runs (`seed::build_parallel`).
+    let positions = largest_ref / step.max(1) as u64;
+    let counts = crate::seed::build_transient_bytes(threads, kmer_size, positions);
     let packed_ref = largest_ref * 2; // buf + enc (no rc for a reference bin)
     let query = largest_qry * 4; // buf + rc + enc + enc_rc
     // Host seed slots (round 107): one per producer plus the two the consumer
@@ -1421,6 +1427,7 @@ pub(crate) fn host_estimate_sizes(
         per_worker_prefetch: packed_ref + counts + index + pos + query + pinned,
         per_worker_no_prefetch: (packed_ref + counts + index + pos).max(query + pinned),
         query_ahead: query,
+        pairs_at_once: crate::seed::build_pairs_at_once_bytes(threads, kmer_size, positions),
     }
 }
 
@@ -1497,6 +1504,35 @@ pub fn host_query_ahead(
             }
             None => true,
         }
+}
+
+/// Bytes the workers hold on top of [`host_peak`] when each reference build
+/// keeps all its pairs at once. A worker builds one bin at a time.
+pub fn host_pairs_at_once_bytes(est: &HostEstimate, assignment: &[Vec<u32>]) -> u64 {
+    assignment.len() as u64 * est.pairs_at_once
+}
+
+/// Whether reference builds may keep all their pairs at once (round 112): the
+/// last rung, decided after reference prefetch and the query bins packed
+/// ahead, on top of whatever those two came to. Without a reading of the
+/// host's memory the builds stay in rounds, which hold no more than a build
+/// did before round 112.
+pub fn host_pairs_at_once(
+    est: &HostEstimate,
+    assignment: &[Vec<u32>],
+    prefetch: bool,
+    pack_ahead: bool,
+    available: Option<u64>,
+) -> bool {
+    let ahead = if pack_ahead {
+        host_query_ahead_bytes(est, assignment)
+    } else {
+        0
+    };
+    available.is_some_and(|a| {
+        host_peak(est, assignment, prefetch) + ahead + host_pairs_at_once_bytes(est, assignment)
+            <= a
+    })
 }
 
 /// FNV-1a over names, lengths and bases, in input order. A frozen manifest
@@ -2448,6 +2484,7 @@ mod tests {
             per_worker_prefetch: 300,
             per_worker_no_prefetch: 150,
             query_ahead: 40,
+            pairs_at_once: 25,
         };
         let multi = |w: usize| vec![vec![0u32, 1]; w]; // every worker owns 2 bins
         // 1 worker: 100 + 300 = 400 fits → prefetch kept.
@@ -2482,6 +2519,23 @@ mod tests {
         // No reference prefetch, no pack ahead; no reading, the request stands.
         assert!(!host_query_ahead(&est, &multi(1), false, Some(u64::MAX)));
         assert!(host_query_ahead(&est, &multi(4), true, None));
+        // The last rung: all pairs of a build at once, 25 per worker, on top of
+        // whatever the two rungs above came to.
+        use super::host_pairs_at_once;
+        assert!(host_pairs_at_once(&est, &multi(1), true, true, Some(465)));
+        assert!(!host_pairs_at_once(&est, &multi(1), true, true, Some(464)));
+        assert!(host_pairs_at_once(&est, &multi(1), true, false, Some(425)));
+        assert!(!host_pairs_at_once(&est, &multi(1), true, false, Some(424)));
+        assert!(host_pairs_at_once(&est, &multi(4), false, false, Some(800)));
+        assert!(!host_pairs_at_once(
+            &est,
+            &multi(4),
+            false,
+            false,
+            Some(799)
+        ));
+        // No reading: the builds stay in rounds.
+        assert!(!host_pairs_at_once(&est, &multi(1), true, true, None));
         // Shared counted once, never per worker.
         assert_eq!(
             host_peak(&est, &multi(2), true) - host_peak(&est, &multi(1), true),

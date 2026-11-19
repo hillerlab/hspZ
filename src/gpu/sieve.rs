@@ -66,11 +66,14 @@ pub const RIGHT_WORDS: u32 = 2;
 pub const LEFT_WORDS: u32 = 3;
 /// The most words a side can be carried to. [`PADG`] and the 32-bit arithmetic
 /// are sized for these.
+#[cfg(any(test, feature = "gate-sieve"))]
 pub const RIGHT_WORDS_MAX: u32 = 4;
+#[cfg(any(test, feature = "gate-sieve"))]
 pub const LEFT_WORDS_MAX: u32 = 5;
 
 /// How far an undecided side is carried: `(right, left)` words in all, between
 /// the static `(RIGHT_WORDS, LEFT_WORDS)` and `(RIGHT_WORDS_MAX, LEFT_WORDS_MAX)`.
+#[cfg(any(test, feature = "gate-sieve"))]
 pub type Words = (u32, u32);
 
 /// One side's walk so far: the class-score prefix sum at the end of the last
@@ -203,6 +206,13 @@ pub fn classes(
             }
         }
     }
+    // The kernel multiplies a class score by a block's eight bases, and a score
+    // may be as low as -2^30. Today neither negative class can get there: a
+    // soft-masked or `N` reference base is packed as `REF_FILL` and assumed
+    // present, so its score against a base (-1000 by default) is in both
+    // maxima. Should that change, raising a class score keeps the bound a bound,
+    // so they are held at `-MAX_ABS`.
+    let (uti, utv) = (uti.max(-MAX_ABS), utv.max(-MAX_ABS));
     if um < 0 || uti > 0 || utv > 0 {
         return Err(format!(
             "class scores match {um}, transition {uti}, transversion {utv} are not ordered around 0"
@@ -831,6 +841,25 @@ mod tests {
                 .unwrap_err()
                 .contains("no negative drift")
         );
+    }
+
+    /// A matrix whose mismatches are far below anything the kernel's 32-bit
+    /// sums are sized for. The class scores do not follow it down: the masked
+    /// reference bases, packed with the fill code, keep both at their own score.
+    #[test]
+    fn class_scores_stay_where_the_block_arithmetic_is_exact() {
+        let mut m = build_sub_mat("", 910, None).unwrap();
+        for r in 0..4 {
+            for q in 0..4 {
+                if r != q {
+                    m[r * NUC + q] = -(1 << 29);
+                }
+            }
+        }
+        let c = classes(&m, 910, false, false).unwrap();
+        assert_eq!((c.um, c.uti, c.utv), (100, -1000, -1000));
+        assert!(c.uti >= -MAX_ABS && c.utv >= -MAX_ABS);
+        assert_eq!(c.kernel_args(), (100, 1100, 0, -8000));
     }
 
     #[test]

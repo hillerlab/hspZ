@@ -1263,6 +1263,135 @@ pub mod device {
         }
     }
 
+    /// [`bucket_count`] without its loop (round 114): the same counts, word for
+    /// word.
+    ///
+    /// `bucket_count` and `bucket_scatter` take one vote per bucket, seven trips
+    /// of a loop that every lane of every warp walks for the windows of an A100,
+    /// and they were measured to pay for each trip (66 ms per bucket on a unit
+    /// of 125.6e9 hits). One `match.any` says the same: each lane gets the lanes
+    /// of its warp that hold its bucket. The first of them stores the bucket's
+    /// count for the warp, over the zero that lane `v` stores for bucket `v`
+    /// (a warp barrier between the two stores orders them), and a lane's rank in
+    /// the scatter is the number of those lanes before it.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    pub fn bucket_count_match(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        mut counts: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_COUNTS: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        // The clamp is `bucket_count`'s. Lanes past the end share a key that no
+        // bucket has (`n_buckets <= 32`).
+        let b = if live {
+            let raw = (anchors[i as usize] as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        if lane < n_buckets {
+            unsafe { WARP_COUNTS[warp_id * 32 + lane as usize] = 0 };
+        }
+        // The count below goes over that zero, and it is another lane's store:
+        // the barrier is what orders the two (the lanes of a warp are free to
+        // run the two `if`s in any order otherwise).
+        warp::sync_mask(FULL_MASK);
+        if live && (own & warp::lanemask_lt()) == 0 {
+            unsafe { WARP_COUNTS[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut total = 0u32;
+            for w in 0..WARPS {
+                total += unsafe { WARP_COUNTS[w * 32 + tid as usize] };
+            }
+            // SAFETY: `n_buckets * n_blocks` slots, one per (bucket, block).
+            unsafe { *counts.get_unchecked_mut((tid * n_blocks + bid) as usize) = total };
+        }
+    }
+
+    /// [`bucket_scatter`] without its loop, as [`bucket_count_match`]: the same
+    /// two buffers, word for word.
+    #[cfg(feature = "ref-loc-buckets")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn bucket_scatter_match(
+        anchors: &[u64],
+        n: u32,
+        shift: u32,
+        n_blocks: u32,
+        n_buckets: u32,
+        incl: &[u32],
+        mut sorted_anchor: DisjointSlice<u64>,
+        mut sorted_idx: DisjointSlice<u32>,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_PREFIX: SharedArray<u32, { WARPS * 32 }> = SharedArray::UNINIT;
+        static mut BLOCK_TOTAL: SharedArray<u32, 32> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp_id = (tid / WARP_SIZE) as usize;
+        let live = i < n;
+        let anchor = if live { anchors[i as usize] } else { 0 };
+        let b = if live {
+            let raw = (anchor as u32) >> shift;
+            if raw < n_buckets { raw } else { n_buckets - 1 }
+        } else {
+            32
+        };
+        let own = warp::match_any_sync(FULL_MASK, b);
+        let before = own & warp::lanemask_lt();
+        if lane < n_buckets {
+            unsafe { WARP_PREFIX[warp_id * 32 + lane as usize] = 0 };
+        }
+        // As in `bucket_count_match`: the barrier orders the zero and the count.
+        warp::sync_mask(FULL_MASK);
+        if live && before == 0 {
+            unsafe { WARP_PREFIX[warp_id * 32 + b as usize] = own.count_ones() };
+        }
+        thread::sync_threads();
+
+        if tid < n_buckets {
+            let mut prefix = 0u32;
+            for w in 0..WARPS {
+                let count = unsafe { WARP_PREFIX[w * 32 + tid as usize] };
+                unsafe { WARP_PREFIX[w * 32 + tid as usize] = prefix };
+                prefix += count;
+            }
+            unsafe { BLOCK_TOTAL[tid as usize] = prefix };
+        }
+        thread::sync_threads();
+
+        if live {
+            let bu = b as usize;
+            let block_base = incl[(b * n_blocks + bid) as usize] - unsafe { BLOCK_TOTAL[bu] };
+            let out = block_base + unsafe { WARP_PREFIX[warp_id * 32 + bu] } + before.count_ones();
+            // SAFETY: the block bases and local ranks partition `0..n` exactly,
+            // one slot per hit.
+            unsafe {
+                *sorted_anchor.get_unchecked_mut(out as usize) = anchor;
+                *sorted_idx.get_unchecked_mut(out as usize) = i;
+            }
+        }
+    }
+
     /// Runs only the promoted score gate and writes one byte for every hit.
     /// The rare survivors are materialized later from a stable compacted ID
     /// list, so the common reject path writes neither an HSP nor a `u32` flag.

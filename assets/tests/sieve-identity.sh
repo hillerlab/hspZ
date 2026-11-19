@@ -45,9 +45,10 @@ printf '%-34s %-5s %-17s %-10s %s\n' arm sieve digest rho check
 # arm NAME on|off REF QRY [hspz options...]; environment prefixes go through ENVV.
 arm() {
   local name=$1 want=$2 ref=$3 qry=$4; shift 4
-  # The control also expands seeds with the kernels of before round 110 (one warp or thread per seed), so an arm
-  # compares the group kernel as well as the sieve; an arm's own ENVV may override that.
-  env HSPZ_FIND_HITS_GROUPS=0 ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
+  # The control also expands seeds with the kernels of before round 110 (one warp or thread per seed) and buckets
+  # with those of before round 114 (a vote per bucket), so an arm compares the group kernel and the bucket kernels
+  # as well as the sieve; an arm's own ENVV may override that.
+  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
     2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
   env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits 16711680 --time "$@" \
     2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
@@ -62,6 +63,14 @@ arm() {
     # Every tally after the model's keep count must be zero.
     echo "$check" | grep -q 'candidate mismatches 0, flag mismatches 0, kept but rejected 0, plane word mismatches 0$' \
       || verdict="CHECK ${check:-missing}"
+  fi
+  # Under HSPZ_BUCKET_ORDER_CHECK every checked chunk must be the stable permutation by bucket.
+  if grep -q '^#bucket-check' "$W/$name.1.err"; then
+    local nb nok
+    nb=$(grep -c '^#bucket-check chunk=' "$W/$name.1.err")
+    nok=$(grep -c '^#bucket-check chunk=.* perm=ok monotone=ok stable=ok anchors=ok' "$W/$name.1.err")
+    { [ "$nb" -gt 0 ] && [ "$nb" = "$nok" ] && ! grep -q '^#bucket-check-violation' "$W/$name.1.err"; } \
+      || verdict="BUCKET ORDER $nok of $nb chunks"
   fi
   [ "$verdict" = ok ] || fail=$((fail+1))
   printf '%-34s %-5s %-17s %-10s %s\n' "$name" "${state:-none}" "$d1" "${rho:--}" "$verdict"
@@ -184,6 +193,18 @@ ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check           on  "$R" "$Q"
 ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check-chunks    on  "$R" "$Q" -C 60000
 ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check-satellite on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 grep -q 'of packed planes' "$W/buckets-forced.1.err" || { echo "buckets-forced: the window is not plane-sized"; fail=$((fail+1)); }
+
+# Round 114: the bucket kernels take one match.any instead of a vote per bucket. The permutation check (anchors
+# and raw ids of every chunk: a permutation, ascending by bucket, stable, each anchor its own) runs on 1, 4, 8, 16
+# and 31 buckets, on chunks that end inside a warp, and once on the kernels of before.
+for shift in 26 24 23 22 21; do
+  ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=$shift HSPZ_BUCKET_ORDER_CHECK=1000000" arm bucket-order-shift-$shift on "$R" "$Q"
+done
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23 HSPZ_BUCKET_ORDER_CHECK=1000000" arm bucket-order-small-chunks on "$R" "$Q" -C 60000
+ENVV="HSPZ_BUCKET_VOTES=loop HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=23 HSPZ_BUCKET_ORDER_CHECK=1000000" arm bucket-order-loop-kernels on "$R" "$Q"
+for a in bucket-order-shift-26 bucket-order-shift-21 bucket-order-small-chunks bucket-order-loop-kernels; do
+  grep -q '^#bucket-check chunk=' "$W/$a.1.err" || { echo "$a: the permutation check did not run"; fail=$((fail+1)); }
+done
 
 echo
 grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \

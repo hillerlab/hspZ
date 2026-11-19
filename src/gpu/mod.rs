@@ -989,6 +989,11 @@ pub struct Engine {
     /// skips the bucket pass, whose window would not fit the L2 as bytes.
     #[cfg(feature = "ref-loc-buckets")]
     bucket_planes: bool,
+    /// Round 114: the bucket kernels learn which lanes of a warp share a bucket
+    /// from one `match.any` (`true`, the default) or from a vote per bucket
+    /// (`HSPZ_BUCKET_VOTES=loop`).
+    #[cfg(feature = "ref-loc-buckets")]
+    bucket_match: bool,
     /// Round 110 (`find-hits-groups`, experiment): which kernel expands the
     /// seeds of a chunk into anchors.
     #[cfg(feature = "find-hits-groups")]
@@ -1998,6 +2003,8 @@ impl Engine {
             buf_flags_bits: unsafe { uninitialized(&stream, 0)? },
             #[cfg(feature = "ref-loc-buckets")]
             bucket_planes,
+            #[cfg(feature = "ref-loc-buckets")]
+            bucket_match: bucket_match_request(),
             #[cfg(feature = "find-hits-groups")]
             find_hits_groups: find_hits_groups_request(),
             #[cfg(feature = "ref-loc-buckets")]
@@ -3144,20 +3151,34 @@ impl Engine {
                     // SAFETY: one hit per thread; thread `v < n_buckets` of block
                     // `bid` owns exactly slot `v * cblocks + bid`.
                     unsafe {
-                        self.module.bucket_count(
-                            &self.stream,
-                            LaunchConfig {
-                                grid_dim: (cblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &self.buf_anchor,
-                            iter_num_hits,
-                            self.bucket_shift,
-                            cblocks,
-                            self.n_buckets,
-                            &mut self.buf_bucket_counts,
-                        )?;
+                        let config = LaunchConfig {
+                            grid_dim: (cblocks, 1, 1),
+                            block_dim: (SCAN_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        if self.bucket_match {
+                            self.module.bucket_count_match(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &mut self.buf_bucket_counts,
+                            )?;
+                        } else {
+                            self.module.bucket_count(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &mut self.buf_bucket_counts,
+                            )?;
+                        }
                     }
                     self.end_stage(stage, "ref_bucket_count")?;
 
@@ -3224,22 +3245,38 @@ impl Engine {
                     // SAFETY: same geometry as `bucket_count`, and the inclusive
                     // prefix partitions `0..iter_num_hits` into one slot per hit.
                     unsafe {
-                        self.module.bucket_scatter(
-                            &self.stream,
-                            LaunchConfig {
-                                grid_dim: (cblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            },
-                            &self.buf_anchor,
-                            iter_num_hits,
-                            self.bucket_shift,
-                            cblocks,
-                            self.n_buckets,
-                            &self.buf_bucket_counts,
-                            &mut self.buf_sorted_anchor,
-                            &mut self.buf_sorted_idx,
-                        )?;
+                        let config = LaunchConfig {
+                            grid_dim: (cblocks, 1, 1),
+                            block_dim: (SCAN_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        if self.bucket_match {
+                            self.module.bucket_scatter_match(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &self.buf_bucket_counts,
+                                &mut self.buf_sorted_anchor,
+                                &mut self.buf_sorted_idx,
+                            )?;
+                        } else {
+                            self.module.bucket_scatter(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &self.buf_bucket_counts,
+                                &mut self.buf_sorted_anchor,
+                                &mut self.buf_sorted_idx,
+                            )?;
+                        }
                     }
                     self.end_stage(stage, "ref_bucket_scatter")?;
                     #[cfg(feature = "ref-loc-buckets")]
@@ -5019,6 +5056,24 @@ impl Engine {
     }
 }
 
+/// Round 114: how the bucket kernels learn which lanes of a warp share a
+/// bucket. `HSPZ_BUCKET_VOTES` unset or `match`: one `match.any`
+/// (`bucket_count_match`, `bucket_scatter_match`). `loop`: one vote per bucket,
+/// the kernels of rounds 83 to 113. Both write the same buffers
+/// (`HSPZ_BUCKET_ORDER_CHECK` proves the permutation on the device).
+#[cfg(feature = "ref-loc-buckets")]
+fn bucket_match_request() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_BUCKET_VOTES").as_deref() {
+        Err(_) | Ok("match") => true,
+        Ok("loop") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_BUCKET_VOTES={other:?} is not match or loop; using match");
+            true
+        }
+    })
+}
+
 /// Round 110 (`find-hits-groups`): which kernel expands a chunk's seeds.
 /// `HSPZ_FIND_HITS_GROUPS` unset: runs of 32 seeds per warp
 /// (`find_hits_groups`). `0`: one warp or one thread per seed, as before round
@@ -5541,15 +5596,49 @@ pub fn resolve_max_hits(ctx: &Arc<CudaContext>, requested: u32) -> u32 {
 /// Tightest free VRAM across the first `n` devices. Planning must not assume
 /// device 0 is the smallest card in a heterogeneous node.
 pub fn min_free_bytes(n: usize) -> Result<u64, Box<dyn std::error::Error>> {
-    let n = n.max(1);
+    Ok(open_devices(n)?.1)
+}
+
+/// What [`open_devices`] returns: the contexts to hold, and the tightest free
+/// VRAM among their devices.
+pub type OpenDevices = (Vec<Arc<CudaContext>>, u64);
+
+/// The primary context of each of the first `n` devices, and the tightest free
+/// VRAM among them (round 112).
+///
+/// The contexts are returned for the caller to hold until its workers are done.
+/// A primary context that is released after the probe is torn down, and the
+/// worker that runs on the device builds it again: about a second per worker on
+/// an A100 node, on top of 1.6 s for probing eight cards one after another.
+/// While the caller holds them a worker's `CudaContext::new` only takes another
+/// reference, and here they are created at the same time, one thread per
+/// device.
+pub fn open_devices(n: usize) -> Result<OpenDevices, DriverError> {
+    let opened: Vec<Result<(Arc<CudaContext>, u64), DriverError>> = std::thread::scope(|scope| {
+        let probes: Vec<_> = (0..n.max(1))
+            .map(|device| {
+                scope.spawn(move || {
+                    // Creating the context binds it to this thread, which is
+                    // what the memory query reads.
+                    let ctx = CudaContext::new(device)?;
+                    let (free, _) = device_memory();
+                    Ok((ctx, free as u64))
+                })
+            })
+            .collect();
+        probes
+            .into_iter()
+            .map(|probe| probe.join().expect("device probe panicked"))
+            .collect()
+    });
+    let mut contexts = Vec::with_capacity(opened.len());
     let mut min_free = u64::MAX;
-    for i in 0..n {
-        let ctx = CudaContext::new(i)?;
-        let _ = ctx.bind_to_thread();
-        let (free, _) = device_memory();
-        min_free = min_free.min(free as u64);
+    for device in opened {
+        let (ctx, free) = device?;
+        min_free = min_free.min(free);
+        contexts.push(ctx);
     }
-    Ok(min_free)
+    Ok((contexts, min_free))
 }
 
 /// Visible CUDA devices.
