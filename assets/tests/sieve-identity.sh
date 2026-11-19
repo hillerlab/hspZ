@@ -45,7 +45,9 @@ printf '%-34s %-5s %-17s %-10s %s\n' arm sieve digest rho check
 # arm NAME on|off REF QRY [hspz options...]; environment prefixes go through ENVV.
 arm() {
   local name=$1 want=$2 ref=$3 qry=$4; shift 4
-  env ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
+  # The control also expands seeds with the kernels of before round 110 (one warp or thread per seed), so an arm
+  # compares the group kernel as well as the sieve; an arm's own ENVV may override that.
+  env HSPZ_FIND_HITS_GROUPS=0 ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
     2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
   env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits 16711680 --time "$@" \
     2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
@@ -164,8 +166,16 @@ grep -q '^#sieve guard' "$W/defaults.1.err" && { echo "defaults: the guard held 
 # the unit, and on the tandem array the guard holds the plain gate.
 ENVV="HSPZ_REF_BUCKETS=1" arm buckets-iupac-in-query    off "$R" "$W/qry_iupac.fa"
 ENVV="HSPZ_REF_BUCKETS=1" arm buckets-satellite-guard   on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+
+# Round 110: seeds expanded by runs of 32 per warp. `check` runs the per-seed kernel and the group kernel on each
+# chunk and stops at the first anchor that differs; small chunks cut the runs at arbitrary seeds.
+ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check           on  "$R" "$Q"
+ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check-chunks    on  "$R" "$Q" -C 60000
+ENVV="HSPZ_FIND_HITS_GROUPS=check" arm find-hits-check-satellite on  "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
 grep -q 'of packed planes' "$W/buckets-forced.1.err" || { echo "buckets-forced: the window is not plane-sized"; fail=$((fail+1)); }
 
 echo
+grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \
+  && { echo "find-hits-check: an arm did not report its check"; fail=$((fail+1)); }
 if [ $fail -eq 0 ]; then echo "sieve-identity: PASS (every arm byte-identical, every check clean)"; else echo "sieve-identity: $fail FAILURE(S); logs in $W"; fi
 exit $fail

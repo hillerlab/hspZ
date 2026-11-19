@@ -1348,6 +1348,10 @@ pub struct HostEstimate {
     /// Per-worker peak without prefetch: the build is inline, so it does not
     /// overlap the query phase.
     pub per_worker_no_prefetch: u64,
+    /// One more packed query bin per worker: the next unit's bin, packed on a
+    /// thread while the current unit runs (round 107). Charged on top of either
+    /// shape, and only when [`host_query_ahead`] says it fits.
+    pub query_ahead: u64,
 }
 
 pub fn host_estimate(
@@ -1403,12 +1407,16 @@ pub(crate) fn host_estimate_sizes(
     let counts = threads as u64 * index; // build_parallel pass-1 transient
     let packed_ref = largest_ref * 2; // buf + enc (no rc for a reference bin)
     let query = largest_qry * 4; // buf + rc + enc + enc_rc
-    let pinned = 2 * max_seeds as u64 * 8; // two u64 seed slots
+    // Host seed slots (round 107): one per producer plus the two the consumer
+    // holds, each one worst-case batch of u64 seeds.
+    let slot = max_seeds as u64 * 8;
+    let pinned = (crate::seed::producers_auto(threads, slot as usize) as u64 + 2) * slot;
 
     HostEstimate {
         shared: ref_bp_total + qry_bp_total,
         per_worker_prefetch: packed_ref + counts + index + pos + query + pinned,
         per_worker_no_prefetch: (packed_ref + counts + index + pos).max(query + pinned),
+        query_ahead: query,
     }
 }
 
@@ -1457,6 +1465,34 @@ pub fn host_peak(est: &HostEstimate, assignment: &[Vec<u32>], prefetch: bool) ->
                 }
             })
             .sum::<u64>()
+}
+
+/// Bytes the workers hold on top of [`host_peak`] when each packs its next
+/// query bin ahead of the unit that needs it.
+pub fn host_query_ahead_bytes(est: &HostEstimate, assignment: &[Vec<u32>]) -> u64 {
+    assignment.len() as u64 * est.query_ahead
+}
+
+/// Whether the workers may pack their next query bin ahead (round 107). It is a
+/// third rung below reference prefetch, decided after it: a host that only fits
+/// the reference prefetch keeps that and packs each query bin when its unit
+/// starts, as before. Without reference prefetch (refused by the flag or by the
+/// preflight) memory is the constraint and nothing is packed ahead. `available`
+/// is `None` when the host gave no reading; the request then stands, as it does
+/// for reference prefetch.
+pub fn host_query_ahead(
+    est: &HostEstimate,
+    assignment: &[Vec<u32>],
+    prefetch: bool,
+    available: Option<u64>,
+) -> bool {
+    prefetch
+        && match available {
+            Some(a) => {
+                host_peak(est, assignment, true) + host_query_ahead_bytes(est, assignment) <= a
+            }
+            None => true,
+        }
 }
 
 /// FNV-1a over names, lengths and bases, in input order. A frozen manifest
@@ -2401,11 +2437,13 @@ mod tests {
     #[test]
     fn host_preflight_keeps_prefetch_then_falls_back_then_errors() {
         use super::{HostEstimate, host_peak, host_preflight};
-        // shared 100, per-worker prefetch 300, no-prefetch 150.
+        // shared 100, per-worker prefetch 300, no-prefetch 150, one query bin
+        // packed ahead 40.
         let est = HostEstimate {
             shared: 100,
             per_worker_prefetch: 300,
             per_worker_no_prefetch: 150,
+            query_ahead: 40,
         };
         let multi = |w: usize| vec![vec![0u32, 1]; w]; // every worker owns 2 bins
         // 1 worker: 100 + 300 = 400 fits → prefetch kept.
@@ -2426,6 +2464,20 @@ mod tests {
         // Mixed 2/1/1: only the first worker prefetches.
         let mixed = vec![vec![0u32, 1], vec![2], vec![3]];
         assert_eq!(host_peak(&est, &mixed, true), 100 + 300 + 150 + 150);
+
+        // Round 107: packing the next query bin ahead is a third rung. It costs
+        // one more packed query bin per worker on top of the prefetch shape and
+        // never takes the reference prefetch away from a host that fits it.
+        use super::{host_query_ahead, host_query_ahead_bytes};
+        assert_eq!(host_query_ahead_bytes(&est, &multi(4)), 160);
+        assert!(host_query_ahead(&est, &multi(1), true, Some(440)));
+        assert!(!host_query_ahead(&est, &multi(1), true, Some(439)));
+        assert_eq!(host_preflight(&est, &multi(1), 439), Ok(true));
+        assert!(host_query_ahead(&est, &one_each, true, Some(860)));
+        assert!(!host_query_ahead(&est, &one_each, true, Some(859)));
+        // No reference prefetch, no pack ahead; no reading, the request stands.
+        assert!(!host_query_ahead(&est, &multi(1), false, Some(u64::MAX)));
+        assert!(host_query_ahead(&est, &multi(4), true, None));
         // Shared counted once, never per worker.
         assert_eq!(
             host_peak(&est, &multi(2), true) - host_peak(&est, &multi(1), true),

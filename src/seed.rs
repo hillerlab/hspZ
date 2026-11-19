@@ -397,6 +397,137 @@ pub fn chunk_seeds(seq: &[u8], shape: &Shape, transitions: bool, range: (u32, u3
     out
 }
 
+/// [`chunk_seeds`] written straight into `dst`, returning how many seeds were
+/// written: the same values in the same order, without the `Vec` and the copy
+/// out of it (round 107). `dst` must hold [`max_seeds`] of the range's span;
+/// a shorter one is a caller bug and panics on the first write past its end.
+///
+/// The window slides instead of being decoded again at every position: one
+/// 2-bit code enters a `u64` of the last `shape.size` bases, a counter says how
+/// many of them in a row were codeable, and the k-mer is the care positions
+/// pulled out of that word run by run. [`Shape::kmer_at`] reads `size` bases and
+/// `kmer_size` of them again for every position, which is most of what a
+/// single-threaded batch cost. A shape longer than 32 bases does not fit the
+/// word and takes the plain loop.
+pub fn chunk_seeds_into(
+    seq: &[u8],
+    shape: &Shape,
+    transitions: bool,
+    range: (u32, u32),
+    dst: &mut [u64],
+) -> usize {
+    if shape.size > 32 || shape.size == 0 {
+        return chunk_seeds_into_plain(seq, shape, transitions, range, dst);
+    }
+    if range.0 >= range.1 {
+        return 0;
+    }
+    let size = shape.size;
+    let k = shape.kmer_size;
+    // Window index `p` (0 is the oldest base) sits at bits `2 * (size - 1 - p)`.
+    // A run of `r` adjacent care positions `pos[i]..=pos[i + r - 1]` moves as one
+    // field to bits `2 * (k - i - r)` of the k-mer, which is where
+    // `kmer = (kmer << 2) + code` over the care positions in order puts it.
+    let mut runs: Vec<(u32, u64, u32)> = Vec::with_capacity(k);
+    let mut i = 0;
+    while i < k {
+        let mut r = 1;
+        while i + r < k && shape.pos[i + r] == shape.pos[i + r - 1] + 1 {
+            r += 1;
+        }
+        let last = shape.pos[i + r - 1];
+        runs.push((
+            (2 * (size - 1 - last)) as u32,
+            (1u64 << (2 * r)) - 1,
+            (2 * (k - i - r)) as u32,
+        ));
+        i += r;
+    }
+    let flips: Vec<u64> = (0..k)
+        .filter(|&t| transitions && shape.transition[t])
+        .map(|t| TRANSITION_MASK << (2 * t))
+        .collect();
+    let mut code = [N_NT; 256];
+    for (c, slot) in code.iter_mut().enumerate() {
+        *slot = nt_char_to_int(c as u8);
+    }
+    let keep = if size == 32 {
+        u64::MAX
+    } else {
+        (1u64 << (2 * size)) - 1
+    };
+
+    // `run` counts the codeable bases in a row that end at the newest one. An
+    // uncodeable base leaves the word alone: the `size` codeable bases that must
+    // follow before a window is valid again push every older bit out of it.
+    let (mut window, mut run) = (0u64, 0usize);
+    let start = range.0 as usize;
+    for &c in &seq[start..start + size - 1] {
+        let v = code[c as usize];
+        if v == N_NT {
+            run = 0;
+        } else {
+            run += 1;
+            window = ((window << 2) | u64::from(v)) & keep;
+        }
+    }
+    let mut at = 0;
+    for j in range.0..range.1 {
+        let v = code[seq[j as usize + size - 1] as usize];
+        if v == N_NT {
+            run = 0;
+            continue;
+        }
+        run += 1;
+        window = ((window << 2) | u64::from(v)) & keep;
+        if run < size {
+            continue;
+        }
+        let mut kmer = 0u64;
+        for &(down, mask, up) in &runs {
+            kmer |= ((window >> down) & mask) << up;
+        }
+        let low = u64::from(j);
+        dst[at] = (kmer << 32) | low;
+        at += 1;
+        for &flip in &flips {
+            dst[at] = ((kmer ^ flip) << 32) | low;
+            at += 1;
+        }
+    }
+    at
+}
+
+/// [`chunk_seeds_into`] with [`Shape::kmer_at`] at every position, for a shape
+/// the sliding word cannot hold.
+fn chunk_seeds_into_plain(
+    seq: &[u8],
+    shape: &Shape,
+    transitions: bool,
+    range: (u32, u32),
+    dst: &mut [u64],
+) -> usize {
+    let mut at = 0;
+    for j in range.0..range.1 {
+        let kmer = shape.kmer_at(seq, j as usize);
+        if kmer == INVALID_KMER {
+            continue;
+        }
+        dst[at] = ((kmer as u64) << 32) | j as u64;
+        at += 1;
+        if transitions {
+            for t in 0..shape.kmer_size {
+                if shape.transition[t] {
+                    let idx = (kmer as u64) ^ (TRANSITION_MASK << (2 * t));
+                    dst[at] = (idx << 32) | j as u64;
+                    at += 1;
+                }
+            }
+        }
+    }
+    at
+}
+
 /// [`chunk_seeds`] over `threads` scoped workers.
 ///
 /// Query positions split into contiguous ranges, each worker runs the exact
@@ -480,6 +611,25 @@ pub fn concat_parts(parts: &[Vec<u64>], dst: &mut [u64]) -> usize {
 pub fn max_seeds(span: u32, shape: &Shape, transitions: bool) -> usize {
     let per_pos = if transitions { 1 + shape.kmer_size } else { 1 };
     span as usize * per_pos
+}
+
+/// Look-ahead budget for host seed slots (round 107): each producer of the
+/// host seed stream holds one worst-case batch.
+pub const SEED_AHEAD_BYTES: usize = 512 << 20;
+/// More producers than this only add slots. One thread writes a 250 kbp batch
+/// in 3 to 5 ms, and the fastest card measured (an A100 on hg38 x mm39) takes a
+/// batch every 4 ms on average, so six stay well ahead of it.
+pub const SEED_PRODUCERS_MAX: usize = 6;
+
+/// Producers of the host seed stream for a worker with `threads` threads and
+/// worst-case batches of `slot_bytes`: one per thread, at most
+/// [`SEED_PRODUCERS_MAX`], and no more than [`SEED_AHEAD_BYTES`] of slots.
+/// The host budget counts the same number.
+pub fn producers_auto(threads: usize, slot_bytes: usize) -> usize {
+    threads
+        .min(SEED_PRODUCERS_MAX)
+        .min(SEED_AHEAD_BYTES / slot_bytes.max(1))
+        .max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +963,58 @@ pub fn chunks(start: u32, end: u32, wga_chunk: u32) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 107: the direct writer is `chunk_seeds` without the `Vec`. Random
+    /// sequence with soft-masked runs, N runs and separators, both shapes, with
+    /// and without transitions, ranges that start and end inside invalid runs.
+    #[test]
+    fn chunk_seeds_into_equals_chunk_seeds() {
+        let mut x = 0x2545F4914F6CDD1Du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut seq = Vec::with_capacity(60_000);
+        while seq.len() < 60_000 {
+            let run = (next() % 400 + 1) as usize;
+            let kind = next() % 10;
+            for _ in 0..run {
+                let b = b"ACGT"[(next() >> 33) as usize & 3];
+                seq.push(match kind {
+                    0 => b.to_ascii_lowercase(),
+                    1 => b'N',
+                    2 => b'n',
+                    _ => b,
+                });
+            }
+        }
+        seq.truncate(60_000);
+        // 19 and 22 bases, a short one, exactly 32 bases (the word is full), and
+        // 36 bases (the plain loop).
+        let wide32 = "1100000000000000000000000000011";
+        let wide36 = "110000000000000000000000000000000011";
+        assert_eq!((wide32.len() + 1, wide36.len()), (32, 36));
+        let wide32 = format!("1{wide32}");
+        for spec in ["12of19", "14of22", "1101011", wide32.as_str(), wide36] {
+            let shape = Shape::parse(spec).unwrap();
+            let last = (seq.len() - shape.size) as u32;
+            for transitions in [false, true] {
+                for range in [(0, last), (0, 1), (17, 17), (123, 9_876), (40_000, last)] {
+                    let want = chunk_seeds(&seq, &shape, transitions, range);
+                    let mut dst = vec![u64::MAX; max_seeds(range.1 - range.0, &shape, transitions)];
+                    let n = chunk_seeds_into(&seq, &shape, transitions, range, &mut dst);
+                    assert_eq!(n, want.len(), "{spec} {transitions} {range:?}");
+                    assert_eq!(&dst[..n], &want[..], "{spec} {transitions} {range:?}");
+                    assert!(
+                        dst[n..].iter().all(|&v| v == u64::MAX),
+                        "wrote past its count"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn shape_12of19_matches_kegalign() {

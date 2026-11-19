@@ -957,6 +957,185 @@ pub mod device {
         }
     }
 
+    /// Round 110, `find-hits-groups`: one warp expands a run of 32 consecutive
+    /// seeds, with its lanes spread over the run's hits.
+    ///
+    /// [`find_hits_dense_warp`] gives every seed a warp, and at 22 hits per seed
+    /// most of its time is what a warp pays once per seed, a chain of dependent
+    /// loads (seed, index line, first positions), not the hits. Here thread `t`
+    /// owns seed slot `t`. Each lane loads its own seed, the index of its first
+    /// position (`seed_lo`, which [`find_num_hits_lo`] wrote next to the count,
+    /// so the index table is not read a second time) and its inclusive hit
+    /// prefix: three sequential streams, and the 32 chains of a run overlap.
+    ///
+    /// The prefix says how many of the run's hits come before each seed. Lane
+    /// `l` of round `i` writes the run's hit `h = 32 i + l`: [`run_owner`] finds
+    /// the seed `v` that holds it and the lane stores
+    /// `pos[end_v - 1 - (h - before_v)]` at raw address `base + h`. That is
+    /// seeds ascending and, inside a seed, descending position: the address
+    /// `prefix - 1 - j` the per-seed kernels give hit `j`, so the anchors are
+    /// the same words in the same places.
+    ///
+    /// Four rounds go through the loop together: their four positions are
+    /// requested before any is stored, so a warp has four loads in flight. On
+    /// an A100 that is what the kernel waits for (unit 0 of hg38 x mm39: 2,042
+    /// ms with one round per iteration, 1,686 with two, 1,515 with four; 2,900
+    /// for a warp per seed).
+    #[cfg(feature = "find-hits-groups")]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn find_hits_groups(
+        pos_table: &[u32],
+        seed_lo: &[u32],
+        seed_offsets: &[u64],
+        seed_size: u32,
+        seed_hit_num: &[u32],
+        mut anchors: DisjointSlice<u64>,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) {
+        let lane = thread::threadIdx_x() % WARP_SIZE;
+        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + thread::threadIdx_x();
+        let live = seed_slot < num_seeds;
+        let (mut end, mut count, mut query_loc, mut prefix) = (0u32, 0u32, 0u32, 0u32);
+        if live {
+            let at = (seed_slot + start_seed_index) as usize;
+            let seed_offset = seed_offsets[at];
+            prefix = seed_hit_num[at];
+            // The prefix is inclusive over the batch's seeds, so the seed's own
+            // count is its difference from the seed before.
+            let before = if at > 0 { seed_hit_num[at - 1] } else { 0 };
+            count = prefix - before;
+            end = seed_lo[at] + count;
+            query_loc = (seed_offset & 0xFFFF_FFFF) as u32 + seed_size;
+        }
+        // A warp's slots are consecutive, so its live lanes are a prefix of the
+        // warp and lane 0 is live whenever any lane is.
+        let live_mask = warp::ballot_sync(FULL_MASK, live);
+        if live_mask == 0 {
+            return;
+        }
+        // Hits of the batch before this lane's seed; lane 0's is the run's base.
+        let first = prefix.wrapping_sub(count);
+        let run_first = warp::shuffle_sync(FULL_MASK, first, 0);
+        // Hits of the run before this lane's seed. A lane past the chunk's seeds
+        // answers `u32::MAX`, which no hit index reaches, so it is never chosen.
+        let before = if live {
+            first.wrapping_sub(run_first)
+        } else {
+            u32::MAX
+        };
+        let last = 31 - live_mask.leading_zeros();
+        let total = warp::shuffle_sync(FULL_MASK, before.wrapping_add(count), last);
+        let base = run_first.wrapping_sub(start_hit_index);
+
+        let mut round = 0u32;
+        while round < total {
+            let h0 = round + lane;
+            let h1 = h0 + WARP_SIZE;
+            let h2 = h1 + WARP_SIZE;
+            let h3 = h2 + WARP_SIZE;
+            let (v0, b0) = run_owner(before, h0);
+            let (v1, b1) = run_owner(before, h1);
+            let (v2, b2) = run_owner(before, h2);
+            let (v3, b3) = run_owner(before, h3);
+            let end0 = warp::shuffle_sync(FULL_MASK, end, v0);
+            let end1 = warp::shuffle_sync(FULL_MASK, end, v1);
+            let end2 = warp::shuffle_sync(FULL_MASK, end, v2);
+            let end3 = warp::shuffle_sync(FULL_MASK, end, v3);
+            let query0 = warp::shuffle_sync(FULL_MASK, query_loc, v0);
+            let query1 = warp::shuffle_sync(FULL_MASK, query_loc, v1);
+            let query2 = warp::shuffle_sync(FULL_MASK, query_loc, v2);
+            let query3 = warp::shuffle_sync(FULL_MASK, query_loc, v3);
+            let (ok0, ok1, ok2, ok3) = (h0 < total, h1 < total, h2 < total, h3 < total);
+            let (mut r0, mut r1, mut r2, mut r3) = (0u32, 0u32, 0u32, 0u32);
+            if ok0 {
+                r0 = pos_table[(end0 - 1 - (h0 - b0)) as usize];
+            }
+            if ok1 {
+                r1 = pos_table[(end1 - 1 - (h1 - b1)) as usize];
+            }
+            if ok2 {
+                r2 = pos_table[(end2 - 1 - (h2 - b2)) as usize];
+            }
+            if ok3 {
+                r3 = pos_table[(end3 - 1 - (h3 - b3)) as usize];
+            }
+            // SAFETY: `base + h` runs over the run's own hit addresses for every
+            // `h < total`; the prefix offsets place them inside
+            // `0..iter_num_hits`, each once.
+            unsafe {
+                if ok0 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h0) as usize) =
+                        (r0 + seed_size) as u64 | ((query0 as u64) << 32);
+                }
+                if ok1 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h1) as usize) =
+                        (r1 + seed_size) as u64 | ((query1 as u64) << 32);
+                }
+                if ok2 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h2) as usize) =
+                        (r2 + seed_size) as u64 | ((query2 as u64) << 32);
+                }
+                if ok3 {
+                    *anchors.get_unchecked_mut(base.wrapping_add(h3) as usize) =
+                        (r3 + seed_size) as u64 | ((query3 as u64) << 32);
+                }
+            }
+            round += 4 * WARP_SIZE;
+        }
+    }
+
+    /// The seed of a run that holds hit `h`: the last lane with `before <= h`,
+    /// and that lane's `before`. Seeds without hits share their `before` with
+    /// the next one, so the last such seed always has hits (if `h` is below the
+    /// run's total) and is the one that holds `h`. Five probes, each answered
+    /// by the lane that owns the probed seed; every lane of the warp must call
+    /// it.
+    #[cfg(feature = "find-hits-groups")]
+    #[inline(always)]
+    fn run_owner(before: u32, h: u32) -> (u32, u32) {
+        let (mut v, mut before_v) = (0u32, 0u32);
+        let mut step = 16u32;
+        while step > 0 {
+            let b = warp::shuffle_sync(FULL_MASK, before, v + step);
+            if b <= h {
+                v += step;
+                before_v = b;
+            }
+            step >>= 1;
+        }
+        (v, before_v)
+    }
+
+    /// [`find_num_hits`] that also writes where each seed's positions start in
+    /// `pos_table`, for [`find_hits_groups`].
+    #[cfg(feature = "find-hits-groups")]
+    #[kernel]
+    pub fn find_num_hits_lo(
+        num_seeds: u32,
+        index_table: &[u32],
+        seed_offsets: &[u64],
+        mut seed_hit_num: DisjointSlice<u32>,
+        mut seed_lo: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut id = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while id < num_seeds {
+            let i = id as usize;
+            let seed = (seed_offsets[i] >> 32) as usize;
+            let end = index_table[seed];
+            let start = if seed > 0 { index_table[seed - 1] } else { 0 };
+            // SAFETY: `id < num_seeds`, and the host sizes both buffers for it.
+            unsafe {
+                *seed_hit_num.get_unchecked_mut(i) = end - start;
+                *seed_lo.get_unchecked_mut(i) = start;
+            }
+            id += stride;
+        }
+    }
+
     /// Round 83, `ref-loc-buckets`: per-block histogram of the reference
     /// address bucket `(anchor as u32) >> shift`, laid out bucket-major and
     /// block-minor so one inclusive scan of `counts` gives every block its

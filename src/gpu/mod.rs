@@ -989,6 +989,10 @@ pub struct Engine {
     /// skips the bucket pass, whose window would not fit the L2 as bytes.
     #[cfg(feature = "ref-loc-buckets")]
     bucket_planes: bool,
+    /// Round 110 (`find-hits-groups`, experiment): which kernel expands the
+    /// seeds of a chunk into anchors.
+    #[cfg(feature = "find-hits-groups")]
+    find_hits_groups: FindHitsGroups,
     #[cfg(feature = "ref-loc-buckets")]
     bucket_shift: u32,
     #[cfg(feature = "ref-loc-buckets")]
@@ -1994,6 +1998,8 @@ impl Engine {
             buf_flags_bits: unsafe { uninitialized(&stream, 0)? },
             #[cfg(feature = "ref-loc-buckets")]
             bucket_planes,
+            #[cfg(feature = "find-hits-groups")]
+            find_hits_groups: find_hits_groups_request(),
             #[cfg(feature = "ref-loc-buckets")]
             bucket_shift,
             #[cfg(feature = "ref-loc-buckets")]
@@ -2589,17 +2595,47 @@ impl Engine {
                 )?;
             }
         } else {
-            // SAFETY: grid-stride kernel; `index_table` covers every seed value and
-            // `d_hit_num` has one slot per seed.
-            unsafe {
-                self.module.find_num_hits(
-                    &self.stream,
-                    elementwise(),
-                    num_seeds,
-                    &self.index_table,
-                    &self.seed_slots[slot],
-                    &mut self.buf_hit_num,
-                )?;
+            // Round 110: the group kernel needs each seed's start index beside
+            // its count.
+            #[cfg(feature = "find-hits-groups")]
+            let with_lo = self.find_hits_groups != FindHitsGroups::Off;
+            #[cfg(not(feature = "find-hits-groups"))]
+            let with_lo = false;
+            #[cfg(feature = "find-hits-groups")]
+            if with_lo {
+                // SAFETY: as below; `buf_seed_lo` is grown to one slot per seed
+                // and fully written before `find_hits_groups` reads it.
+                unsafe {
+                    reserve(
+                        &mut self.buf_seed_lo,
+                        &self.stream,
+                        num_seeds as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                    self.module.find_num_hits_lo(
+                        &self.stream,
+                        elementwise(),
+                        num_seeds,
+                        &self.index_table,
+                        &self.seed_slots[slot],
+                        &mut self.buf_hit_num,
+                        &mut self.buf_seed_lo,
+                    )?;
+                }
+            }
+            if !with_lo {
+                // SAFETY: grid-stride kernel; `index_table` covers every seed value
+                // and `d_hit_num` has one slot per seed.
+                unsafe {
+                    self.module.find_num_hits(
+                        &self.stream,
+                        elementwise(),
+                        num_seeds,
+                        &self.index_table,
+                        &self.seed_slots[slot],
+                        &mut self.buf_hit_num,
+                    )?;
+                }
             }
         }
         self.end_stage(stage, "find_num_hits")?;
@@ -2885,6 +2921,29 @@ impl Engine {
             // cutoff anyway.
             let warp_find_hits =
                 self.paired.is_none() && use_warp_find_hits(iter_num_hits, iter_num_seeds);
+            // Round 110: the same anchors from runs of 32 seeds per warp.
+            #[cfg(feature = "find-hits-groups")]
+            let groups = if self.paired.is_none() {
+                self.find_hits_groups
+            } else {
+                FindHitsGroups::Off
+            };
+            #[cfg(feature = "find-hits-groups")]
+            let by_groups = groups == FindHitsGroups::On;
+            #[cfg(not(feature = "find-hits-groups"))]
+            let by_groups = false;
+            #[cfg(feature = "find-hits-groups")]
+            if by_groups {
+                use std::sync::atomic::Ordering::Relaxed;
+                find_hits_groups_totals::CHUNKS.fetch_add(1, Relaxed);
+                find_hits_groups_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
+                self.launch_find_hits_groups(
+                    slot,
+                    start_seed_index,
+                    start_hit_val,
+                    iter_num_seeds,
+                )?;
+            }
             // SAFETY: one thread or warp per seed; every store lands inside
             // `0..iter_num_hits` by construction of the prefix offsets.
             #[cfg(not(feature = "dense-anchors"))]
@@ -2933,7 +2992,7 @@ impl Engine {
                 }
             }
             #[cfg(feature = "dense-anchors")]
-            if self.paired.is_none() {
+            if self.paired.is_none() && !by_groups {
                 unsafe {
                     #[cfg(feature = "find-hits-warp")]
                     if warp_find_hits {
@@ -2995,12 +3054,24 @@ impl Engine {
             }
             self.end_stage(
                 stage,
-                if warp_find_hits {
+                if by_groups {
+                    "find_hits (groups)"
+                } else if warp_find_hits {
                     "find_hits (warp)"
                 } else {
                     "find_hits"
                 },
             )?;
+            #[cfg(feature = "find-hits-groups")]
+            if groups == FindHitsGroups::Check {
+                self.check_find_hits_groups(
+                    slot,
+                    start_seed_index,
+                    start_hit_val,
+                    iter_num_seeds,
+                    iter_num_hits,
+                )?;
+            }
             // Round 2: the compiled-in pass is a runtime choice, so one binary
             // covers both a card the window helps and one it does not
             // (`HSPZ_REF_BUCKETS=0`). Round 87 `auto` runs alternating LONG
@@ -4073,6 +4144,83 @@ impl Engine {
         Ok(out)
     }
 
+    /// Round 110: expands a chunk's seeds into `buf_anchor` with one warp per
+    /// run of 32 seeds (thread `t` owns seed slot `t`), from the start indices
+    /// `find_num_hits_lo` left in `buf_seed_lo`.
+    #[cfg(feature = "find-hits-groups")]
+    fn launch_find_hits_groups(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+    ) -> Result<(), DriverError> {
+        // SAFETY: every store lands inside `0..iter_num_hits` by construction of
+        // the prefix offsets, as for the other `find_hits` kernels.
+        unsafe {
+            self.module.find_hits_groups(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                    block_dim: (BLOCK_SIZE, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &self.pos_table,
+                &self.buf_seed_lo,
+                &self.seed_slots[slot],
+                self.seed_size,
+                &self.buf_hit_num,
+                &mut self.buf_anchor,
+                start_seed_index,
+                start_hit_index,
+                num_seeds,
+            )
+        }
+    }
+
+    /// Round 110, `HSPZ_FIND_HITS_GROUPS=check`: a per-seed kernel has just
+    /// written this chunk's anchors; expand the seeds again by groups into a
+    /// zeroed scratch buffer and compare every anchor on the host.
+    #[cfg(feature = "find-hits-groups")]
+    fn check_find_hits_groups(
+        &mut self,
+        slot: usize,
+        start_seed_index: u32,
+        start_hit_index: u32,
+        num_seeds: u32,
+        num_hits: u32,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = num_hits as usize;
+        self.sync_pipeline()?;
+        let want = copy_prefix(&self.buf_anchor, &self.stream, n)?;
+        // Zeroed, so a slot the group kernel never wrote cannot pass on what was
+        // there before (no anchor is zero: `ref_loc >= seed_size`).
+        let mut scratch = DeviceBuffer::<u64>::zeroed(&self.stream, n)?;
+        std::mem::swap(&mut self.buf_anchor, &mut scratch);
+        let stage = self.stage();
+        let launched =
+            self.launch_find_hits_groups(slot, start_seed_index, start_hit_index, num_seeds);
+        let ended = self.end_stage(stage, "find_hits (groups)");
+        let synced = self.sync_pipeline();
+        std::mem::swap(&mut self.buf_anchor, &mut scratch);
+        launched?;
+        ended?;
+        synced?;
+        let got = copy_prefix(&scratch, &self.stream, n)?;
+        if let Some(p) = (0..n).find(|&p| got[p] != want[p]) {
+            return Err(format!(
+                "find-hits-groups check: anchor {p} of {n} (chunk seeds {start_seed_index}+{num_seeds}): \
+                 {:#018x} by groups, {:#018x} by the per-seed kernel",
+                got[p], want[p]
+            )
+            .into());
+        }
+        find_hits_groups_totals::CHECKED_CHUNKS.fetch_add(1, Relaxed);
+        find_hits_groups_totals::CHECKED_HITS.fetch_add(n as u64, Relaxed);
+        Ok(())
+    }
+
     fn stage(&self) -> Stage {
         Stage::begin(&self.stream, self.timing)
     }
@@ -4817,6 +4965,48 @@ impl Engine {
         sieve_totals::KEPT_BUT_REJECTED.fetch_add(sum(3), Relaxed);
         Ok(candidates)
     }
+}
+
+/// Round 110 (`find-hits-groups`): which kernel expands a chunk's seeds.
+/// `HSPZ_FIND_HITS_GROUPS` unset: runs of 32 seeds per warp
+/// (`find_hits_groups`). `0`: one warp or one thread per seed, as before round
+/// 110. `check`: both, refusing the run at the first anchor that differs.
+#[cfg(feature = "find-hits-groups")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FindHitsGroups {
+    Off,
+    On,
+    Check,
+}
+
+#[cfg(feature = "find-hits-groups")]
+fn find_hits_groups_request() -> FindHitsGroups {
+    // Read once, so a value that is not understood is reported once and not by
+    // every engine.
+    static REQUEST: std::sync::OnceLock<FindHitsGroups> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_FIND_HITS_GROUPS").as_deref() {
+        Err(_) | Ok("1") => FindHitsGroups::On,
+        Ok("0") => FindHitsGroups::Off,
+        Ok("check") => FindHitsGroups::Check,
+        Ok(other) => {
+            eprintln!(
+                "warning: HSPZ_FIND_HITS_GROUPS={other:?} is not 0, 1 or check; using 1 (runs of \
+                     32 seeds per warp)"
+            );
+            FindHitsGroups::On
+        }
+    })
+}
+
+/// Chunks and hits the group kernel expanded, and those whose anchors the two
+/// kernels agreed on.
+#[cfg(feature = "find-hits-groups")]
+pub mod find_hits_groups_totals {
+    use std::sync::atomic::AtomicU64;
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static CHECKED_HITS: AtomicU64 = AtomicU64::new(0);
 }
 
 /// `MAX_BLOCKS x MAX_THREADS`, the geometry KegAlign uses for its two
