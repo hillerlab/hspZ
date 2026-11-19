@@ -12,8 +12,8 @@
 ## C.1 — Count each seed's reference occurrences
 <!-- @id: c-count-hits -->
 WHAT GOES IN: Query seed offsets and the reference index table.
-WHAT HAPPENS: `find_num_hits` subtracts adjacent cumulative bucket ends for each seed.
-WHAT COMES OUT: One reference-hit count per query seed.
+WHAT HAPPENS: `find_num_hits` subtracts adjacent cumulative bucket ends for each seed and keeps the index of the bucket's first position beside the count, so the expansion does not read the index table a second time.
+WHAT COMES OUT: One reference-hit count and one bucket start per query seed.
 INVARIANT: Empty buckets contribute zero without changing seed order.
 
 ```mermaid
@@ -24,7 +24,7 @@ sequenceDiagram
     participant N as Hit counts
     Q->>C: packed k-mer per seed
     C->>I: bucket end - previous end
-    C-->>N: count in seed order
+    C-->>N: count and bucket start in seed order
 ```
 
 ## C.2 — Turn counts into global prefixes
@@ -65,25 +65,24 @@ sequenceDiagram
     L-->>C: seed range + hit range
 ```
 
-## C.4 — Choose sparse or dense expansion
+## C.4 — Give each warp a run of 32 seeds
 <!-- @id: c-mapping -->
-WHAT GOES IN: One chunk's seed count and hit count.
-WHAT HAPPENS: Sparse launches assign one thread per seed; at 8 or more hits per seed (16 before 0.0.5), one warp walks a seed bucket coalescently.
-WHAT COMES OUT: The same packed anchors under either execution mapping.
+WHAT GOES IN: One chunk's seeds with their bucket starts and inclusive hit prefixes.
+WHAT HAPPENS: A warp owns 32 consecutive seeds (0.1.0). Each lane loads its own seed; the prefixes say how many of the run's hits come before each seed, and the lanes are then spread over the run's hits, each finding the seed that holds its hit with five shuffles. Four rounds of 32 positions are requested before any anchor is stored, so a warp has four loads in flight. `HSPZ_FIND_HITS_GROUPS=0` and `--paired` use the earlier mappings: one thread per seed, or one warp per seed at 8 or more hits per seed.
+WHAT COMES OUT: The same packed anchors under any execution mapping.
 INVARIANT: Mapping changes memory traffic, not prefix-derived destinations.
 
 ```mermaid
 sequenceDiagram
     participant C as Hit chunk
-    participant M as Density choice
-    participant T as Thread-per-seed
-    participant W as Warp-per-seed
+    participant R as Run of 32 seeds
+    participant L as Lanes over the run's hits
+    participant P as Position table
     participant A as Anchors
-    C->>M: hits / seeds
-    M->>T: sparse path
-    M->>W: density at least 16
-    T-->>A: prefix destinations
-    W-->>A: same destinations
+    C->>R: seed, bucket start, prefix per lane
+    R->>L: hits before each seed
+    L->>P: four rounds of 32 positions
+    P-->>A: prefix destinations
 ```
 
 ## C.5 — Expand buckets backwards
