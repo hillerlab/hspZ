@@ -8,6 +8,9 @@
 <!-- @source: src/gpu/kernels.rs::find_hits_dense -->
 <!-- @source: src/gpu/kernels.rs::find_hits_dense_warp -->
 <!-- @source: src/gpu/mod.rs::use_warp_find_hits -->
+<!-- @source: src/gpu/kernels.rs::bucket_nibbles -->
+<!-- @source: src/gpu/kernels.rs::run_bucket_counts -->
+<!-- @source: src/gpu/kernels.rs::find_hits_groups_bucketed -->
 
 ## C.1 — Count each seed's reference occurrences
 <!-- @id: c-count-hits -->
@@ -101,4 +104,24 @@ sequenceDiagram
     S->>B: bucket start..end
     B->>P: occurrence j
     P-->>A: prefix - 1 - chunk start - j
+```
+
+## C.6 — Or write each anchor straight into its reference window
+<!-- @id: c-expand-bucketed -->
+WHAT GOES IN: The same seeds, each k-mer's hits per reference window (four bits per window in a table the size of the index table, with rows of window edges for the few k-mers above 14 hits in a window), and the windows of the score gate (D.6).
+WHAT HAPPENS: When the score gate will read the anchors by reference window and take its survivors in that order (0.1.0), C.4 and C.5 are replaced. A pass over the seeds sums the per-window counts of every run of 32 seeds and a scan gives each run its place in each window; a warp then takes its run's hits window by window, numbers them, and lane `l` of a round stores hit `round + l` at the run's place plus that number, so one store writes 32 consecutive anchors.
+WHAT COMES OUT: The anchor array already grouped by reference window, with no raw-order copy, no count over anchors and no scatter.
+INVARIANT: Each window holds the same anchors as the counting sort of D.6 would put there; only their order inside the window differs, and nothing downstream depends on it (`HSPZ_HITS_BUCKETED=check` compares the two on the host; `=0` restores C.4 and C.5).
+
+```mermaid
+sequenceDiagram
+    participant K as Counts per k-mer and window
+    participant R as Run of 32 seeds
+    participant S as Scan
+    participant W as Warp
+    participant A as Anchors by window
+    K->>R: hits per window of each seed
+    R->>S: run totals per window
+    S-->>W: the run's place in each window
+    W->>A: window by window, 32 consecutive anchors per store
 ```
