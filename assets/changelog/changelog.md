@@ -38,7 +38,7 @@ All notable changes to `hspZ` are documented here, newest first.
 
 ## [0.1.0] — 2026-11-19
 
-Exact speed-ups, all on by default. A whole genome takes about a sixth of the time and every byte of the output
+Exact speed-ups, all on by default. A whole genome takes less than a sixth of the time and every byte of the output
 is the same as with 0.0.6, which is why this is a minor release and not a patch: run times, GPU-hour budgets and
 schedules planned on 0.0.x numbers no longer hold.
 
@@ -47,10 +47,10 @@ to that run's (3,864 files, 865,049,792 bytes, 15,917,736 HSPs):
 
 | cards | 0.0.5 | 0.1.0 | |
 | ---: | ---: | ---: | --- |
-| 1 | 3,491.8 s | **581–588 s** | 6.0× |
-| 8 | 576.9 s | **100.5 s** | 5.7× |
+| 1 | 3,491.8 s | **555–560 s** | 6.3× |
+| 8 | 576.9 s | **89.8 s** | 6.4× |
 
-Change by change (the last three rows against the build before them on the same card):
+Change by change (the last five rows against the build before them on the same card):
 
 | change | one card | eight cards |
 | --- | --- | --- |
@@ -59,9 +59,13 @@ Change by change (the last three rows against the build before them on the same 
 | host side: seeds produced ahead, query packs ahead, inputs read together | 775 → 712 s, 765 → 703 s | 125 → 119 s |
 | `find_hits` by runs of 32 seeds per warp | 711 → 656 s, 703 → 648 s | 120 → 112 s |
 | the sieve's bound carried on for sides that have not decided | 656 → 588 s, 649 → 581 s | 111 → 100 s |
+| start-up: the seed table built by partitions, the devices opened once | 588 → 583 s, 581 → 576 s | 100 → 91 s |
+| the bucket pass without its loop of votes | 581 → 560 s, 575 → 555 s | 92.7 → 89.8 s |
 
-The same build takes 581 to 588 s on two cards of one node, so a difference of 1% between two runs is not a
-result. Two, four and six cards were measured only before the last three changes: 380.0, 218.1 and 149.4 s
+The same build takes 555 to 560 s on two cards of one node, so a difference of 1% between two runs is not a
+result, and the eight-card control of the last row (92.7 s) was taken hours after the 91 s of the row above
+it, on a node whose host-side phases had drifted by about a second. Two, four and six cards were measured
+only before the last five changes: 380.0, 218.1 and 149.4 s
 (1,771.8, 942.9 and 648.0 s with 0.0.5). All times are with `--time`, which itself costs about 3%. Other species
 pairs and other GPU classes were not measured for this release, except where a bullet says so.
 
@@ -135,7 +139,7 @@ pairs and other GPU classes were not measured for this release, except where a b
   - **Verified.** A property test over 12 million random hits (soft-masked runs, N runs, record separators,
     IUPAC codes, both sequence ends, five X-drops, two matrices), each walked at three window lengths and four
     thresholds, finds no certified bound below the exact score, no kept hit rejected and no rejection taken
-    back by a longer window, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 38
+    back by a longer window, and catches three deliberately low bounds. `assets/tests/sieve-identity.sh` runs 45
     option sets with and without the sieve on an RX 6500 XT through ZLUDA: byte-identical every time, and with
     `HSPZ_GATE_SIEVE_CHECK=1` the host recomputes every hit of each run (192,899,566 on the chr20 pair), the lane's decision and the
     exact gate, and finds no disagreement with the device. The plain gate kernels behind `HSPZ_GATE_SIEVE=0`
@@ -154,6 +158,31 @@ pairs and other GPU classes were not measured for this release, except where a b
   - `HSPZ_FIND_HITS_GROUPS=0` restores the earlier kernels; `=check` runs both on every chunk and compares
     every anchor on the host. On an A100 that check passed on all 125,607,610,143 anchors of unit 0.
     `--paired` keeps its own kernel.
+- **The bucket pass without its loop of votes: 147 s → 127 s of GPU on that genome.** The pass sorts a batch's
+  hits by reference window in two kernels, a count and a scatter, and both learned which lanes of a warp share
+  a window by taking one vote per window: seven trips of a loop that every lane walked. One `match` instruction
+  now gives each lane the lanes that hold its window; the first of them stores the window's count for the warp,
+  and a lane's rank is the number of those lanes before it. The two buffers are the same words in the same
+  places. Unit 0 on an A100: count 1,048 → 782 ms, scatter 1,947 → 1,824 ms; what is left is the memory the
+  two kernels move, which is now close to what the card gives. `HSPZ_BUCKET_VOTES=loop` restores the earlier
+  kernels, and `HSPZ_BUCKET_ORDER_CHECK=<n>` proves the permutation on the device for the first n batches (on
+  an A100 it passed on the first 100 batches of unit 0, and `sieve-identity.sh` runs it on every batch with 1,
+  4, 8, 16 and 31 windows).
+- **Start-up: the seed table of a reference bin in a second instead of eight; the devices opened once.**
+  With eight cards a run was start-up plus its slowest worker: each worker built its first seed table in 7 to
+  9 s while seven others did the same, and the devices were opened twice (probed one after another for free
+  memory, released, then built again by each worker).
+  - **Seed table.** The builder made three random memory accesses per reference position. Now every position
+    is first written, with the low bits of its k-mer, into the stream of its partition (the k-mer's four
+    leading care bases), and each partition is sorted on its own, where its count table and its part of the
+    position table stay in cache: 0.8–1.1 s per worker with eight builds at once, byte-identical tables. The
+    pairs are 8 bytes per position; a bin's pairs are held at once where the host budget has room for them
+    and in rounds of at most max(512 MiB, the old builder's count tables) otherwise (`--time` prints which).
+    `HSPZ_SEED_TABLE=two-pass` restores the earlier builder and `=rounds` keeps the pairs bounded.
+  - **Devices.** The contexts of all cards are created at the same time and held to the end of the run, so a
+    worker only takes a reference to its card's context.
+  - On one card the first table is 0.5 s instead of 4.3 s and the run is about 1% shorter; peak resident
+    memory falls from 13.0 to 11.7 GB (42.2 to 38.3 GB at eight cards).
 - **Host side: seeds produced ahead, query packs ahead, inputs read together.** With the gate five times
   faster, a one-card run spent a fifth of its time outside the GPU.
   - **Seeds.** One seed batch used to be generated per loop iteration, with a thread spawned per core for

@@ -44,8 +44,8 @@ sequenceDiagram
 ## B.3 — Count reference k-mers
 <!-- @id: b-count -->
 WHAT GOES IN: A packed reference bin, Shape, step, and CPU worker count.
-WHAT HAPPENS: Workers rescan disjoint position ranges and count each valid k-mer into private tables.
-WHAT COMES OUT: Per-worker counts for every possible packed k-mer.
+WHAT HAPPENS: Workers scan disjoint position ranges and count how many valid k-mers each sends to each partition, the k-mer's leading care bases (0.1.0; a shape longer than 32 bases keeps a private table per worker with one count per k-mer).
+WHAT COMES OUT: Per-worker counts for every partition.
 INVARIANT: Reference position zero and the strided starts match KegAlign's offset rule exactly.
 
 ```mermaid
@@ -60,20 +60,20 @@ sequenceDiagram
 
 ## B.4 — Scan and scatter a stable index
 <!-- @id: b-scatter -->
-WHAT GOES IN: Per-worker k-mer counts and the same reference ranges.
-WHAT HAPPENS: Two-level prefixes assign disjoint bucket cursors; workers rescan and scatter genomic positions.
+WHAT GOES IN: Per-worker partition counts and the same reference ranges.
+WHAT HAPPENS: Prefixes over partitions and workers assign disjoint stream cursors; workers rescan and write each position with the low bits of its k-mer into its partition's stream, and each partition is then counting-sorted on its own, inside a cache (0.1.0). A bin's pairs are held at once where the host budget allows and in rounds otherwise.
 WHAT COMES OUT: Cumulative `index_table` boundaries and bucketed `pos_table` positions.
 INVARIANT: Positions remain ascending inside every bucket, byte-identical to the serial builder and to the arrays `hspZ index` stores for `run --index`.
 
 ```mermaid
 sequenceDiagram
     participant C as Private counts
-    participant S as Two-level scan
+    participant S as Prefix scan
     participant W as CPU workers
     participant T as SeedTable
-    C->>S: counts by worker and k-mer
-    S-->>W: disjoint bucket cursors
-    W->>T: rescan + stable scatter
+    C->>S: counts by worker and partition
+    S-->>W: disjoint stream cursors
+    W->>T: rescan, then a stable sort per partition
     T-->>T: cumulative index + positions
 ```
 
