@@ -30,6 +30,154 @@ pub const INVALID_KMER: u32 = 1 << 31;
 /// `parameters.h: TRANSITION_MASK`.
 const TRANSITION_MASK: u64 = 2;
 
+/// Round 122: what `HSPZ_FOLD` asks of the transition fold
+/// (`gpu::FoldRequest`): `0` no fold, `1` the fold wherever an engine can have
+/// it, `check` the same with every device-built table compared with
+/// [`fold_tables`]. Unset is `FOLD_DEFAULT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+    Off,
+    On,
+    Check,
+}
+
+const FOLD_DEFAULT: Fold = Fold::On;
+
+pub fn fold_request() -> Fold {
+    static REQUEST: std::sync::OnceLock<Fold> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_FOLD").as_deref() {
+        Err(_) => FOLD_DEFAULT,
+        Ok("0") => Fold::Off,
+        Ok("1") => Fold::On,
+        Ok("check") => Fold::Check,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_FOLD={other:?} is not 0, 1 or check; using the default");
+            FOLD_DEFAULT
+        }
+    })
+}
+
+/// Round 122: the seed table in which every k-mer holds its own positions and
+/// those of its single-transition variants, in ascending order. Bit `t` of
+/// `mask` says that care position `t` admits a transition.
+///
+/// A query position's seeds are its k-mer and that k-mer with one care
+/// position changed by a transition ([`Shape::push_seeds`]). Those words
+/// differ from one another in one or two 2-bit fields, so they are distinct
+/// k-mers, and a reference position has one k-mer: the position lists of a
+/// query position's seeds are disjoint. Their union is that position's hits,
+/// each once, and it is the list this table holds for the k-mer alone. A batch
+/// seeded without transitions against it has the hits of the same batch seeded
+/// with them against the plain table.
+///
+/// The engine builds its own on the device (`gpu::Engine::fold_tables`, in
+/// window order instead of ascending); this is what it is checked against.
+/// `None` when the folded positions do not fit 32-bit offsets: every position
+/// is held once per variant, 13 times `pos_table` for 12 care positions.
+#[cfg_attr(
+    not(any(
+        test,
+        all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        )
+    )),
+    allow(dead_code)
+)]
+pub fn fold_tables(
+    index_table: &[u32],
+    pos_table: &[u32],
+    mask: u32,
+    kmer_size: usize,
+    threads: usize,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    let masks: Vec<usize> = (0..kmer_size)
+        .filter(|&t| (mask >> t) & 1 != 0)
+        .map(|t| (TRANSITION_MASK as usize) << (2 * t))
+        .collect();
+    let n = index_table.len();
+    let total = pos_table.len() as u64 * (masks.len() as u64 + 1);
+    if total > u64::from(u32::MAX) {
+        return None;
+    }
+    let span = |k: usize| -> (usize, usize) {
+        let start = if k > 0 { index_table[k - 1] } else { 0 };
+        (start as usize, index_table[k] as usize)
+    };
+    let threads = threads.max(1);
+    let per = n.div_ceil(threads).max(1);
+
+    // The folded length of every k-mer, then where each one ends.
+    let mut index = vec![0u32; n];
+    std::thread::scope(|scope| {
+        for (c, out) in index.chunks_mut(per).enumerate() {
+            let (masks, span) = (&masks, &span);
+            scope.spawn(move || {
+                for (i, slot) in out.iter_mut().enumerate() {
+                    let k = c * per + i;
+                    let (a, b) = span(k);
+                    let mut len = b - a;
+                    for &m in masks {
+                        let (a, b) = span(k ^ m);
+                        len += b - a;
+                    }
+                    *slot = len as u32;
+                }
+            });
+        }
+    });
+    let mut end = 0u32;
+    for slot in index.iter_mut() {
+        end += *slot;
+        *slot = end;
+    }
+    debug_assert_eq!(u64::from(end), total);
+
+    // Fill: the k-mers are cut into ranges of about equal output, and each
+    // range's thread owns its slice of the positions.
+    let mut pos = vec![0u32; total as usize];
+    let cuts: Vec<usize> = (0..=threads)
+        .map(|t| {
+            let want = (total * t as u64 / threads as u64) as u32;
+            index.partition_point(|&e| e < want)
+        })
+        .collect();
+    std::thread::scope(|scope| {
+        let mut rest: &mut [u32] = &mut pos;
+        let mut done = 0usize;
+        for t in 0..threads {
+            let (lo, hi) = (cuts[t], if t + 1 == threads { n } else { cuts[t + 1] });
+            if lo >= hi {
+                continue;
+            }
+            let upto = index[hi - 1] as usize;
+            let (mine, tail) = rest.split_at_mut(upto - done);
+            rest = tail;
+            done = upto;
+            let (masks, span) = (&masks, &span);
+            scope.spawn(move || {
+                let mut at = 0usize;
+                for k in lo..hi {
+                    let first = at;
+                    let (a, b) = span(k);
+                    mine[at..at + (b - a)].copy_from_slice(&pos_table[a..b]);
+                    at += b - a;
+                    for &m in masks {
+                        let (a, b) = span(k ^ m);
+                        mine[at..at + (b - a)].copy_from_slice(&pos_table[a..b]);
+                        at += b - a;
+                    }
+                    // Runs that each ascend: the stable sort merges them.
+                    mine[first..at].sort();
+                }
+                debug_assert_eq!(at, mine.len());
+            });
+        }
+    });
+    Some((index, pos))
+}
+
 /// A spaced seed pattern (`GenerateShapePos`).
 #[derive(Debug, Clone)]
 pub struct Shape {
@@ -99,6 +247,13 @@ impl Shape {
             kmer = (kmer << 2) + nt_char_to_int(window[p]) as u32;
         }
         kmer
+    }
+
+    /// Bit `t` set when care position `t` admits a transition.
+    pub fn transition_mask(&self) -> u32 {
+        (0..self.kmer_size)
+            .filter(|&t| self.transition[t])
+            .fold(0, |m, t| m | 1 << t)
     }
 
     /// The seed offsets `seeder.cpp` pushes for one query position: the k-mer
@@ -1342,6 +1497,125 @@ pub fn chunks(start: u32, end: u32, wga_chunk: u32) -> Vec<(u32, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round 122: every seed batch finds the same reference positions, seeded
+    /// without transitions against the folded table or with them against the
+    /// plain one, position by position; and the fold does not depend on its
+    /// thread count. Two short shapes and 12of19, each also with two care
+    /// positions that admit no transition; a reference with repeats, masked
+    /// runs and Ns.
+    #[test]
+    fn folded_table_gives_each_position_its_variants_hits() {
+        let mut x = 0x9E3779B97F4A7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut reference = Vec::with_capacity(40_000);
+        while reference.len() < 40_000 {
+            let run = (next() % 300 + 1) as usize;
+            let kind = next() % 12;
+            // A few short motifs repeated, so that k-mers and their variants
+            // have long lists.
+            let motif = [b"ACGTTGCA".as_slice(), b"AAGGAAGA", b"CACACATA"][(next() % 3) as usize];
+            for i in 0..run {
+                let b = if kind >= 9 {
+                    motif[i % motif.len()]
+                } else {
+                    b"ACGT"[(next() >> 33) as usize & 3]
+                };
+                reference.push(match kind {
+                    0 => b.to_ascii_lowercase(),
+                    1 => b'N',
+                    _ => b,
+                });
+            }
+        }
+        reference.truncate(40_000);
+        // Stretches of the reference with a transition every few bases, so
+        // that a long seed hits through its variants too, between random ones.
+        let query: Vec<u8> = (0..6_000usize)
+            .map(|i| {
+                let copied = reference[(7_000 + i) % reference.len()].to_ascii_uppercase();
+                if i % 700 < 60 {
+                    b'N'
+                } else if i % 1_000 < 800 && copied != b'N' {
+                    if next() % 9 == 0 {
+                        match copied {
+                            b'A' => b'G',
+                            b'G' => b'A',
+                            b'C' => b'T',
+                            _ => b'C',
+                        }
+                    } else {
+                        copied
+                    }
+                } else {
+                    b"ACGT"[(next() >> 33) as usize & 3]
+                }
+            })
+            .collect();
+        for (spec, some) in [
+            ("1101011", false),
+            ("1101011", true),
+            ("110010111", true),
+            ("12of19", false),
+            ("12of19", true),
+        ] {
+            let mut shape = Shape::parse(spec).unwrap();
+            if some {
+                shape.transition[1] = false;
+                shape.transition[3] = false;
+            }
+            let plain = SeedTable::build(&reference, &shape, 1);
+            let mask = shape.transition_mask();
+            let (index, pos) = fold_tables(
+                &plain.index_table,
+                &plain.pos_table,
+                mask,
+                shape.kmer_size,
+                3,
+            )
+            .unwrap();
+            assert_eq!(
+                fold_tables(
+                    &plain.index_table,
+                    &plain.pos_table,
+                    mask,
+                    shape.kmer_size,
+                    1
+                )
+                .unwrap(),
+                (index.clone(), pos.clone()),
+                "{spec}: one thread and three"
+            );
+            let per = 1 + mask.count_ones() as usize;
+            assert_eq!(pos.len(), plain.pos_table.len() * per, "{spec}");
+            let list = |index: &[u32], pos: &[u32], k: u32| -> Vec<u32> {
+                let start = if k > 0 { index[k as usize - 1] } else { 0 };
+                pos[start as usize..index[k as usize] as usize].to_vec()
+            };
+            let range = (0u32, (query.len() - shape.size + 1) as u32);
+            let with = chunk_seeds(&query, &shape, true, range);
+            let without = chunk_seeds(&query, &shape, false, range);
+            assert_eq!(with.len(), without.len() * per, "{spec}");
+            let mut hits = 0usize;
+            for (i, &seed) in without.iter().enumerate() {
+                let mut want: Vec<u32> = with[i * per..(i + 1) * per]
+                    .iter()
+                    .inspect(|&&s| assert_eq!(s as u32, seed as u32, "{spec}: one query position"))
+                    .flat_map(|&s| list(&plain.index_table, &plain.pos_table, (s >> 32) as u32))
+                    .collect();
+                want.sort_unstable();
+                let got = list(&index, &pos, (seed >> 32) as u32);
+                assert_eq!(got, want, "{spec}: query position {}", seed as u32);
+                hits += got.len();
+            }
+            assert!(hits > 1_000, "{spec}: {hits} hits is not a test");
+        }
+    }
 
     /// Round 107: the direct writer is `chunk_seeds` without the `Vec`. Random
     /// sequence with soft-masked runs, N runs and separators, both shapes, with

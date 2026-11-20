@@ -132,7 +132,28 @@ pub struct FilterOutput {
     /// driver re-issues it one pair per call (`paired.rs`). Always `false`
     /// elsewhere.
     pub oversized: bool,
+    /// Round 121: with `defer_dedup`, each `MAX_HITS` chunk's HSPs as they came
+    /// off the device, for the caller to put through `hsp::dedup_and_order`
+    /// (one chunk at a time, as here) while the next batch's kernels run.
+    /// `hsps` is then empty.
+    pub chunks: Vec<Vec<SegmentPair>>,
 }
+
+/// Round 121: a moment inside one [`Engine::seed_and_filter_with`] call at
+/// which kernels are queued and the host has nothing to wait for yet. Whatever
+/// the host does between two batches the card spends idle; done here it costs
+/// nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lull {
+    /// The seed counts and their scan are queued (about 0.1 ms of card time).
+    Counts,
+    /// The first chunk's hits, score gate and survivor count are queued (the
+    /// long stretch of a batch).
+    Gate,
+}
+
+/// What a caller does in a [`Lull`]: it gets the engine back for the moment.
+pub type LullWork<'a> = dyn FnMut(&mut Engine, Lull) -> Result<(), Box<dyn std::error::Error>> + 'a;
 
 /// `--paired` only: the device copy of each pair's bounds in the packed batch.
 /// Seed `j` belongs to pair `p = upper_bound(q_start, j) - 1`, and its hits are
@@ -927,6 +948,20 @@ pub struct Engine {
     /// `--paired` bounds (see [`set_pairs`](Self::set_pairs)). `None` on every
     /// other path, which therefore launches exactly the kernels it always did.
     paired: Option<PairedBounds>,
+    /// Round 122 (the transition fold): the table set that is not in use, as
+    /// index, positions, bucket counts and bucket rows. `fold_active` says
+    /// whether the engine's own four are the folded set (every batch, unless
+    /// the caller sent plain seeds) or the plain one.
+    fold_alt: Option<Box<[DeviceBuffer<u32>; 4]>>,
+    fold_active: bool,
+    /// The next batch call is on plain seeds ([`plain_next`](Self::plain_next)).
+    plain_once: bool,
+    /// The largest chunk the card holds beside the folded tables.
+    fold_capacity: u32,
+    /// Folded batches this engine was given, and how many of them came back
+    /// to be sent again.
+    fold_seen: u32,
+    fold_again: u32,
     /// `--paired`: set by the driver before each call — whether this call's
     /// seeds span more than one pair, the only case that may stop as
     /// [`FilterOutput::oversized`].
@@ -1080,6 +1115,30 @@ pub struct Engine {
     /// Retained until `seed_and_filter` drains the stream; a per-call temporary
     /// could be freed while the async add-offset kernel still reads it.
     buf_seed_offsets: DeviceBuffer<u32>,
+    /// Round 121: the small buffers every batch needs for its scans and counts
+    /// (block sums and the offsets the host sends back), the materializer's
+    /// unused statistics word and the reduced output. Each was allocated and
+    /// freed once per batch: nine `cuMemAlloc`/`cuMemFree` pairs and three
+    /// memsets between kernels that wait on nothing else. They are grown like
+    /// every other buffer ([`reserve`]) and every element a kernel reads is
+    /// written first, so none needs zeroing. A use is always separated from the
+    /// next by a wait on the stream (each scan's sums are read by the host).
+    scr_hit_sums: DeviceBuffer<u32>,
+    scr_hit_offsets: DeviceBuffer<u32>,
+    #[cfg(feature = "ref-loc-buckets")]
+    scr_run_sums: DeviceBuffer<u32>,
+    #[cfg(feature = "dense-anchors")]
+    scr_surv_sums: DeviceBuffer<u32>,
+    #[cfg(feature = "dense-anchors")]
+    scr_surv_offsets: DeviceBuffer<u32>,
+    scr_done_sums: DeviceBuffer<u32>,
+    scr_done_offsets: DeviceBuffer<u32>,
+    #[cfg(not(feature = "counters"))]
+    scr_stats: DeviceBuffer<u64>,
+    buf_reduced: DeviceBuffer<SegmentPair>,
+    /// The allocation count ([`ALLOC_EPOCH`]) at the last device-memory sample:
+    /// the peak can only have moved if something was allocated since.
+    mem_epoch_seen: u64,
     /// Free list of pinned host staging buffers. Page-locking is
     /// expensive — `cuMemHostAlloc` of two 26 MB buffers cost ~13 ms per pass
     /// when this was done per pass — so they live for the engine's lifetime and
@@ -1197,6 +1256,68 @@ unsafe fn reserve<T>(
     }
     Ok(())
 }
+
+/// Copies `data` into `buf` on `stream`, growing `buf` first, and does not wait
+/// for the copy: the kernels queued after it on the same stream see it.
+///
+/// # Safety
+///
+/// As [`reserve`]; and `data` must stay alive until the stream is next
+/// synchronized (the driver stages a pageable source before it returns, so
+/// this is belt and braces).
+unsafe fn upload<T: DeviceCopy>(
+    buf: &mut DeviceBuffer<T>,
+    stream: &CudaStream,
+    data: &[T],
+    syncs: &mut u64,
+) -> Result<(), DriverError> {
+    unsafe { reserve(buf, stream, data.len(), syncs)? };
+    if data.is_empty() {
+        return Ok(());
+    }
+    // SAFETY: `buf` holds at least `data.len()` elements after the reserve.
+    unsafe {
+        cuda_core::memory::memcpy_htod_async(
+            buf.cu_deviceptr(),
+            data.as_ptr(),
+            std::mem::size_of_val(data),
+            stream.cu_stream(),
+        )
+    }
+}
+
+/// `HSPZ_HOST_TRACE=1`: where the host's time inside the batch calls goes,
+/// without `--time` (whose events add host work of their own): blocked on the
+/// card (the card is busy and the host waits), doing work under queued kernels
+/// (a [`Lull`]), or doing its own work with nothing queued, which is the time
+/// the card may sit idle. Summed over all workers; printed at the end of a run.
+pub mod host_trace {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    pub static BATCH_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BLOCKED_NS: AtomicU64 = AtomicU64::new(0);
+    pub static LULL_NS: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+
+    pub fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var("HSPZ_HOST_TRACE").as_deref() == Ok("1"))
+    }
+
+    /// Runs `wait` and, when tracing, charges its duration to `to`.
+    pub fn timed<T>(to: &AtomicU64, wait: impl FnOnce() -> T) -> T {
+        if !on() {
+            return wait();
+        }
+        let t = std::time::Instant::now();
+        let out = wait();
+        to.fetch_add(t.elapsed().as_nanos() as u64, Relaxed);
+        out
+    }
+}
+
+/// Counts device allocations made through [`uninitialized`], so that the
+/// device-memory sample of a batch is taken only when one happened.
+static ALLOC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `cuDeviceGetAttribute` for `ordinal`, no context required (round 90b: the
 /// unit-partition guard runs before any worker owns a device).
@@ -1416,15 +1537,19 @@ fn copy_range_into<T: DeviceCopy>(
     // covers at least the `[first, first+len)` range, and the
     // synchronization completes the transfer before the vector is exposed
     // as initialized.
-    unsafe {
-        cuda_core::memory::memcpy_dtoh_async(
-            host.as_mut_ptr(),
-            buf.cu_deviceptr() + byte_off,
-            bytes,
-            stream.cu_stream(),
-        )?;
-    }
-    stream.synchronize()?;
+    // The copy into pageable memory waits for the stream itself, so it is timed
+    // with the synchronization that follows it.
+    host_trace::timed(&host_trace::BLOCKED_NS, || -> Result<(), DriverError> {
+        unsafe {
+            cuda_core::memory::memcpy_dtoh_async(
+                host.as_mut_ptr(),
+                buf.cu_deviceptr() + byte_off,
+                bytes,
+                stream.cu_stream(),
+            )?;
+        }
+        stream.synchronize()
+    })?;
     // SAFETY: the completed D2H copy initialized exactly `len` elements.
     unsafe { host.set_len(len) };
     Ok(())
@@ -1854,6 +1979,76 @@ pub struct EngineConfig<'a> {
     /// N8: `find_hsps` grid. `0` uses [`HSP_BLOCKS`], the ZLUDA
     /// optimum. Runtime rather than `const` so the L4 sweep needs no rebuild.
     pub hsp_blocks: u32,
+    /// Round 122: `Some` asks for the transition fold ([`FoldRequest`]). The
+    /// engine decides ([`Engine::folded`]).
+    #[cfg_attr(
+        not(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        )),
+        allow(dead_code)
+    )]
+    pub fold: Option<FoldRequest>,
+}
+
+/// Round 122, the transition fold. A query position's seeds are its k-mer and
+/// that k-mer with one care position changed by a transition; their position
+/// lists are disjoint, so one table in which every k-mer also holds its
+/// variants' positions gives a position's hits from one seed. An engine that
+/// has it (`Engine::folded`) is seeded without transitions and finds the same
+/// hits: a thirteenth of the seeds, slices thirteen times as long.
+///
+/// A batch is the same set of hits either way, but a batch of `max_hits` hits
+/// or more is cut into chunks at seeds of the plain order, and the output
+/// depends on the cut (the dedup runs per chunk). Such a batch comes back
+/// `oversized` and the caller sends its plain seeds
+/// ([`Engine::plain_next`]); the engine keeps the plain tables for it.
+// The fold needs the three features of the group line; without them a request is carried and not read.
+#[cfg_attr(
+    not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy, Debug)]
+pub struct FoldRequest {
+    /// Bit `t` set for every care position that admits a transition.
+    pub mask: u32,
+    /// Device bytes that one hit of capacity costs
+    /// (`plan::device_bytes_per_hit`). The folded tables are paid for with
+    /// capacity above `max_hits`, which only a batch cut into chunks can need:
+    /// the fold is built when `max_hits` still fits beside it, and dropped for
+    /// the rest of the reference the first time a chunk needs more than what
+    /// is left, or when more than a quarter of the batches come back
+    /// ([`Engine::folded`] then turns false).
+    pub bytes_per_hit: u64,
+    /// `HSPZ_FOLD=check`: the device's tables against the host's
+    /// (`seed::fold_tables`), every k-mer.
+    pub check: bool,
+}
+
+/// Round 122: from this many batches sent again, a folded engine whose
+/// batches come back more than one time in four drops its fold.
+const FOLD_AGAIN_MIN: u32 = 16;
+
+/// Round 122: what the fold did over the run.
+pub mod fold_totals {
+    use std::sync::atomic::AtomicU64;
+    #[cfg_attr(
+        not(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        )),
+        allow(dead_code)
+    )]
+    pub static BINS: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    pub static REISSUED: AtomicU64 = AtomicU64::new(0);
+    pub static RELEASED: AtomicU64 = AtomicU64::new(0);
 }
 
 impl Engine {
@@ -2012,6 +2207,12 @@ impl Engine {
             hsp_blocks,
             dump_raw: false,
             paired: None,
+            fold_alt: None,
+            fold_active: false,
+            plain_once: false,
+            fold_capacity: 0,
+            fold_seen: 0,
+            fold_again: 0,
             paired_multi: false,
             buf_seed_lo: unsafe { uninitialized(&stream, 0)? },
             collect_hit_stats: false,
@@ -2104,6 +2305,20 @@ impl Engine {
             seed_shape: unsafe { uninitialized(&stream, 0)? },
             buf_seed_kmer: unsafe { uninitialized(&stream, 0)? },
             buf_seed_offsets: unsafe { uninitialized(&stream, 0)? },
+            scr_hit_sums: unsafe { uninitialized(&stream, 0)? },
+            scr_hit_offsets: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "ref-loc-buckets")]
+            scr_run_sums: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "dense-anchors")]
+            scr_surv_sums: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(feature = "dense-anchors")]
+            scr_surv_offsets: unsafe { uninitialized(&stream, 0)? },
+            scr_done_sums: unsafe { uninitialized(&stream, 0)? },
+            scr_done_offsets: unsafe { uninitialized(&stream, 0)? },
+            #[cfg(not(feature = "counters"))]
+            scr_stats: DeviceBuffer::<u64>::zeroed(&stream, 1)?,
+            buf_reduced: unsafe { uninitialized(&stream, 0)? },
+            mem_epoch_seen: u64::MAX,
             pinned_slots: Vec::new(),
             pinned_ok: false,
             last_end: None,
@@ -2149,6 +2364,14 @@ impl Engine {
             feature = "gate-sieve"
         ))]
         engine.build_bucket_tables()?;
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        if let Some(req) = cfg.fold {
+            engine.fold_tables(req, cfg.index_table, cfg.pos_table)?;
+        }
         engine.stream.synchronize()?;
         engine.copy_stream.synchronize()?;
         phases.add("upload ref/query/tables", t.elapsed());
@@ -2379,6 +2602,14 @@ impl Engine {
         Ok(())
     }
 
+    /// Round 122: waits for every seed upload that has been issued. An upload
+    /// runs on its own stream and is ordered against the kernels that read its
+    /// slot, not against a kernel that writes the slot: the device seeder,
+    /// when a batch whose folded seeds were uploaded is seeded again.
+    pub fn settle_uploads(&mut self) -> Result<(), DriverError> {
+        host_trace::timed(&host_trace::BLOCKED_NS, || self.copy_stream.synchronize())
+    }
+
     /// Generate one batch's exact compact seed stream on the device.
     pub fn generate_seeds(
         &mut self,
@@ -2456,7 +2687,15 @@ impl Engine {
         self.end_stage(stage, "seed k-mers")?;
 
         let blocks = span.div_ceil(SCAN_BLOCK);
-        let mut d_block_sums = DeviceBuffer::<u32>::zeroed(&self.stream, blocks as usize)?;
+        // SAFETY: `scan_blocks` writes one sum for every launched block.
+        unsafe {
+            reserve(
+                &mut self.scr_hit_sums,
+                &self.stream,
+                blocks as usize,
+                &mut self.pipeline_syncs,
+            )?;
+        }
         let stage = self.stage();
         unsafe {
             self.module.scan_blocks(
@@ -2467,14 +2706,14 @@ impl Engine {
                     shared_mem_bytes: 0,
                 },
                 &mut self.buf_hit_num,
-                &mut d_block_sums,
+                &mut self.scr_hit_sums,
                 span,
             )?;
         }
         self.end_stage(stage, "seed scan blocks")?;
 
         let t = Instant::now();
-        let mut sums = d_block_sums.to_host_vec(&self.stream)?;
+        let mut sums = copy_prefix(&self.scr_hit_sums, &self.stream, blocks as usize)?;
         self.absorb_sync()?;
         let mut num_seeds = 0u32;
         for sum in &mut sums {
@@ -2487,8 +2726,16 @@ impl Engine {
             self.phases.add("seed count round trip", t.elapsed());
             return Ok(0);
         }
-        self.buf_seed_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
-        self.pipeline_syncs += 1;
+        // SAFETY: the copy is queued before the kernel that reads it, and the
+        // stream is drained again (the hit-count scan below) before `sums` goes.
+        unsafe {
+            upload(
+                &mut self.buf_seed_offsets,
+                &self.stream,
+                &sums,
+                &mut self.pipeline_syncs,
+            )?;
+        }
         self.phases.add("seed count round trip", t.elapsed());
 
         let stage = self.stage();
@@ -2583,6 +2830,39 @@ impl Engine {
         slot: usize,
         rev: bool,
     ) -> Result<FilterOutput, Box<dyn std::error::Error>> {
+        self.seed_and_filter_with(slot, rev, false, &mut |_, _| Ok(()))
+    }
+
+    /// [`seed_and_filter`](Self::seed_and_filter) that calls `lull` at the
+    /// moments of [`Lull`] (each at most once, and not at all on the early
+    /// exits: the caller must not depend on it) and, with `defer_dedup`, hands
+    /// the HSPs back per chunk without the host sort and dedup.
+    pub fn seed_and_filter_with(
+        &mut self,
+        slot: usize,
+        rev: bool,
+        defer_dedup: bool,
+        lull: &mut LullWork<'_>,
+    ) -> Result<FilterOutput, Box<dyn std::error::Error>> {
+        if !host_trace::on() {
+            return self.seed_and_filter_inner(slot, rev, defer_dedup, lull);
+        }
+        host_trace::BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut traced = |engine: &mut Engine, at: Lull| {
+            host_trace::timed(&host_trace::LULL_NS, || lull(engine, at))
+        };
+        host_trace::timed(&host_trace::BATCH_NS, || {
+            self.seed_and_filter_inner(slot, rev, defer_dedup, &mut traced)
+        })
+    }
+
+    fn seed_and_filter_inner(
+        &mut self,
+        slot: usize,
+        rev: bool,
+        defer_dedup: bool,
+        lull: &mut LullWork<'_>,
+    ) -> Result<FilterOutput, Box<dyn std::error::Error>> {
         // Refuse to run against a query that was never swapped in.
         //
         // `Engine::new` is reference-only, so a fresh engine starts with
@@ -2600,6 +2880,9 @@ impl Engine {
                 .into());
         }
         let num_seeds = self.seed_len[slot];
+        // Round 122: a batch is on folded seeds unless the caller said plain.
+        let folded = !std::mem::take(&mut self.plain_once) && self.fold_alt.is_some();
+        self.use_tables(folded);
 
         // Allocation and transfer are timed apart, because the
         // remedies are different — a grown-once buffer fixes one and does
@@ -2759,7 +3042,15 @@ impl Engine {
         // only the per-block sums (num_seeds/256 u32) cross the bus instead of
         // the whole array in each direction.
         let blocks = num_seeds.div_ceil(SCAN_BLOCK);
-        let mut d_block_sums = DeviceBuffer::<u32>::zeroed(&self.stream, blocks as usize)?;
+        // SAFETY: `scan_blocks` writes one sum for every launched block.
+        unsafe {
+            reserve(
+                &mut self.scr_hit_sums,
+                &self.stream,
+                blocks as usize,
+                &mut self.pipeline_syncs,
+            )?;
+        }
         let stage = self.stage();
         // SAFETY: one element per thread over `num_seeds`, one sum slot per block.
         unsafe {
@@ -2771,18 +3062,22 @@ impl Engine {
                     shared_mem_bytes: 0,
                 },
                 &mut self.buf_hit_num,
-                &mut d_block_sums,
+                &mut self.scr_hit_sums,
                 num_seeds,
             )?;
         }
         self.end_stage(stage, "scan_blocks")?;
 
         let t = Instant::now();
+        lull(self, Lull::Counts)?;
+        self.phases.add("host work under kernels", t.elapsed());
+
+        let t = Instant::now();
         // REQUIRED: the host computes the exclusive scan of the
         // block sums and the total decides the chunk walk, so this round trip is a
         // real dependency. Moving the reduction onto the device is a separate
         // change; this path does not redesign it.
-        let mut sums = d_block_sums.to_host_vec(&self.stream)?;
+        let mut sums = copy_prefix(&self.scr_hit_sums, &self.stream, blocks as usize)?;
         self.absorb_sync()?;
         // `--paired`: a call holding several pairs is only exact while it stays
         // one MAX_HITS sub-chunk (dedup runs per sub-chunk, and a pair's
@@ -2801,12 +3096,50 @@ impl Engine {
                     raw: Vec::new(),
                     audit: Vec::new(),
                     oversized: true,
+                    chunks: Vec::new(),
                 });
             }
         }
+        // Round 122: a folded batch that the plain order would cut into chunks
+        // (the walk runs once per `max_hits` hits) is not this path's: the cuts
+        // fall at plain seeds. As above, nothing has been touched yet.
+        if folded {
+            let total: u64 = sums.iter().map(|&s| u64::from(s)).sum();
+            self.fold_seen += 1;
+            if total >= u64::from(self.max_hits) {
+                fold_totals::REISSUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.fold_again += 1;
+                // A batch sent again costs a count pass and its seeds
+                // generated on the device, about what the fold saves on a
+                // batch. Where most batches are cut (a small `--max-hits`)
+                // the fold only costs.
+                if self.fold_again >= FOLD_AGAIN_MIN && self.fold_again > self.fold_seen / 4 {
+                    self.release_fold("a quarter of its batches are cut at --max-hits");
+                }
+                self.phases.add("block-sum round trip", t.elapsed());
+                return Ok(FilterOutput {
+                    hsps: Vec::new(),
+                    num_hits: 0,
+                    raw_hsps: 0,
+                    raw: Vec::new(),
+                    audit: Vec::new(),
+                    oversized: true,
+                    chunks: Vec::new(),
+                });
+            }
+            fold_totals::BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let num_hits = exclusive_scan_hit_totals(&mut sums)?;
-        let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
-        self.pipeline_syncs += 1;
+        // SAFETY: queued before `add_block_offsets`, which reads it; `sums`
+        // lives to the end of this call, past every wait on the stream.
+        unsafe {
+            upload(
+                &mut self.scr_hit_offsets,
+                &self.stream,
+                &sums,
+                &mut self.pipeline_syncs,
+            )?;
+        }
         self.phases.add("block-sum round trip", t.elapsed());
 
         let stage = self.stage();
@@ -2820,7 +3153,7 @@ impl Engine {
                     shared_mem_bytes: 0,
                 },
                 &mut self.buf_hit_num,
-                &d_offsets,
+                &self.scr_hit_offsets,
                 num_seeds,
             )?;
         }
@@ -2833,7 +3166,11 @@ impl Engine {
             raw: Vec::new(),
             audit: Vec::new(),
             oversized: false,
+            chunks: Vec::new(),
         };
+        // The gate's lull is offered once per call, on its first chunk.
+        #[cfg_attr(not(feature = "dense-anchors"), allow(unused_variables, unused_mut))]
+        let mut lulled_gate = false;
         if num_hits == 0 {
             if self.collect_hit_stats {
                 let t = Instant::now();
@@ -2841,7 +3178,9 @@ impl Engine {
                     .observe_launch(hit_counts.as_deref().expect("hit stats requested counts"));
                 self.phases.add("hit-distribution stats", t.elapsed());
             }
-            // `d_block_sums`/`d_offsets` are freed on the way out and
+            // The scratch buffers are the engine's now, but keep the wait: this is
+            // the rare exit, and it used to be needed because
+            // `d_block_sums`/`d_offsets` were freed on the way out and
             // `add_block_offsets` may still be queued reading them.
             self.sync_pipeline()?;
             return Ok(out);
@@ -2997,6 +3336,13 @@ impl Engine {
                 feature = "gate-sieve"
             )))]
             let from_seeds = false;
+
+            // Round 122: the folded tables were paid for with capacity. A chunk
+            // above what is left (only a batch cut into chunks has one, and
+            // those are on the plain tables) takes the memory back.
+            if !folded && self.fold_alt.is_some() && iter_num_hits > self.fold_capacity {
+                self.release_fold("a chunk needs its memory");
+            }
 
             let t = Instant::now();
             #[cfg(not(feature = "dense-anchors"))]
@@ -3228,467 +3574,462 @@ impl Engine {
             // from one L2-resident reference window. `buf_anchor` is left
             // untouched — `find_hsps` still reads it by survivor id.
             #[cfg(feature = "ref-loc-buckets")]
-            let _bucket_offsets = if !bucket_pass {
-                None
-            } else {
-                Some({
-                    let cblocks = iter_num_hits.div_ceil(SCAN_BLOCK);
-                    let counts_len = self.n_buckets * cblocks;
+            if bucket_pass {
+                let cblocks = iter_num_hits.div_ceil(SCAN_BLOCK);
+                let counts_len = self.n_buckets * cblocks;
 
-                    let t = Instant::now();
-                    // SAFETY: `bucket_count` writes every count and `bucket_scatter`
-                    // every one of the `iter_num_hits` permuted slots before the
-                    // gate reads them.
-                    unsafe {
+                let t = Instant::now();
+                // SAFETY: `bucket_count` writes every count and `bucket_scatter`
+                // every one of the `iter_num_hits` permuted slots before the
+                // gate reads them.
+                unsafe {
+                    reserve(
+                        &mut self.buf_sorted_anchor,
+                        &self.stream,
+                        iter_num_hits as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                    if !slot_order {
                         reserve(
-                            &mut self.buf_sorted_anchor,
+                            &mut self.buf_sorted_idx,
                             &self.stream,
                             iter_num_hits as usize,
                             &mut self.pipeline_syncs,
                         )?;
-                        if !slot_order {
-                            reserve(
-                                &mut self.buf_sorted_idx,
-                                &self.stream,
-                                iter_num_hits as usize,
-                                &mut self.pipeline_syncs,
-                            )?;
-                        }
-                        reserve(
-                            &mut self.buf_bucket_counts,
-                            &self.stream,
-                            counts_len as usize,
-                            &mut self.pipeline_syncs,
-                        )?;
-                        reserve(
-                            &mut self.buf_flags_bits,
-                            &self.stream,
-                            flag_words as usize,
-                            &mut self.pipeline_syncs,
-                        )?;
                     }
-                    self.phases.add("alloc bucket buffers", t.elapsed());
+                    reserve(
+                        &mut self.buf_bucket_counts,
+                        &self.stream,
+                        counts_len as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                    reserve(
+                        &mut self.buf_flags_bits,
+                        &self.stream,
+                        flag_words as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
+                self.phases.add("alloc bucket buffers", t.elapsed());
 
-                    // Round 87 (blocks): the ON span starts after the
-                    // reserves, so host allocation stays outside the event
-                    // pair; it covers the bucket pass plus the reordered
-                    // gate and count below.
-                    #[cfg(feature = "ref-loc-buckets")]
-                    if time_span {
-                        self.block_span_start
-                            .as_ref()
-                            .expect("block span events ensured above")
-                            .record(&self.stream)?;
-                    }
+                // Round 87 (blocks): the ON span starts after the
+                // reserves, so host allocation stays outside the event
+                // pair; it covers the bucket pass plus the reordered
+                // gate and count below.
+                #[cfg(feature = "ref-loc-buckets")]
+                if time_span {
+                    self.block_span_start
+                        .as_ref()
+                        .expect("block span events ensured above")
+                        .record(&self.stream)?;
+                }
 
-                    // Round 119: the bucket order from the seeds in
-                    // place of the count and the scatter, or beside them.
-                    // SAFETY: empty, never read; one of the two branches below
-                    // replaces it.
-                    let mut d_bucket_sums = unsafe { uninitialized::<u32>(&self.stream, 0)? };
-                    #[cfg(all(
-                        feature = "find-hits-groups",
-                        feature = "ref-loc-buckets",
-                        feature = "gate-sieve"
-                    ))]
-                    if from_seeds {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        hits_bucketed_totals::CHUNKS.fetch_add(1, Relaxed);
-                        hits_bucketed_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
-                        d_bucket_sums =
-                            self.launch_hits_bucketed(slot, start_seed_index, iter_num_seeds)?;
-                    }
-                    if !from_seeds {
-                        let stage = self.stage();
-                        // SAFETY: one hit per thread; thread `v < n_buckets` of block
-                        // `bid` owns exactly slot `v * cblocks + bid`.
-                        unsafe {
-                            let config = LaunchConfig {
-                                grid_dim: (cblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            };
-                            if self.bucket_match {
-                                self.module.bucket_count_match(
-                                    &self.stream,
-                                    config,
-                                    &self.buf_anchor,
-                                    iter_num_hits,
-                                    self.bucket_shift,
-                                    cblocks,
-                                    self.n_buckets,
-                                    &mut self.buf_bucket_counts,
-                                )?;
-                            } else {
-                                self.module.bucket_count(
-                                    &self.stream,
-                                    config,
-                                    &self.buf_anchor,
-                                    iter_num_hits,
-                                    self.bucket_shift,
-                                    cblocks,
-                                    self.n_buckets,
-                                    &mut self.buf_bucket_counts,
-                                )?;
-                            }
-                        }
-                        self.end_stage(stage, "ref_bucket_count")?;
-
-                        let sblocks = counts_len.div_ceil(SCAN_BLOCK);
-                        d_bucket_sums =
-                            DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
-                        let stage = self.stage();
-                        // SAFETY: one count per thread, one sum slot per launched block.
-                        unsafe {
-                            self.module.scan_blocks(
+                // Round 119: the bucket order from the seeds in
+                // place of the count and the scatter, or beside them.
+                #[cfg(all(
+                    feature = "find-hits-groups",
+                    feature = "ref-loc-buckets",
+                    feature = "gate-sieve"
+                ))]
+                if from_seeds {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    hits_bucketed_totals::CHUNKS.fetch_add(1, Relaxed);
+                    hits_bucketed_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
+                    self.launch_hits_bucketed(slot, start_seed_index, iter_num_seeds)?;
+                }
+                if !from_seeds {
+                    let stage = self.stage();
+                    // SAFETY: one hit per thread; thread `v < n_buckets` of block
+                    // `bid` owns exactly slot `v * cblocks + bid`.
+                    unsafe {
+                        let config = LaunchConfig {
+                            grid_dim: (cblocks, 1, 1),
+                            block_dim: (SCAN_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        if self.bucket_match {
+                            self.module.bucket_count_match(
                                 &self.stream,
-                                LaunchConfig {
-                                    grid_dim: (sblocks, 1, 1),
-                                    block_dim: (SCAN_BLOCK, 1, 1),
-                                    shared_mem_bytes: 0,
-                                },
-                                &mut self.buf_bucket_counts,
-                                &mut d_bucket_sums,
-                                counts_len,
-                            )?;
-                        }
-                        self.end_stage(stage, "ref_bucket_scan")?;
-
-                        // Round 2: the upper level of the scan runs in ONE block on the
-                        // device instead of crossing the bus twice per chunk. `sblocks`
-                        // is ~6.6k block sums today (~27k at a 64M cap); the kernel
-                        // loops over any length, and the totals it adds are hit counts,
-                        // so `u32` is exact.
-                        let stage = self.stage();
-                        // SAFETY: one block, in place over the `sblocks` block sums.
-                        unsafe {
-                            self.module.scan_exclusive_one_block(
-                                &self.stream,
-                                LaunchConfig {
-                                    grid_dim: (1, 1, 1),
-                                    block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
-                                    shared_mem_bytes: 0,
-                                },
-                                &mut d_bucket_sums,
-                                sblocks,
-                            )?;
-                        }
-                        self.end_stage(stage, "ref_bucket_scan")?;
-
-                        let stage = self.stage();
-                        // SAFETY: same geometry as `scan_blocks`, so block `b` reads
-                        // offset `b`.
-                        unsafe {
-                            self.module.add_block_offsets(
-                                &self.stream,
-                                LaunchConfig {
-                                    grid_dim: (sblocks, 1, 1),
-                                    block_dim: (SCAN_BLOCK, 1, 1),
-                                    shared_mem_bytes: 0,
-                                },
-                                &mut self.buf_bucket_counts,
-                                &d_bucket_sums,
-                                counts_len,
-                            )?;
-                        }
-                        self.end_stage(stage, "ref_bucket_scan")?;
-
-                        let stage = self.stage();
-                        // SAFETY: same geometry as `bucket_count`, and the inclusive
-                        // prefix partitions `0..iter_num_hits` into one slot per hit.
-                        unsafe {
-                            let config = LaunchConfig {
-                                grid_dim: (cblocks, 1, 1),
-                                block_dim: (SCAN_BLOCK, 1, 1),
-                                shared_mem_bytes: 0,
-                            };
-                            #[cfg(feature = "gate-sieve")]
-                            if slot_order {
-                                self.module.bucket_scatter_match_anchors(
-                                    &self.stream,
-                                    config,
-                                    &self.buf_anchor,
-                                    iter_num_hits,
-                                    self.bucket_shift,
-                                    cblocks,
-                                    self.n_buckets,
-                                    &self.buf_bucket_counts,
-                                    &mut self.buf_sorted_anchor,
-                                )?;
-                            }
-                            if slot_order {
-                                // Launched above.
-                            } else if self.bucket_match {
-                                self.module.bucket_scatter_match(
-                                    &self.stream,
-                                    config,
-                                    &self.buf_anchor,
-                                    iter_num_hits,
-                                    self.bucket_shift,
-                                    cblocks,
-                                    self.n_buckets,
-                                    &self.buf_bucket_counts,
-                                    &mut self.buf_sorted_anchor,
-                                    &mut self.buf_sorted_idx,
-                                )?;
-                            } else {
-                                self.module.bucket_scatter(
-                                    &self.stream,
-                                    config,
-                                    &self.buf_anchor,
-                                    iter_num_hits,
-                                    self.bucket_shift,
-                                    cblocks,
-                                    self.n_buckets,
-                                    &self.buf_bucket_counts,
-                                    &mut self.buf_sorted_anchor,
-                                    &mut self.buf_sorted_idx,
-                                )?;
-                            }
-                        }
-                        self.end_stage(stage, "ref_bucket_scatter")?;
-                    }
-                    #[cfg(all(
-                        feature = "find-hits-groups",
-                        feature = "ref-loc-buckets",
-                        feature = "gate-sieve"
-                    ))]
-                    if let HitsBucketed::Check(limit) = self.hits_bucketed {
-                        use std::sync::atomic::Ordering::Relaxed;
-                        if seeds_can
-                            && hits_bucketed_totals::CHECKED_CHUNKS.load(Relaxed) < u64::from(limit)
-                        {
-                            self.check_hits_bucketed(
-                                slot,
-                                start_seed_index,
-                                iter_num_seeds,
+                                config,
+                                &self.buf_anchor,
                                 iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &mut self.buf_bucket_counts,
+                            )?;
+                        } else {
+                            self.module.bucket_count(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &mut self.buf_bucket_counts,
                             )?;
                         }
                     }
-                    #[cfg(feature = "ref-loc-buckets")]
-                    if order_check_limit() > 0 {
-                        static BUCKET_CHECK_DONE: std::sync::atomic::AtomicU32 =
-                            std::sync::atomic::AtomicU32::new(0);
-                        let check_k = order_check_limit();
-                        let check_c =
-                            BUCKET_CHECK_DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        if check_c < check_k {
-                            self.stream.synchronize()?;
-                            let check_n = iter_num_hits as usize;
-                            let check_sorted_anchor =
-                                copy_prefix(&self.buf_sorted_anchor, &self.stream, check_n)?;
-                            let check_sorted_idx =
-                                copy_prefix(&self.buf_sorted_idx, &self.stream, check_n)?;
-                            let check_orig_anchor =
-                                copy_prefix(&self.buf_anchor, &self.stream, check_n)?;
-                            let bucket_of = |a: u64| -> u32 { (a as u32) >> self.bucket_shift };
-                            let mut perm_ok = true;
-                            let mut perm_detail = String::from("none");
-                            {
-                                let mut seen = vec![false; check_n];
-                                for (p, &idx) in check_sorted_idx.iter().enumerate() {
-                                    let i = idx as usize;
-                                    if idx as usize >= check_n || seen[i] {
-                                        perm_ok = false;
-                                        perm_detail = format!("p={p} idx={idx} n={check_n}");
-                                        break;
-                                    }
-                                    seen[i] = true;
-                                }
-                            }
-                            let mut monotone_ok = true;
-                            let mut monotone_detail = String::from("none");
-                            let mut prev_b = 0u32;
-                            for (p, &a) in check_sorted_anchor.iter().enumerate() {
-                                let b = bucket_of(a);
-                                if p > 0 && b < prev_b {
-                                    monotone_ok = false;
-                                    monotone_detail =
-                                        format!("p={p} bucket={b} prev={prev_b} anchor={a:#x}");
-                                    break;
-                                }
-                                prev_b = b;
-                            }
-                            let mut stable_ok = true;
-                            let mut stable_detail = String::from("none");
-                            for p in 1..check_n {
-                                if bucket_of(check_sorted_anchor[p])
-                                    == bucket_of(check_sorted_anchor[p - 1])
-                                    && check_sorted_idx[p] <= check_sorted_idx[p - 1]
-                                {
-                                    stable_ok = false;
-                                    stable_detail = format!(
-                                        "p={p} idx={} prev_idx={}",
-                                        check_sorted_idx[p],
-                                        check_sorted_idx[p - 1]
-                                    );
-                                    break;
-                                }
-                            }
-                            let mut anchors_ok = true;
-                            let mut anchors_detail = String::from("none");
+                    self.end_stage(stage, "ref_bucket_count")?;
+
+                    let sblocks = counts_len.div_ceil(SCAN_BLOCK);
+                    // SAFETY: `scan_blocks` writes one sum for every
+                    // launched block.
+                    unsafe {
+                        reserve(
+                            &mut self.scr_run_sums,
+                            &self.stream,
+                            sblocks as usize,
+                            &mut self.pipeline_syncs,
+                        )?;
+                    }
+                    let stage = self.stage();
+                    // SAFETY: one count per thread, one sum slot per launched block.
+                    unsafe {
+                        self.module.scan_blocks(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (sblocks, 1, 1),
+                                block_dim: (SCAN_BLOCK, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &mut self.buf_bucket_counts,
+                            &mut self.scr_run_sums,
+                            counts_len,
+                        )?;
+                    }
+                    self.end_stage(stage, "ref_bucket_scan")?;
+
+                    // Round 2: the upper level of the scan runs in ONE block on the
+                    // device instead of crossing the bus twice per chunk. `sblocks`
+                    // is ~6.6k block sums today (~27k at a 64M cap); the kernel
+                    // loops over any length, and the totals it adds are hit counts,
+                    // so `u32` is exact.
+                    let stage = self.stage();
+                    // SAFETY: one block, in place over the `sblocks` block sums.
+                    unsafe {
+                        self.module.scan_exclusive_one_block(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (1, 1, 1),
+                                block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &mut self.scr_run_sums,
+                            sblocks,
+                        )?;
+                    }
+                    self.end_stage(stage, "ref_bucket_scan")?;
+
+                    let stage = self.stage();
+                    // SAFETY: same geometry as `scan_blocks`, so block `b` reads
+                    // offset `b`.
+                    unsafe {
+                        self.module.add_block_offsets(
+                            &self.stream,
+                            LaunchConfig {
+                                grid_dim: (sblocks, 1, 1),
+                                block_dim: (SCAN_BLOCK, 1, 1),
+                                shared_mem_bytes: 0,
+                            },
+                            &mut self.buf_bucket_counts,
+                            &self.scr_run_sums,
+                            counts_len,
+                        )?;
+                    }
+                    self.end_stage(stage, "ref_bucket_scan")?;
+
+                    let stage = self.stage();
+                    // SAFETY: same geometry as `bucket_count`, and the inclusive
+                    // prefix partitions `0..iter_num_hits` into one slot per hit.
+                    unsafe {
+                        let config = LaunchConfig {
+                            grid_dim: (cblocks, 1, 1),
+                            block_dim: (SCAN_BLOCK, 1, 1),
+                            shared_mem_bytes: 0,
+                        };
+                        #[cfg(feature = "gate-sieve")]
+                        if slot_order {
+                            self.module.bucket_scatter_match_anchors(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &self.buf_bucket_counts,
+                                &mut self.buf_sorted_anchor,
+                            )?;
+                        }
+                        if slot_order {
+                            // Launched above.
+                        } else if self.bucket_match {
+                            self.module.bucket_scatter_match(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &self.buf_bucket_counts,
+                                &mut self.buf_sorted_anchor,
+                                &mut self.buf_sorted_idx,
+                            )?;
+                        } else {
+                            self.module.bucket_scatter(
+                                &self.stream,
+                                config,
+                                &self.buf_anchor,
+                                iter_num_hits,
+                                self.bucket_shift,
+                                cblocks,
+                                self.n_buckets,
+                                &self.buf_bucket_counts,
+                                &mut self.buf_sorted_anchor,
+                                &mut self.buf_sorted_idx,
+                            )?;
+                        }
+                    }
+                    self.end_stage(stage, "ref_bucket_scatter")?;
+                }
+                #[cfg(all(
+                    feature = "find-hits-groups",
+                    feature = "ref-loc-buckets",
+                    feature = "gate-sieve"
+                ))]
+                if let HitsBucketed::Check(limit) = self.hits_bucketed {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if seeds_can
+                        && hits_bucketed_totals::CHECKED_CHUNKS.load(Relaxed) < u64::from(limit)
+                    {
+                        self.check_hits_bucketed(
+                            slot,
+                            start_seed_index,
+                            iter_num_seeds,
+                            iter_num_hits,
+                        )?;
+                    }
+                }
+                #[cfg(feature = "ref-loc-buckets")]
+                if order_check_limit() > 0 {
+                    static BUCKET_CHECK_DONE: std::sync::atomic::AtomicU32 =
+                        std::sync::atomic::AtomicU32::new(0);
+                    let check_k = order_check_limit();
+                    let check_c =
+                        BUCKET_CHECK_DONE.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if check_c < check_k {
+                        self.stream.synchronize()?;
+                        let check_n = iter_num_hits as usize;
+                        let check_sorted_anchor =
+                            copy_prefix(&self.buf_sorted_anchor, &self.stream, check_n)?;
+                        let check_sorted_idx =
+                            copy_prefix(&self.buf_sorted_idx, &self.stream, check_n)?;
+                        let check_orig_anchor =
+                            copy_prefix(&self.buf_anchor, &self.stream, check_n)?;
+                        let bucket_of = |a: u64| -> u32 { (a as u32) >> self.bucket_shift };
+                        let mut perm_ok = true;
+                        let mut perm_detail = String::from("none");
+                        {
+                            let mut seen = vec![false; check_n];
                             for (p, &idx) in check_sorted_idx.iter().enumerate() {
                                 let i = idx as usize;
-                                if i >= check_n || check_orig_anchor[i] != check_sorted_anchor[p] {
-                                    anchors_ok = false;
-                                    anchors_detail = format!("p={p} idx={idx}");
+                                if idx as usize >= check_n || seen[i] {
+                                    perm_ok = false;
+                                    perm_detail = format!("p={p} idx={idx} n={check_n}");
                                     break;
                                 }
-                            }
-                            let ok_str = |ok: bool| if ok { "ok" } else { "FAIL" };
-                            if !perm_ok {
-                                eprintln!(
-                                    "#bucket-check-violation chunk={check_c} perm {perm_detail}"
-                                );
-                            }
-                            if !monotone_ok {
-                                eprintln!(
-                                    "#bucket-check-violation chunk={check_c} monotone {monotone_detail}"
-                                );
-                            }
-                            if !stable_ok {
-                                eprintln!(
-                                    "#bucket-check-violation chunk={check_c} stable {stable_detail}"
-                                );
-                            }
-                            if !anchors_ok {
-                                eprintln!(
-                                    "#bucket-check-violation chunk={check_c} anchors {anchors_detail}"
-                                );
-                            }
-                            let n_buckets = self.n_buckets as usize;
-                            let mut hist = vec![0u32; n_buckets];
-                            for &a in &check_sorted_anchor {
-                                let b = bucket_of(a) as usize;
-                                if b < n_buckets {
-                                    hist[b] += 1;
-                                }
-                            }
-                            let mut hist_sorted = hist.clone();
-                            hist_sorted.sort_unstable();
-                            let (hb_min, hb_med, hb_max) = (
-                                hist_sorted[0],
-                                hist_sorted[n_buckets / 2],
-                                hist_sorted[n_buckets - 1],
-                            );
-                            let ref_len = self.ref_len;
-                            let push_sectors = |r: u32, out: &mut Vec<u32>| {
-                                let start = r.saturating_sub(64);
-                                let mut end = r.saturating_add(32);
-                                if end > ref_len {
-                                    end = ref_len;
-                                }
-                                if start >= end {
-                                    return;
-                                }
-                                for s in (start >> 5)..=((end - 1) >> 5) {
-                                    out.push(s);
-                                }
-                            };
-                            let mut sectors: Vec<u32> = Vec::new();
-                            for &a in &check_sorted_anchor {
-                                push_sectors(a as u32, &mut sectors);
-                            }
-                            sectors.sort_unstable();
-                            let mut distinct: u64 = 0;
-                            let mut prev_s: Option<u32> = None;
-                            for &s in &sectors {
-                                if prev_s != Some(s) {
-                                    distinct += 1;
-                                    prev_s = Some(s);
-                                }
-                            }
-                            let touches = sectors.len() as u64;
-                            let tps = if distinct > 0 {
-                                touches as f64 / distinct as f64
-                            } else {
-                                0.0
-                            };
-                            let mut bucket_tps_max = 0.0f64;
-                            let mut lo = 0usize;
-                            while lo < check_n {
-                                let b = bucket_of(check_sorted_anchor[lo]);
-                                let mut hi = lo + 1;
-                                while hi < check_n && bucket_of(check_sorted_anchor[hi]) == b {
-                                    hi += 1;
-                                }
-                                let mut v: Vec<u32> = Vec::new();
-                                for &a in &check_sorted_anchor[lo..hi] {
-                                    push_sectors(a as u32, &mut v);
-                                }
-                                v.sort_unstable();
-                                let mut d: u64 = 0;
-                                let mut pv: Option<u32> = None;
-                                for &s in &v {
-                                    if pv != Some(s) {
-                                        d += 1;
-                                        pv = Some(s);
-                                    }
-                                }
-                                if d > 0 {
-                                    bucket_tps_max = bucket_tps_max.max(v.len() as f64 / d as f64);
-                                }
-                                lo = hi;
-                            }
-                            eprintln!(
-                                "#bucket-check chunk={check_c} n={check_n} perm={} monotone={} stable={} anchors={} B={} shift={} hits_per_bucket={hb_min}/{hb_med}/{hb_max} distinct_sectors_total={distinct} touches_total={touches} touches_per_sector={tps:.2} bucket_tps_max={bucket_tps_max:.2}",
-                                ok_str(perm_ok),
-                                ok_str(monotone_ok),
-                                ok_str(stable_ok),
-                                ok_str(anchors_ok),
-                                self.n_buckets,
-                                self.bucket_shift,
-                            );
-                            // Round 116: the scatter that writes no raw id, run
-                            // beside the one just checked into a buffer of its
-                            // own, must write the same anchors word for word.
-                            #[cfg(feature = "gate-sieve")]
-                            if self.survivor_slots && self.bucket_match {
-                                // SAFETY: the kernel writes every one of the
-                                // `iter_num_hits` slots before the copy below.
-                                let mut d_plain = unsafe {
-                                    uninitialized::<u64>(&self.stream, iter_num_hits as usize)?
-                                };
-                                unsafe {
-                                    self.module.bucket_scatter_match_anchors(
-                                        &self.stream,
-                                        LaunchConfig {
-                                            grid_dim: (cblocks, 1, 1),
-                                            block_dim: (SCAN_BLOCK, 1, 1),
-                                            shared_mem_bytes: 0,
-                                        },
-                                        &self.buf_anchor,
-                                        iter_num_hits,
-                                        self.bucket_shift,
-                                        cblocks,
-                                        self.n_buckets,
-                                        &self.buf_bucket_counts,
-                                        &mut d_plain,
-                                    )?;
-                                }
-                                let plain = copy_prefix(&d_plain, &self.stream, check_n)?;
-                                let differ = plain
-                                    .iter()
-                                    .zip(&check_sorted_anchor)
-                                    .position(|(a, b)| a != b);
-                                if let Some(at) = differ {
-                                    eprintln!(
-                                        "#bucket-check-violation chunk={check_c} anchors_only slot={at}"
-                                    );
-                                }
-                                eprintln!(
-                                    "#bucket-check-anchors-only chunk={check_c} n={check_n} equal={}",
-                                    ok_str(differ.is_none()),
-                                );
+                                seen[i] = true;
                             }
                         }
+                        let mut monotone_ok = true;
+                        let mut monotone_detail = String::from("none");
+                        let mut prev_b = 0u32;
+                        for (p, &a) in check_sorted_anchor.iter().enumerate() {
+                            let b = bucket_of(a);
+                            if p > 0 && b < prev_b {
+                                monotone_ok = false;
+                                monotone_detail =
+                                    format!("p={p} bucket={b} prev={prev_b} anchor={a:#x}");
+                                break;
+                            }
+                            prev_b = b;
+                        }
+                        let mut stable_ok = true;
+                        let mut stable_detail = String::from("none");
+                        for p in 1..check_n {
+                            if bucket_of(check_sorted_anchor[p])
+                                == bucket_of(check_sorted_anchor[p - 1])
+                                && check_sorted_idx[p] <= check_sorted_idx[p - 1]
+                            {
+                                stable_ok = false;
+                                stable_detail = format!(
+                                    "p={p} idx={} prev_idx={}",
+                                    check_sorted_idx[p],
+                                    check_sorted_idx[p - 1]
+                                );
+                                break;
+                            }
+                        }
+                        let mut anchors_ok = true;
+                        let mut anchors_detail = String::from("none");
+                        for (p, &idx) in check_sorted_idx.iter().enumerate() {
+                            let i = idx as usize;
+                            if i >= check_n || check_orig_anchor[i] != check_sorted_anchor[p] {
+                                anchors_ok = false;
+                                anchors_detail = format!("p={p} idx={idx}");
+                                break;
+                            }
+                        }
+                        let ok_str = |ok: bool| if ok { "ok" } else { "FAIL" };
+                        if !perm_ok {
+                            eprintln!("#bucket-check-violation chunk={check_c} perm {perm_detail}");
+                        }
+                        if !monotone_ok {
+                            eprintln!(
+                                "#bucket-check-violation chunk={check_c} monotone {monotone_detail}"
+                            );
+                        }
+                        if !stable_ok {
+                            eprintln!(
+                                "#bucket-check-violation chunk={check_c} stable {stable_detail}"
+                            );
+                        }
+                        if !anchors_ok {
+                            eprintln!(
+                                "#bucket-check-violation chunk={check_c} anchors {anchors_detail}"
+                            );
+                        }
+                        let n_buckets = self.n_buckets as usize;
+                        let mut hist = vec![0u32; n_buckets];
+                        for &a in &check_sorted_anchor {
+                            let b = bucket_of(a) as usize;
+                            if b < n_buckets {
+                                hist[b] += 1;
+                            }
+                        }
+                        let mut hist_sorted = hist.clone();
+                        hist_sorted.sort_unstable();
+                        let (hb_min, hb_med, hb_max) = (
+                            hist_sorted[0],
+                            hist_sorted[n_buckets / 2],
+                            hist_sorted[n_buckets - 1],
+                        );
+                        let ref_len = self.ref_len;
+                        let push_sectors = |r: u32, out: &mut Vec<u32>| {
+                            let start = r.saturating_sub(64);
+                            let mut end = r.saturating_add(32);
+                            if end > ref_len {
+                                end = ref_len;
+                            }
+                            if start >= end {
+                                return;
+                            }
+                            for s in (start >> 5)..=((end - 1) >> 5) {
+                                out.push(s);
+                            }
+                        };
+                        let mut sectors: Vec<u32> = Vec::new();
+                        for &a in &check_sorted_anchor {
+                            push_sectors(a as u32, &mut sectors);
+                        }
+                        sectors.sort_unstable();
+                        let mut distinct: u64 = 0;
+                        let mut prev_s: Option<u32> = None;
+                        for &s in &sectors {
+                            if prev_s != Some(s) {
+                                distinct += 1;
+                                prev_s = Some(s);
+                            }
+                        }
+                        let touches = sectors.len() as u64;
+                        let tps = if distinct > 0 {
+                            touches as f64 / distinct as f64
+                        } else {
+                            0.0
+                        };
+                        let mut bucket_tps_max = 0.0f64;
+                        let mut lo = 0usize;
+                        while lo < check_n {
+                            let b = bucket_of(check_sorted_anchor[lo]);
+                            let mut hi = lo + 1;
+                            while hi < check_n && bucket_of(check_sorted_anchor[hi]) == b {
+                                hi += 1;
+                            }
+                            let mut v: Vec<u32> = Vec::new();
+                            for &a in &check_sorted_anchor[lo..hi] {
+                                push_sectors(a as u32, &mut v);
+                            }
+                            v.sort_unstable();
+                            let mut d: u64 = 0;
+                            let mut pv: Option<u32> = None;
+                            for &s in &v {
+                                if pv != Some(s) {
+                                    d += 1;
+                                    pv = Some(s);
+                                }
+                            }
+                            if d > 0 {
+                                bucket_tps_max = bucket_tps_max.max(v.len() as f64 / d as f64);
+                            }
+                            lo = hi;
+                        }
+                        eprintln!(
+                            "#bucket-check chunk={check_c} n={check_n} perm={} monotone={} stable={} anchors={} B={} shift={} hits_per_bucket={hb_min}/{hb_med}/{hb_max} distinct_sectors_total={distinct} touches_total={touches} touches_per_sector={tps:.2} bucket_tps_max={bucket_tps_max:.2}",
+                            ok_str(perm_ok),
+                            ok_str(monotone_ok),
+                            ok_str(stable_ok),
+                            ok_str(anchors_ok),
+                            self.n_buckets,
+                            self.bucket_shift,
+                        );
+                        // Round 116: the scatter that writes no raw id, run
+                        // beside the one just checked into a buffer of its
+                        // own, must write the same anchors word for word.
+                        #[cfg(feature = "gate-sieve")]
+                        if self.survivor_slots && self.bucket_match {
+                            // SAFETY: the kernel writes every one of the
+                            // `iter_num_hits` slots before the copy below.
+                            let mut d_plain = unsafe {
+                                uninitialized::<u64>(&self.stream, iter_num_hits as usize)?
+                            };
+                            unsafe {
+                                self.module.bucket_scatter_match_anchors(
+                                    &self.stream,
+                                    LaunchConfig {
+                                        grid_dim: (cblocks, 1, 1),
+                                        block_dim: (SCAN_BLOCK, 1, 1),
+                                        shared_mem_bytes: 0,
+                                    },
+                                    &self.buf_anchor,
+                                    iter_num_hits,
+                                    self.bucket_shift,
+                                    cblocks,
+                                    self.n_buckets,
+                                    &self.buf_bucket_counts,
+                                    &mut d_plain,
+                                )?;
+                            }
+                            let plain = copy_prefix(&d_plain, &self.stream, check_n)?;
+                            let differ = plain
+                                .iter()
+                                .zip(&check_sorted_anchor)
+                                .position(|(a, b)| a != b);
+                            if let Some(at) = differ {
+                                eprintln!(
+                                    "#bucket-check-violation chunk={check_c} anchors_only slot={at}"
+                                );
+                            }
+                            eprintln!(
+                                "#bucket-check-anchors-only chunk={check_c} n={check_n} equal={}",
+                                ok_str(differ.is_none()),
+                            );
+                        }
                     }
-                    // Retained until the pass drains the stream: `add_block_offsets`
-                    // may still be queued reading it.
-                    d_bucket_sums
-                })
-            };
+                }
+            }
 
             #[cfg(feature = "dense-anchors")]
             let (materializer_hits, _survivor_offsets) = {
@@ -3874,7 +4215,14 @@ impl Engine {
                 let blocks = scan_len.div_ceil(SCAN_BLOCK);
                 // SAFETY: the count kernel writes one sum for every launched
                 // block before the host copy reads it.
-                let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
+                unsafe {
+                    reserve(
+                        &mut self.scr_surv_sums,
+                        &self.stream,
+                        blocks as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
                 let stage = self.stage();
                 if !bits_pass {
                     unsafe {
@@ -3886,7 +4234,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             },
                             &self.buf_flags,
-                            &mut d_sums,
+                            &mut self.scr_surv_sums,
                             iter_num_hits,
                         )?;
                     }
@@ -3902,7 +4250,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             },
                             &self.buf_flags_bits,
-                            &mut d_sums,
+                            &mut self.scr_surv_sums,
                             flag_words,
                         )?;
                     }
@@ -3920,8 +4268,15 @@ impl Engine {
                         .record(&self.stream)?;
                 }
 
+                if !lulled_gate {
+                    lulled_gate = true;
+                    let t = Instant::now();
+                    lull(self, Lull::Gate)?;
+                    self.phases.add("host work under kernels", t.elapsed());
+                }
+
                 let t = Instant::now();
-                let mut sums = d_sums.to_host_vec(&self.stream)?;
+                let mut sums = copy_prefix(&self.scr_surv_sums, &self.stream, blocks as usize)?;
                 self.absorb_sync()?;
                 let mut total = 0u32;
                 for sum in sums.iter_mut() {
@@ -4029,8 +4384,17 @@ impl Engine {
                 }
                 self.phases.add("alloc dense outputs", t.elapsed());
 
-                let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
-                self.pipeline_syncs += 1;
+                // SAFETY: queued before the emit kernels, which read it; `sums`
+                // leaves this block with the total and lives through the done
+                // scan's wait on the stream.
+                unsafe {
+                    upload(
+                        &mut self.scr_surv_offsets,
+                        &self.stream,
+                        &sums,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
                 let stage = self.stage();
                 if !bits_pass {
                     unsafe {
@@ -4042,7 +4406,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             },
                             &mut self.buf_flags,
-                            &d_offsets,
+                            &self.scr_surv_offsets,
                             &mut self.buf_survivors,
                             iter_num_hits,
                         )?;
@@ -4066,7 +4430,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             },
                             &self.buf_flags_bits,
-                            &d_offsets,
+                            &self.scr_surv_offsets,
                             &mut self.buf_survivors,
                             flag_words,
                         )?;
@@ -4086,7 +4450,7 @@ impl Engine {
                                 shared_mem_bytes: 0,
                             },
                             &self.buf_flags_bits,
-                            &d_offsets,
+                            &self.scr_surv_offsets,
                             &self.buf_sorted_idx,
                             &mut self.buf_survivors,
                             flag_words,
@@ -4193,7 +4557,7 @@ impl Engine {
                         }
                     }
                 }
-                (total, d_offsets)
+                (total, sums)
             };
             #[cfg(not(feature = "dense-anchors"))]
             let materializer_hits = iter_num_hits;
@@ -4206,14 +4570,23 @@ impl Engine {
             } else {
                 1
             };
+            #[cfg(feature = "counters")]
             let mut d_stats = DeviceBuffer::<u64>::zeroed(&self.stream, stats_len)?;
+            #[cfg(not(feature = "counters"))]
+            let _ = stats_len;
             if !self.async_stages {
                 self.stream.synchronize()?;
                 self.stage_syncs += 1;
             }
             self.phases.add("alloc materializer buffers", t.elapsed());
-            let (free, total) = device_memory();
-            self.peak_used = self.peak_used.max(total.saturating_sub(free));
+            // The peak can only have risen if something was allocated since the
+            // last sample, so the driver is asked then and not once per chunk.
+            let epoch = ALLOC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+            if epoch != self.mem_epoch_seen {
+                self.mem_epoch_seen = epoch;
+                let (free, total) = device_memory();
+                self.peak_used = self.peak_used.max(total.saturating_sub(free));
+            }
 
             #[cfg(feature = "counters")]
             self.hsp_stats.set_strand(rev);
@@ -4238,6 +4611,10 @@ impl Engine {
             #[cfg(not(feature = "dense-anchors"))]
             let survivor_ptr = core::ptr::null::<u32>();
             let stage = self.stage();
+            #[cfg(feature = "counters")]
+            let stats = &mut d_stats;
+            #[cfg(not(feature = "counters"))]
+            let stats = &mut self.scr_stats;
             // SAFETY: one warp per work item; `hsp`/`done` are sized to the
             // materializer count and the dense pointers cover every emitted ID.
             unsafe {
@@ -4262,7 +4639,7 @@ impl Engine {
                     survivor_ptr,
                     &mut self.buf_hsp,
                     &mut self.buf_done,
-                    &mut d_stats,
+                    stats,
                 )?;
             }
             self.end_stage(stage, "find_hsps")?;
@@ -4309,7 +4686,15 @@ impl Engine {
             // falls out of the block-sum scan, and `compress_output` is
             // unchanged — it still reads a full inclusive scan.
             let done_blocks = materializer_hits.div_ceil(SCAN_BLOCK);
-            let mut d_done_sums = DeviceBuffer::<u32>::zeroed(&self.stream, done_blocks as usize)?;
+            // SAFETY: `scan_blocks` writes one sum for every launched block.
+            unsafe {
+                reserve(
+                    &mut self.scr_done_sums,
+                    &self.stream,
+                    done_blocks as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+            }
             let stage = self.stage();
             // SAFETY: one element per thread over `materializer_hits`, one sum slot
             // per block.
@@ -4322,7 +4707,7 @@ impl Engine {
                         shared_mem_bytes: 0,
                     },
                     &mut self.buf_done,
-                    &mut d_done_sums,
+                    &mut self.scr_done_sums,
                     materializer_hits,
                 )?;
             }
@@ -4331,7 +4716,7 @@ impl Engine {
             let t = Instant::now();
             // REQUIRED: `num_anchors` sizes the reduced buffer and decides whether
             // this chunk emits anything at all.
-            let mut sums = d_done_sums.to_host_vec(&self.stream)?;
+            let mut sums = copy_prefix(&self.scr_done_sums, &self.stream, done_blocks as usize)?;
             self.absorb_sync()?;
             let mut acc = 0u32;
             for s in sums.iter_mut() {
@@ -4346,8 +4731,16 @@ impl Engine {
             }
             out.raw_hsps += num_anchors;
 
-            let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
-            self.pipeline_syncs += 1;
+            // SAFETY: queued before `add_block_offsets`, which reads it; `sums`
+            // lives to the end of this iteration, past the wait on the output.
+            unsafe {
+                upload(
+                    &mut self.scr_done_offsets,
+                    &self.stream,
+                    &sums,
+                    &mut self.pipeline_syncs,
+                )?;
+            }
             let stage = self.stage();
             // SAFETY: same geometry as `scan_blocks`, so block `b` reads offset `b`.
             unsafe {
@@ -4359,15 +4752,23 @@ impl Engine {
                         shared_mem_bytes: 0,
                     },
                     &mut self.buf_done,
-                    &d_offsets,
+                    &self.scr_done_offsets,
                     materializer_hits,
                 )?;
             }
             self.end_stage(stage, "add_block_offsets (done)")?;
 
             let t = Instant::now();
-            let mut d_reduced =
-                DeviceBuffer::<SegmentPair>::zeroed(&self.stream, num_anchors as usize)?;
+            // SAFETY: `compress_output` writes every one of the `num_anchors`
+            // slots (one per done flag) before the copy below reads them.
+            unsafe {
+                reserve(
+                    &mut self.buf_reduced,
+                    &self.stream,
+                    num_anchors as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+            }
             if !self.async_stages {
                 self.stream.synchronize()?;
                 self.stage_syncs += 1;
@@ -4383,7 +4784,7 @@ impl Engine {
                     elementwise(),
                     &self.buf_done,
                     &self.buf_hsp,
-                    &mut d_reduced,
+                    &mut self.buf_reduced,
                     materializer_hits,
                 )?;
             }
@@ -4392,13 +4793,19 @@ impl Engine {
             let t = Instant::now();
             // REQUIRED: this is the output. It also drains the stream, which is
             // what makes the per-chunk temporaries safe to drop below.
-            let mut anchors = d_reduced.to_host_vec(&self.stream)?;
+            let mut anchors = copy_prefix(&self.buf_reduced, &self.stream, num_anchors as usize)?;
             self.absorb_sync()?;
             self.phases.add("D->H anchors", t.elapsed());
 
             let t = Instant::now();
             if self.dump_raw {
                 out.raw.extend_from_slice(&anchors);
+            }
+            // With `counters` the dedup feeds the engine's group statistics, so
+            // it stays here.
+            if defer_dedup && cfg!(not(feature = "counters")) {
+                out.chunks.push(anchors);
+                continue;
             }
             #[cfg(feature = "counters")]
             crate::hsp::dedup_and_order(&mut anchors, Some(&mut self.groups));
@@ -4642,7 +5049,7 @@ impl Engine {
     /// A genuine host dependency: the host is about to read a device
     /// result, free a buffer a queued kernel touches, or return to the caller.
     fn sync_pipeline(&mut self) -> Result<(), DriverError> {
-        self.stream.synchronize()?;
+        host_trace::timed(&host_trace::BLOCKED_NS, || self.stream.synchronize())?;
         self.pipeline_syncs += 1;
         self.resolve_pending()
     }
@@ -4756,6 +5163,7 @@ unsafe fn uninitialized<T>(
         return Ok(unsafe { DeviceBuffer::from_raw_parts(0, len, ctx) });
     }
     let ptr = unsafe { cuda_core::memory::malloc_sync(bytes)? };
+    ALLOC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(unsafe { DeviceBuffer::from_raw_parts(ptr, len, ctx) })
 }
 
@@ -5095,6 +5503,59 @@ fn pack_launch(groups: usize) -> LaunchConfig {
     }
 }
 
+impl Engine {
+    /// Round 122: whether this engine's batches are seeded without transitions
+    /// ([`FoldRequest`]). It can turn false once, when a chunk takes the
+    /// folded tables' memory.
+    pub fn folded(&self) -> bool {
+        self.fold_alt.is_some()
+    }
+
+    /// Round 122: the next batch call is on plain seeds, all variants: a batch
+    /// that came back `oversized` from a folded engine, sent again.
+    pub fn plain_next(&mut self) {
+        self.plain_once = true;
+    }
+
+    /// Makes the engine's tables the folded set or the plain one. Queued
+    /// kernels hold device addresses, not these handles.
+    fn use_tables(&mut self, fold: bool) {
+        if self.fold_active == fold {
+            return;
+        }
+        let Some(alt) = self.fold_alt.as_mut() else {
+            return;
+        };
+        std::mem::swap(&mut self.index_table, &mut alt[0]);
+        std::mem::swap(&mut self.pos_table, &mut alt[1]);
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        {
+            std::mem::swap(&mut self.buf_bucket_nibbles, &mut alt[2]);
+            std::mem::swap(&mut self.buf_bucket_bounds, &mut alt[3]);
+        }
+        self.fold_active = fold;
+    }
+
+    /// Frees the folded tables; the engine is plain from here on.
+    fn release_fold(&mut self, why: &str) {
+        self.use_tables(false);
+        if self.fold_alt.take().is_some() {
+            fold_totals::RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.timing {
+                eprintln!(
+                    "  transition fold: dropped for this reference, {why} ({} of {} batches sent \
+                     again, {} hits fit beside it)",
+                    self.fold_again, self.fold_seen, self.fold_capacity
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "gate-sieve")]
 impl Engine {
     /// Words per row of bucket edges, as a shift: the next power of two above
@@ -5107,6 +5568,244 @@ impl Engine {
     ))]
     fn bounds_row_shift(&self) -> u32 {
         (self.n_buckets + 1).next_power_of_two().trailing_zeros()
+    }
+
+    /// Round 122: builds the folded tables beside the plain ones
+    /// ([`FoldRequest`]) and makes them the engine's: every k-mer's folded
+    /// length (`fold_counts`), the scan, one pass that copies each variant's
+    /// positions window by window (`fold_fill`), and the bucket tables of the
+    /// result. A k-mer's list is in window order, which is all the bucket
+    /// tables and the group kernel need; inside a window it is variant by
+    /// variant, not ascending.
+    ///
+    /// Not built, with a line under `--time`, when the bucket order is not
+    /// written from the seeds for this reference, the folded positions do not
+    /// fit 32-bit offsets, or `max_hits` hits no longer fit beside them.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn fold_tables(
+        &mut self,
+        req: FoldRequest,
+        host_index: &[u32],
+        host_pos: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n_kmers = self.index_table.len() as u32;
+        let kmer_size = n_kmers.trailing_zeros() / 2;
+        let plain = self.pos_table.len() as u64;
+        let total = plain * u64::from(req.mask.count_ones() + 1);
+        // Folded positions, their ends, the counts per k-mer and at most a row
+        // of edges for every k-mer.
+        let bytes = 4 * total
+            + 8 * u64::from(n_kmers)
+            + ((4 * u64::from(n_kmers)) << self.bounds_row_shift());
+        let left =
+            u64::from(self.hit_capacity).saturating_sub(bytes.div_ceil(req.bytes_per_hit.max(1)));
+        let why_not = if req.mask == 0 {
+            Some("the seed has no transition".to_string())
+        } else if self.census.is_some() {
+            Some("the census counts by plain seed".to_string())
+        } else if self.buf_bucket_nibbles.is_empty() {
+            Some("the bucket order is not written from the seeds".to_string())
+        } else if total > u64::from(u32::MAX) {
+            Some(format!("{total} folded positions do not fit 32 bits"))
+        } else if left < u64::from(self.max_hits) {
+            Some(format!(
+                "{:.1} GiB of tables leave room for {left} hits, below --max-hits {}",
+                bytes as f64 / (1u64 << 30) as f64,
+                self.max_hits
+            ))
+        } else if (device_memory().0 as u64) < bytes + (1 << 30) {
+            Some(format!(
+                "{:.1} GiB of tables, {:.1} GiB free on the device",
+                bytes as f64 / (1u64 << 30) as f64,
+                device_memory().0 as f64 / (1u64 << 30) as f64
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why_not {
+            if self.timing {
+                eprintln!("  transition fold: off for this reference, {why}");
+            }
+            return Ok(());
+        }
+        let t = Instant::now();
+        // SAFETY: `fold_counts` writes every word.
+        let mut ends = unsafe { uninitialized::<u32>(&self.stream, n_kmers as usize)? };
+        let sblocks = n_kmers.div_ceil(SCAN_BLOCK);
+        let mut d_sums = DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+        let scan = LaunchConfig {
+            grid_dim: (sblocks, 1, 1),
+            block_dim: (SCAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one thread per k-mer writing its own word, then the in-block
+        // scan with its block totals.
+        unsafe {
+            self.module.fold_counts(
+                &self.stream,
+                elementwise(),
+                &self.index_table,
+                req.mask,
+                kmer_size,
+                n_kmers,
+                &mut ends,
+            )?;
+            self.module
+                .scan_blocks(&self.stream, scan, &mut ends, &mut d_sums, n_kmers)?;
+        }
+        // Once per reference, so the block totals take the host's way.
+        let mut sums = d_sums.to_host_vec(&self.stream)?;
+        let mut acc = 0u64;
+        for sum in sums.iter_mut() {
+            let here = *sum;
+            *sum = acc as u32;
+            acc += u64::from(here);
+        }
+        if acc != total {
+            return Err(format!(
+                "transition fold: {acc} folded positions counted, {total} expected"
+            )
+            .into());
+        }
+        let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
+        // SAFETY: the scan's last step; then one thread per k-mer writes the
+        // `ends[k - 1]..ends[k]` slots of the folded positions, all of them.
+        let folded = unsafe {
+            self.module
+                .add_block_offsets(&self.stream, scan, &mut ends, &d_offsets, n_kmers)?;
+            let mut folded = uninitialized::<u32>(&self.stream, total as usize)?;
+            self.module.fold_fill(
+                &self.stream,
+                elementwise(),
+                &self.index_table,
+                &self.pos_table,
+                &ends,
+                req.mask,
+                kmer_size,
+                self.seed_size,
+                self.bucket_shift,
+                self.n_buckets,
+                n_kmers,
+                &mut folded,
+            )?;
+            folded
+        };
+        self.stream.synchronize()?;
+        let built = t.elapsed();
+        if req.check {
+            self.check_fold(req.mask, kmer_size, host_index, host_pos, &ends, &folded)?;
+        }
+        // SAFETY: empty, and replaced by `build_bucket_tables` below.
+        let (nibbles, bounds) = unsafe {
+            (
+                uninitialized::<u32>(&self.stream, 0)?,
+                uninitialized::<u32>(&self.stream, 0)?,
+            )
+        };
+        self.fold_alt = Some(Box::new([ends, folded, nibbles, bounds]));
+        self.use_tables(true);
+        let t = Instant::now();
+        self.build_bucket_tables()?;
+        if self.buf_bucket_nibbles.is_empty() {
+            // Declined (it said why): back to the plain tables alone.
+            self.use_tables(false);
+            self.fold_alt = None;
+            return Ok(());
+        }
+        self.fold_capacity = left.min(u64::from(u32::MAX)) as u32;
+        // A test's way to the release: `HSPZ_FOLD_CAPACITY` lowers the figure.
+        if let Some(cap) = std::env::var("HSPZ_FOLD_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            self.fold_capacity = self.fold_capacity.min(cap);
+        }
+        fold_totals::BINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.timing {
+            eprintln!(
+                "  transition fold: {plain} positions -> {total} ({:.1} GiB), built in {:.1} ms and {:.1} ms \
+                 for its bucket tables; chunks up to {} hits beside it{}",
+                total as f64 * 4.0 / (1u64 << 30) as f64,
+                built.as_secs_f64() * 1e3,
+                t.elapsed().as_secs_f64() * 1e3,
+                self.fold_capacity,
+                if req.check {
+                    " (checked against the host's)"
+                } else {
+                    ""
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `HSPZ_FOLD=check`: the device's folded tables against
+    /// `seed::fold_tables` on the host: the same ends, and for every k-mer the
+    /// same positions, in window order.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn check_fold(
+        &mut self,
+        mask: u32,
+        kmer_size: u32,
+        host_index: &[u32],
+        host_pos: &[u32],
+        ends: &DeviceBuffer<u32>,
+        folded: &DeviceBuffer<u32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let (want_ends, want_pos) =
+            crate::seed::fold_tables(host_index, host_pos, mask, kmer_size as usize, threads)
+                .ok_or("transition fold check: the host's table does not fit 32 bits")?;
+        let got_ends = ends.to_host_vec(&self.stream)?;
+        if got_ends != want_ends {
+            let k = got_ends.iter().zip(&want_ends).position(|(a, b)| a != b);
+            return Err(
+                format!("transition fold check: the ends differ, first at k-mer {k:?}").into(),
+            );
+        }
+        let got_pos = folded.to_host_vec(&self.stream)?;
+        let (shift, top, seed_size) = (self.bucket_shift, self.n_buckets - 1, self.seed_size);
+        let bucket = |p: u32| ((p + seed_size) >> shift).min(top);
+        let n = want_ends.len();
+        let per = n.div_ceil(threads);
+        let bad = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        std::thread::scope(|scope| {
+            for c in 0..threads {
+                let (got_pos, want_pos, want_ends, bad, bucket) =
+                    (&got_pos, &want_pos, &want_ends, &bad, &bucket);
+                scope.spawn(move || {
+                    let mut list = Vec::new();
+                    for k in (c * per)..((c + 1) * per).min(n) {
+                        let lo = if k > 0 { want_ends[k - 1] as usize } else { 0 };
+                        let hi = want_ends[k] as usize;
+                        let got = &got_pos[lo..hi];
+                        let in_order = got.windows(2).all(|w| bucket(w[0]) <= bucket(w[1]));
+                        list.clear();
+                        list.extend_from_slice(got);
+                        list.sort_unstable();
+                        if !in_order || list != want_pos[lo..hi] {
+                            bad.fetch_min(k, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        match bad.into_inner() {
+            usize::MAX => Ok(()),
+            k => Err(format!(
+                "transition fold check: k-mer {k} holds other positions or is out of window order"
+            )
+            .into()),
+        }
     }
 
     /// Round 119: the two tables the group line reads, once per reference: every
@@ -5184,7 +5883,13 @@ impl Engine {
             rows += here;
         }
         let row_bytes = (rows as usize * 4) << row_shift;
-        let allowed = (self.ref_len as usize / 4).max(64 << 20);
+        // Most k-mers of the folded table have a row: its memory is counted
+        // with the fold's ([`fold_tables`](Self::fold_tables)).
+        let allowed = if self.fold_active {
+            usize::MAX
+        } else {
+            (self.ref_len as usize / 4).max(64 << 20)
+        };
         if rows >= 1 << 24 || row_bytes > allowed {
             if self.timing {
                 eprintln!(
@@ -5241,8 +5946,7 @@ impl Engine {
     }
 
     /// Round 119: one chunk's bucket order written from its seeds
-    /// into `buf_sorted_anchor`. Returns the block sums of the scan, which a
-    /// queued kernel may still read.
+    /// into `buf_sorted_anchor`.
     #[cfg(all(
         feature = "find-hits-groups",
         feature = "ref-loc-buckets",
@@ -5253,13 +5957,15 @@ impl Engine {
         slot: usize,
         start_seed_index: u32,
         num_seeds: u32,
-    ) -> Result<DeviceBuffer<u32>, DriverError> {
-        // One warp of the two kernels below per run of 32 seeds.
-        let num_runs = num_seeds.div_ceil(32);
+    ) -> Result<(), DriverError> {
+        // One warp of the two kernels below per run of `run_len` seeds: 32,
+        // or fewer of the folded table's, which have 13 times the hits each.
+        let run_len = if self.fold_active { fold_run_len() } else { 32 };
+        let num_runs = num_seeds.div_ceil(run_len);
         let counts_len = self.n_buckets * num_runs;
         let row_shift = self.bounds_row_shift();
         let by_runs = LaunchConfig {
-            grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+            grid_dim: ((num_runs * 32).div_ceil(BLOCK_SIZE), 1, 1),
             block_dim: (BLOCK_SIZE, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5294,6 +6000,7 @@ impl Engine {
                 self.n_buckets,
                 row_shift,
                 num_runs,
+                run_len,
                 &mut self.buf_seed_counts,
                 &mut self.buf_seed_nib,
             )?;
@@ -5301,7 +6008,15 @@ impl Engine {
         self.end_stage(stage, "run_bucket_counts")?;
 
         let sblocks = counts_len.div_ceil(SCAN_BLOCK);
-        let mut d_sums = DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+        // SAFETY: `scan_blocks` writes one sum for every launched block.
+        unsafe {
+            reserve(
+                &mut self.scr_run_sums,
+                &self.stream,
+                sblocks as usize,
+                &mut self.pipeline_syncs,
+            )?;
+        }
         let scan = LaunchConfig {
             grid_dim: (sblocks, 1, 1),
             block_dim: (SCAN_BLOCK, 1, 1),
@@ -5315,7 +6030,7 @@ impl Engine {
                 &self.stream,
                 scan,
                 &mut self.buf_seed_counts,
-                &mut d_sums,
+                &mut self.scr_run_sums,
                 counts_len,
             )?;
             self.module.scan_exclusive_one_block(
@@ -5325,14 +6040,14 @@ impl Engine {
                     block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
                     shared_mem_bytes: 0,
                 },
-                &mut d_sums,
+                &mut self.scr_run_sums,
                 sblocks,
             )?;
             self.module.add_block_offsets(
                 &self.stream,
                 scan,
                 &mut self.buf_seed_counts,
-                &d_sums,
+                &self.scr_run_sums,
                 counts_len,
             )?;
         }
@@ -5356,13 +6071,14 @@ impl Engine {
                 self.n_buckets,
                 row_shift,
                 num_runs,
+                run_len,
                 start_seed_index,
                 num_seeds,
                 &mut self.buf_sorted_anchor,
             )?;
         }
         self.end_stage(stage, "find_hits_bucketed")?;
-        Ok(d_sums)
+        Ok(())
     }
 
     /// Round 119, `HSPZ_HITS_BUCKETED=check`: the count and the scatter have
@@ -5393,7 +6109,7 @@ impl Engine {
         let launched = self.launch_hits_bucketed(slot, start_seed_index, num_seeds);
         let synced = self.sync_pipeline();
         std::mem::swap(&mut self.buf_sorted_anchor, &mut scratch);
-        let _sums = launched?;
+        launched?;
         synced?;
         let mut got = copy_prefix(&scratch, &self.stream, n)?;
         let (shift, top) = (self.bucket_shift, self.n_buckets - 1);
@@ -5604,8 +6320,14 @@ impl Engine {
         let words = n.div_ceil(32);
         let blocks = words.div_ceil(SCAN_BLOCK);
         // SAFETY: `count_bits` writes one sum per launched block before the copy.
-        let mut d_sums = unsafe { uninitialized::<u32>(&self.stream, blocks as usize)? };
+        // The survivor count, which shares the buffer, runs after this returns.
         unsafe {
+            reserve(
+                &mut self.scr_surv_sums,
+                &self.stream,
+                blocks as usize,
+                &mut self.pipeline_syncs,
+            )?;
             self.module.count_bits(
                 &self.stream,
                 LaunchConfig {
@@ -5614,11 +6336,11 @@ impl Engine {
                     shared_mem_bytes: 0,
                 },
                 &self.sieve.cand_bits,
-                &mut d_sums,
+                &mut self.scr_surv_sums,
                 words,
             )?;
         }
-        let sums = d_sums.to_host_vec(&self.stream)?;
+        let sums = copy_prefix(&self.scr_surv_sums, &self.stream, blocks as usize)?;
         self.absorb_sync()?;
         Ok(sums.iter().map(|&c| u64::from(c)).sum())
     }
@@ -6347,6 +7069,36 @@ pub fn validate_hit_config(
 /// A pinned request wins; `0` means "use the device-derived default".
 pub fn adopt_max_hits(requested: u32, derived: u32) -> u32 {
     if requested > 0 { requested } else { derived }
+}
+
+/// Round 122: how many folded seeds a warp of the bucketed group kernels
+/// holds, a power of two up to 32. A folded seed has 13 times the hits of a
+/// plain one, and with 32 of them a batch is fewer warps than an A100 holds
+/// resident: unit 0's writer took 2,026 ms with 32, 1,763 with 16, 1,473 with
+/// 8, 1,313 with 4, 1,291 with 2 and 1,653 with 1 (the count kernel 117, 104,
+/// 92, 108, 165 and 283 ms). `HSPZ_FOLD_RUN` overrides the 4.
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+fn fold_run_len() -> u32 {
+    static REQUEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| {
+        match std::env::var("HSPZ_FOLD_RUN")
+            .ok()
+            .map(|v| v.parse::<u32>())
+        {
+            None => 4,
+            Some(Ok(n)) if n.is_power_of_two() && n <= 32 => n,
+            Some(other) => {
+                eprintln!(
+                    "warning: HSPZ_FOLD_RUN={other:?} is not a power of two up to 32; using 4"
+                );
+                4
+            }
+        }
+    })
 }
 
 /// `max_hits` in force: `requested`, or the device-derived default when `0`.

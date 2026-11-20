@@ -1194,6 +1194,21 @@ pub fn unit_device_bytes(
     u64::try_from(total).map_err(|_| "device estimate exceeds u64".into())
 }
 
+/// Round 122: the device bytes that one more hit of capacity costs under
+/// [`unit_device_bytes`], rounded up. The transition fold is paid for with
+/// capacity above `max_hits` (`gpu::FoldRequest`).
+pub fn device_bytes_per_hit(
+    kmer_size: usize,
+    step: u32,
+    wga_chunk_size: u32,
+    transitions: bool,
+) -> Result<u64, String> {
+    const SPAN: u32 = 1 << 20;
+    let lo = unit_device_bytes(0, 0, kmer_size, step, SPAN, wga_chunk_size, transitions)?;
+    let hi = unit_device_bytes(0, 0, kmer_size, step, 2 * SPAN, wga_chunk_size, transitions)?;
+    Ok((hi - lo).div_ceil(u64::from(SPAN)))
+}
+
 /// Conservative bound for the largest Cartesian unit, using packed lengths.
 ///
 /// Full Cartesian means max packed reference × max packed query is sufficient.
@@ -2494,6 +2509,29 @@ mod tests {
     }
 
     use super::*;
+
+    /// Round 122: capacity priced per hit covers what the estimate adds for
+    /// it, at the capacities a card can hold.
+    #[test]
+    fn device_bytes_per_hit_covers_the_estimate() {
+        for (k, c, tr) in [
+            (12usize, 250_000u32, true),
+            (14, 250_000, true),
+            (12, 60_000, false),
+        ] {
+            let per = device_bytes_per_hit(k, 1, c, tr).unwrap();
+            assert!((40..=120).contains(&per), "{per} bytes per hit");
+            for (lo, hi) in [(16_711_680u32, 33_423_360u32), (332_401_664, 1_308_385_253)] {
+                let a = unit_device_bytes(450_000_000, 500_000_000, k, 1, lo, c, tr).unwrap();
+                let b = unit_device_bytes(450_000_000, 500_000_000, k, 1, hi, c, tr).unwrap();
+                assert!(
+                    b - a <= per * u64::from(hi - lo),
+                    "k={k}: {} > {per} per hit",
+                    b - a
+                );
+            }
+        }
+    }
 
     /// The prefetch fallback — keep prefetch when it fits,
     /// disable it when only the no-prefetch shape fits, hard-error when neither

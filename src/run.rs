@@ -19,7 +19,7 @@
 
 use crate::Fallible;
 use crate::cli::RunArgs;
-use crate::gpu::{DeviceProfile, Engine, EngineConfig, HitStats, Lifecycle};
+use crate::gpu::{DeviceProfile, Engine, EngineConfig, HitStats, Lifecycle, Lull};
 use crate::hsp::{self, SegmentPair};
 use crate::partition::{Partitioner, Plan};
 use crate::plan::{self, PackedBin, RecordMeta};
@@ -211,6 +211,7 @@ impl Prepared {
             hit_capacity: contract.hit_capacity,
             timing: args.time,
             hsp_blocks: contract.hsp_blocks,
+            fold: None,
         }
     }
 
@@ -337,6 +338,48 @@ impl SeedSlot {
     }
 }
 
+/// A batch whose HSPs are still to be sorted and deduplicated: its interval,
+/// its strand, and its `MAX_HITS` chunks as they came off the device.
+type PendingBatch = Option<(usize, bool, Vec<Vec<SegmentPair>>)>;
+
+/// Round 121: sorts and deduplicates the batch in `pending`, one chunk at a time
+/// as the engine does, and appends its HSPs to their interval and strand.
+fn settle_pending(
+    pending: &mut PendingBatch,
+    out: &mut [(Vec<SegmentPair>, Vec<SegmentPair>)],
+    engine: &mut Engine,
+) {
+    let Some((interval, rev, chunks)) = pending.take() else {
+        return;
+    };
+    let t = Instant::now();
+    let dst = if rev {
+        &mut out[interval].1
+    } else {
+        &mut out[interval].0
+    };
+    for mut chunk in chunks {
+        crate::hsp::dedup_and_order(&mut chunk, None);
+        dst.extend_from_slice(&chunk);
+    }
+    engine.phases.add("host sort + dedup", t.elapsed());
+}
+
+/// Round 121: `HSPZ_LEAN_BATCHES` unset or `1`: the host work between two
+/// batches (the next upload, the last batch's sort and dedup) is done inside a
+/// batch while its kernels are queued. `0`: between batches, as before.
+fn lean_batches() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_LEAN_BATCHES").as_deref() {
+        Err(_) | Ok("1") => true,
+        Ok("0") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_LEAN_BATCHES={other:?} is not 0 or 1; using 1");
+            true
+        }
+    })
+}
+
 /// How the host seed stream is generated (round 107), as `(producers, threads
 /// per producer)`.
 ///
@@ -420,27 +463,67 @@ pub(crate) fn seed_and_filter_all(
     let mut out: Vec<(Vec<SegmentPair>, Vec<SegmentPair>)> =
         vec![(Vec::new(), Vec::new()); q.intervals.len()];
 
+    // Round 122: an engine with the transition fold is seeded without
+    // transitions (`gpu::FoldRequest`), and a folded seed stands for all of
+    // its position's seeds in the count.
+    let fold = transitions && engine.folded();
+    let seed_tr = transitions && !fold;
+    let per_pos = if fold {
+        1 + shape.transition.iter().filter(|&&t| t).count() as u64
+    } else {
+        1
+    };
+
     // Round 69: chosen at runtime, not at compile time. The device seeder wins on
     // several GPUs and loses on one, so one binary has to be able to do both.
     if engine.device_seeds {
         let _ = (q.fwd, q.rc, threads);
         engine.async_seed_copy = false;
+        // Round 121: a batch's HSPs are sorted and deduplicated under the next
+        // batch's score gate (see the host-seed loop below).
+        let defer = lean_batches() && !engine.dump_raw;
+        let mut pending: PendingBatch = None;
         for b in &batches {
-            let n_seeds = engine.generate_seeds(0, b.rev, b.range, shape, transitions)?;
+            // Folded seeds while the engine has its fold (it can drop it
+            // inside a pass).
+            let with = transitions && !(fold && engine.folded());
+            let n_seeds = engine.generate_seeds(0, b.rev, b.range, shape, with)?;
             #[cfg(feature = "device-seeds-check")]
             {
                 let seq = if b.rev { q.rc } else { q.fwd };
-                let expected = seed::chunk_seeds(seq, shape, transitions, b.range);
+                let expected = seed::chunk_seeds(seq, shape, with, b.range);
                 engine.check_seed_bytes(0, &expected)?;
             }
             if n_seeds > 0 {
-                pass.stats.seeds += n_seeds as u64;
-                let o = engine.seed_and_filter(0, b.rev).map_err(|e| {
+                pass.stats.seeds += n_seeds as u64 * if with { 1 } else { per_pos };
+                let named = |e: Box<dyn std::error::Error>| {
                     format!(
                         "interval {} range {}-{} rev {}: {e}",
                         b.interval, b.range.0, b.range.1, b.rev
                     )
-                })?;
+                };
+                let mut o = {
+                    let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
+                        if lull == Lull::Gate {
+                            settle_pending(&mut pending, &mut out, engine);
+                        }
+                        Ok(())
+                    };
+                    engine.seed_and_filter_with(0, b.rev, defer, &mut work)
+                }
+                .map_err(named)?;
+                if o.oversized {
+                    // Round 122: the plain order cuts this batch into chunks.
+                    engine.generate_seeds(0, b.rev, b.range, shape, true)?;
+                    engine.plain_next();
+                    o = engine
+                        .seed_and_filter_with(0, b.rev, defer, &mut |_, _| Ok(()))
+                        .map_err(named)?;
+                }
+                settle_pending(&mut pending, &mut out, engine);
+                if !o.chunks.is_empty() {
+                    pending = Some((b.interval, b.rev, o.chunks));
+                }
                 pass.stats.seed_hits += o.num_hits as u64;
                 pass.stats.raw_hsps += o.raw_hsps as u64;
                 let dst = &mut out[b.interval];
@@ -459,6 +542,7 @@ pub(crate) fn seed_and_filter_all(
                 );
             }
         }
+        settle_pending(&mut pending, &mut out, engine);
         for (fw, rc) in out {
             pass.stats.hsps += (fw.len() + rc.len()) as u64;
             pass.intervals.push((fw, rc));
@@ -476,7 +560,7 @@ pub(crate) fn seed_and_filter_all(
             .map(|b| b.range.1 - b.range.0)
             .max()
             .unwrap_or(0);
-        let cap = seed::max_seeds(widest, shape, transitions);
+        let cap = seed::max_seeds(widest, shape, seed_tr);
         // Pinned staging is the default, but `cuMemHostAlloc` is not universally
         // available — ZLUDA returns DriverError(801) for it at any size — so a
         // refusal falls back to a pageable `Vec` rather than failing the run.
@@ -582,7 +666,7 @@ pub(crate) fn seed_and_filter_all(
                         // The same call the serial loop made for this batch, so the
                         // seed sequence stays bit-identical.
                         let seq: &[u8] = if b.rev { rc } else { fwd };
-                        slot.fill(seq, shape, transitions, b.range, inner);
+                        slot.fill(seq, shape, seed_tr, b.range, inner);
                         if alarm.0.send(Some((i, slot, t.elapsed()))).is_err() {
                             return;
                         }
@@ -608,6 +692,17 @@ pub(crate) fn seed_and_filter_all(
                 }
             };
 
+            // Round 121 (`HSPZ_LEAN_BATCHES`, on unless `0`): what the host did
+            // between two batches, with the card idle, it does inside the next
+            // batch while kernels are queued: the upload of the batch after is
+            // issued once this batch's counts are queued, and a batch's HSPs are
+            // sorted and deduplicated under the next batch's score gate.
+            let defer = lean_batches() && !engine.dump_raw;
+            // The upload is only issued ahead when it has a slot of its own.
+            let lean = overlap && lean_batches();
+            // The batch whose HSPs are still to be deduplicated: interval, strand,
+            // and its chunks as they came off the device.
+            let mut pending: PendingBatch = None;
             let mut cur = take(0)?;
             // Batch 0's upload, so the loop can always be one upload ahead.
             if overlap {
@@ -620,7 +715,7 @@ pub(crate) fn seed_and_filter_all(
                 // done, so its producer keeps that time too.
                 let mut next = None;
                 if overlap {
-                    if i + 1 < batches.len() {
+                    if !lean && i + 1 < batches.len() {
                         let slot = take(i + 1)?;
                         engine.upload_seeds((i + 1) % 2, slot.seeds())?;
                         next = Some(slot);
@@ -632,15 +727,63 @@ pub(crate) fn seed_and_filter_all(
                 let b = &batches[i];
                 let n_seeds = cur.seeds().len();
                 if n_seeds > 0 {
-                    pass.stats.seeds += n_seeds as u64;
-                    let o = engine
-                        .seed_and_filter(if overlap { i % 2 } else { 0 }, b.rev)
-                        .map_err(|e| {
-                            format!(
-                                "interval {} range {}-{} rev {}: {e}",
-                                b.interval, b.range.0, b.range.1, b.rev
-                            )
-                        })?;
+                    pass.stats.seeds += n_seeds as u64 * per_pos;
+                    let at = if overlap { i % 2 } else { 0 };
+                    let named = |e: Box<dyn std::error::Error>| {
+                        format!(
+                            "interval {} range {}-{} rev {}: {e}",
+                            b.interval, b.range.0, b.range.1, b.rev
+                        )
+                    };
+                    // Round 122: this batch's seeds again with their variants,
+                    // for a batch that the plain order cuts into chunks, and
+                    // for every batch left in a pass whose engine dropped its
+                    // fold (the producers go on writing folded seeds). The
+                    // device seeder writes them, the same bytes as the host's:
+                    // generated here, on the consumer's thread, and uploaded
+                    // from pageable memory they cost 19 ms a batch, sixty
+                    // times what the fold saves on one.
+                    let again = |engine: &mut Engine| -> Fallible<crate::gpu::FilterOutput> {
+                        // The folded seeds of this batch may still be on their
+                        // way into the slot the seeder is about to write (a
+                        // batch that went through its folded call has waited
+                        // for them; one of a pass that lost its fold has not).
+                        engine.settle_uploads()?;
+                        engine.generate_seeds(at, b.rev, b.range, shape, true)?;
+                        engine.plain_next();
+                        engine.seed_and_filter_with(at, b.rev, defer, &mut |_, _| Ok(()))
+                    };
+                    let o = if fold && !engine.folded() {
+                        again(engine).map_err(named)?
+                    } else {
+                        let o = {
+                            let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
+                                match lull {
+                                    Lull::Counts => {
+                                        if lean && next.is_none() && i + 1 < batches.len() {
+                                            let slot = take(i + 1)?;
+                                            engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                                            next = Some(slot);
+                                        }
+                                    }
+                                    Lull::Gate => settle_pending(&mut pending, &mut out, engine),
+                                }
+                                Ok(())
+                            };
+                            engine.seed_and_filter_with(at, b.rev, defer, &mut work)
+                        }
+                        .map_err(named)?;
+                        if o.oversized {
+                            again(engine).map_err(named)?
+                        } else {
+                            o
+                        }
+                    };
+                    // A call that left early never reached its lulls.
+                    settle_pending(&mut pending, &mut out, engine);
+                    if !o.chunks.is_empty() {
+                        pending = Some((b.interval, b.rev, o.chunks));
+                    }
                     pass.stats.seed_hits += o.num_hits as u64;
                     pass.stats.raw_hsps += o.raw_hsps as u64;
                     let dst = &mut out[b.interval];
@@ -659,6 +802,13 @@ pub(crate) fn seed_and_filter_all(
                     );
                 }
 
+                if lean && next.is_none() && i + 1 < batches.len() {
+                    // The batch had no seeds or left before its first lull.
+                    let slot = take(i + 1)?;
+                    engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                    next = Some(slot);
+                }
+
                 // This slot's upload finished before its compute started, and its
                 // compute has finished: a producer may overwrite it. A send only
                 // fails when every producer is gone, which is after the last claim.
@@ -673,6 +823,7 @@ pub(crate) fn seed_and_filter_all(
                 let _ = free_tx.send(done);
             }
             let _ = free_tx.send(cur);
+            settle_pending(&mut pending, &mut out, engine);
             Ok(())
         })?;
 
@@ -1899,6 +2050,35 @@ fn note_slow_index_load(dir: &std::path::Path, id: u32, dt: Duration, bytes: u64
 /// of a reference build. The single-query worker and the batch executor both
 /// call it inline for the first bin and from the prefetch thread for the next,
 /// so the two paths cannot drift.
+/// Round 122: what a run asks of an engine for the transition fold
+/// (`gpu::FoldRequest`), or `None` where a batch must be the plain seeds:
+/// `--dump-raw` shows their order, `--hit-stats` counts by seed (as the
+/// engine's census does, under which it refuses the fold itself), and the
+/// `counters` build counts by them. `--paired` builds its own configuration.
+fn fold_request(
+    args: &RunArgs,
+    shape: &Shape,
+    transitions: bool,
+) -> Option<crate::gpu::FoldRequest> {
+    let mode = seed::fold_request();
+    if mode == seed::Fold::Off
+        || !transitions
+        || args.dump_raw.is_some()
+        || args.hit_stats
+        || cfg!(feature = "counters")
+    {
+        return None;
+    }
+    let bytes_per_hit =
+        plan::device_bytes_per_hit(shape.kmer_size, args.step, args.wga_chunk_size, transitions)
+            .ok()?;
+    Some(crate::gpu::FoldRequest {
+        mask: shape.transition_mask(),
+        bytes_per_hit,
+        check: mode == seed::Fold::Check,
+    })
+}
+
 pub(crate) fn build_ref_bin(
     rbin: &plan::Bin,
     ref_records: &[(String, Vec<u8>)],
@@ -2074,6 +2254,7 @@ fn run_bins(
             hit_capacity: contract.hit_capacity,
             timing: args.time,
             hsp_blocks: contract.hsp_blocks,
+            fold: fold_request(args, shape, transitions),
         };
         let mut engine = Engine::new(&ctx, cfg, &mut rep.phases)?;
         rep.lifecycle.engine_creations += 1;
@@ -4812,6 +4993,18 @@ pub(crate) fn report_counts(stats: &Stats) {
     eprintln!("#seed hits: {}", stats.seed_hits);
     eprintln!("#raw HSPs: {}", stats.raw_hsps);
     eprintln!("#HSPs: {}", stats.hsps);
+    if crate::gpu::host_trace::on() {
+        use crate::gpu::host_trace as t;
+        use std::sync::atomic::Ordering::Relaxed;
+        let s = |ns: &std::sync::atomic::AtomicU64| ns.load(Relaxed) as f64 / 1e9;
+        let (batch, blocked, lull) = (s(&t::BATCH_NS), s(&t::BLOCKED_NS), s(&t::LULL_NS));
+        eprintln!(
+            "host trace: {} batch calls, {batch:.3} s inside them: {blocked:.3} s blocked on the card, \
+             {lull:.3} s of host work under queued kernels, {:.3} s of host work with nothing queued",
+            t::BATCHES.load(Relaxed),
+            batch - blocked - lull
+        );
+    }
     #[cfg(feature = "gate-sieve")]
     for line in crate::gpu::sieve_totals::report() {
         eprintln!("{line}");
@@ -4827,6 +5020,19 @@ pub(crate) fn report_counts(stats: &Stats) {
         let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
         if chunks > 0 {
             eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        {
+            use crate::gpu::fold_totals as f;
+            let bins = f::BINS.load(Relaxed);
+            if bins > 0 {
+                eprintln!(
+                    "transition fold: {bins} reference tables folded, {} batches on them, {} sent again \
+                     with their plain seeds, {} tables dropped",
+                    f::BATCHES.load(Relaxed),
+                    f::REISSUED.load(Relaxed),
+                    f::RELEASED.load(Relaxed)
+                );
+            }
         }
         let (chunks, hits) = (
             t::CHECKED_CHUNKS.load(Relaxed),

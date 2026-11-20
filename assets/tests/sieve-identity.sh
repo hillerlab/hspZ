@@ -48,9 +48,9 @@ arm() {
   # The control also expands seeds with the kernels of before round 110 (one warp or thread per seed) and buckets
   # with those of before round 114 (a vote per bucket), so an arm compares the group kernel and the bucket kernels
   # as well as the sieve; an arm's own ENVV may override that.
-  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits 16711680 "$@" \
+  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits "${MAXH:-16711680}" "$@" \
     2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
-  env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits 16711680 --time "$@" \
+  env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits "${MAXH:-16711680}" --time "$@" \
     2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
   local d0 d1 state rho check verdict=ok
   d0=$(digest "$W/$name.0"); d1=$(digest "$W/$name.1")
@@ -260,6 +260,54 @@ grep -q '^  ref_bucket_scatter' "$W/hits-bucketed-off.1.err" || { echo "hits-buc
 grep -q '^bucket order from the seeds' "$W/hits-bucketed-groups-check.1.err" && { echo "hits-bucketed-groups-check: the anchors were written from the seeds"; fail=$((fail+1)); }
 grep -q '^find_hits by groups check: .* every anchor equal' "$W/hits-bucketed-groups-check.1.err" || { echo "hits-bucketed-groups-check: the check did not run"; fail=$((fail+1)); }
 grep -q 'query without a mask plane' "$W/gather.1.err" && { echo "gather: the gathered arm lost its mask plane"; fail=$((fail+1)); }
+
+# Round 122: the transition fold. A folded engine is seeded without transitions and finds each position's hits in
+# one list; the control has neither the fold nor the sieve. `check` compares the tables the device built with the
+# host's, k-mer by k-mer. A batch of --max-hits hits or more is cut at plain seeds and must be sent again with
+# them (MAXH makes some batches, or most, such a batch; where most are, the engine drops its fold after 16 and
+# the pass goes on with plain seeds); HSPZ_FOLD_CAPACITY makes the first cut batch take the fold's memory.
+FB="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=24"
+ENVV="$FB HSPZ_FOLD=check" arm fold-check-24 on "$R" "$Q"
+ENVV="HSPZ_REF_BUCKETS=1 HSPZ_REF_BUCKET_SHIFT=25 HSPZ_FOLD=check" arm fold-check-25 on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD=1 HSPZ_HITS_BUCKETED=check" arm fold-bucketed-check on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD=1" arm fold-2400 on "$R" "$Q" -H 2400
+ENVV="$FB HSPZ_FOLD=check" arm fold-iupac on "$W/ref_iupac.fa" "$W/qry_iupac.fa"
+ENVV="$FB HSPZ_FOLD=1 HSPZ_DEVICE_SEEDS=1" arm fold-device-seeds on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD=1 HSPZ_FOLD_RUN=32" arm fold-run-32 on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD=1 HSPZ_FOLD_RUN=1" arm fold-run-1 on "$R" "$Q"
+MAXH=1700000 ENVV="$FB HSPZ_FOLD=1" arm fold-cut-batches on "$R" "$Q" -C 60000
+MAXH=1700000 ENVV="$FB HSPZ_FOLD=1 HSPZ_DEVICE_SEEDS=1" arm fold-cut-batches-device-seeds on "$R" "$Q" -C 60000
+MAXH=1000000 ENVV="$FB HSPZ_FOLD=1" arm fold-mostly-cut on "$R" "$Q" -C 60000
+MAXH=1000000 ENVV="$FB HSPZ_FOLD=1 HSPZ_DEVICE_SEEDS=1" arm fold-mostly-cut-device-seeds on "$R" "$Q" -C 60000
+MAXH=4000000 ENVV="$FB HSPZ_FOLD=1 HSPZ_FOLD_CAPACITY=3000000" arm fold-released on "$R" "$Q"
+MAXH=4000000 ENVV="$FB HSPZ_FOLD=1 HSPZ_FOLD_CAPACITY=3000000 HSPZ_DEVICE_SEEDS=1" arm fold-released-device-seeds on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD=0" arm fold-off on "$R" "$Q"
+for a in fold-check-24 fold-check-25 fold-iupac; do
+  grep -q '^  transition fold: .* (checked against the host.s)' "$W/$a.1.err" || { echo "$a: the tables were not checked"; fail=$((fail+1)); }
+done
+for a in fold-check-24 fold-check-25 fold-bucketed-check fold-2400 fold-iupac fold-device-seeds fold-run-32 fold-run-1; do
+  grep -q '^transition fold: 1 reference tables folded, [1-9][0-9]* batches on them, 0 sent again' "$W/$a.1.err" \
+    || { echo "$a: the batches were not on the folded tables"; fail=$((fail+1)); }
+done
+grep -q '^bucket order from the seeds check: .* every bucket the same anchors' "$W/fold-bucketed-check.1.err" \
+  || { echo "fold-bucketed-check: the check did not run"; fail=$((fail+1)); }
+for a in fold-cut-batches fold-cut-batches-device-seeds; do
+  grep -q '^transition fold: 1 reference tables folded, [1-9][0-9]* batches on them, [1-9][0-9]* sent again .* 0 tables dropped' "$W/$a.1.err" \
+    || { echo "$a: not both folded batches and batches sent again"; fail=$((fail+1)); }
+done
+for a in fold-mostly-cut fold-mostly-cut-device-seeds; do
+  grep -q '^transition fold: 1 reference tables folded, [0-9]* batches on them, 16 sent again .* 1 tables dropped' "$W/$a.1.err" \
+    || { echo "$a: the fold was not dropped after 16 batches sent again"; fail=$((fail+1)); }
+  grep -q '^  transition fold: dropped for this reference, a quarter of its batches' "$W/$a.1.err" \
+    || { echo "$a: the fold was not dropped for its cut batches"; fail=$((fail+1)); }
+done
+for a in fold-released fold-released-device-seeds; do
+  grep -q '^transition fold: 1 reference tables folded, 0 batches on them, 1 sent again .* 1 tables dropped' "$W/$a.1.err" \
+    || { echo "$a: the tables were not dropped at the first cut batch"; fail=$((fail+1)); }
+  grep -q '^  transition fold: dropped for this reference, a chunk needs its memory' "$W/$a.1.err" \
+    || { echo "$a: the fold was not dropped for a chunk"; fail=$((fail+1)); }
+done
+grep -q 'transition fold' "$W/fold-off.1.err" && { echo "fold-off: the fold was built"; fail=$((fail+1)); }
 
 echo
 grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \
