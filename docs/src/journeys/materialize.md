@@ -6,7 +6,7 @@
 ## E.1 — Restore each surviving anchor
 <!-- @id: e-restore-anchor -->
 WHAT GOES IN: Stable survivor IDs, packed raw anchors, and encoded sequences.
-WHAT HAPPENS: One warp resolves each survivor ID back to its original reference/query anchor.
+WHAT HAPPENS: One warp resolves each survivor ID back to its original reference/query anchor; since 0.1.2 the launch has one warp per survivor, up to the engine's grid, so a chunk with few survivors does not start idle blocks.
 WHAT COMES OUT: An ordered stream of anchors for the exact materializer.
 INVARIANT: The materializer sees the same anchor coordinates as the score gate, in the same relative order.
 

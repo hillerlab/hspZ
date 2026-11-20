@@ -14,6 +14,8 @@
 <!-- @source: src/gpu/kernels.rs::fold_counts -->
 <!-- @source: src/gpu/kernels.rs::fold_fill -->
 <!-- @source: src/seed.rs::fold_tables -->
+<!-- @source: src/gpu/kernels.rs::fold_seed_counts -->
+<!-- @source: src/gpu/kernels.rs::scan_blocks_sat -->
 
 ## C.1 — Count each seed's reference occurrences
 <!-- @id: c-count-hits -->
@@ -132,7 +134,7 @@ sequenceDiagram
 ## C.7 — Seed each position once against a table that holds its variants
 <!-- @id: c-fold -->
 WHAT GOES IN: A reference bin's seed table, the seed's transition positions, and a query seeded without transitions.
-WHAT HAPPENS: With transitions a query position has its k-mer and that k-mer with one care position changed (13 seeds for 12of19); they are distinct k-mers, so their position lists are disjoint. The device builds a second table in which each k-mer's list is the union of the 13, window by window (0.1.1), and C.1 to C.6 run on it with one seed per position and four seeds per warp. A batch of MAX_HITS hits or more (C.3 would cut it at plain seeds) comes back unprocessed and is run again from its plain seeds on the plain table.
+WHAT HAPPENS: With transitions a query position has its k-mer and that k-mer with one care position changed (13 seeds for 12of19); they are distinct k-mers, so their position lists are disjoint. The device builds a second table in which each k-mer's list is the union of the 13, window by window (0.1.1), and C.1 to C.6 run on it with one seed per position and four seeds per warp. A batch of MAX_HITS hits or more (C.3 would cut it at plain seeds) comes back unprocessed and is run again from its plain seeds on the plain table. Since 0.1.2 a folded batch is counted by one kernel: the build records each k-mer's hits per window beside the table, one pass sums them per run of four seeds and window (C.6's pass, reading those records instead of the seeds' counts), and one saturating scan of the sums gives each run its place in each window and the batch its total; C.1's count per seed and C.2's scan of it are not run.
 WHAT COMES OUT: The same anchors per batch from a thirteenth of the seeds, read in slices thirteen times as long.
 INVARIANT: A folded batch holds exactly the hits of its plain seeds and is never cut into chunks; `HSPZ_FOLD=check` compares each device-built table with the host's, and `HSPZ_FOLD=0` runs every batch plain.
 

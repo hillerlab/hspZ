@@ -6,6 +6,7 @@
 <!-- @source: src/run.rs::unit_cost_policy -->
 <!-- @source: src/run.rs::partition_policy -->
 <!-- @source: src/run.rs::run_bins -->
+<!-- @source: src/run.rs::PackCache -->
 <!-- @source: src/run.rs::seed_and_filter_all -->
 <!-- @source: src/run.rs::UnitOutput -->
 <!-- @source: src/run.rs::Emitter::emit_unit -->
@@ -50,7 +51,7 @@ sequenceDiagram
 ## H.3 — Reuse the engine across query work
 <!-- @id: h-query-work -->
 WHAT GOES IN: One reference-ready Engine and the visit's query bins (every planned query bin under whole-bin ownership).
-WHAT HAPPENS: Each query bin is packed, reverse-complemented, split into intervals and batches, then run on both requested strands.
+WHAT HAPPENS: Each query bin is packed, reverse-complemented, split into intervals and batches, then run on both requested strands. Where the host budget has room for all of the run's packed query bins, each is packed once and kept for every visit (0.1.2); otherwise each unit packs its own, ahead of time where H.4 allows.
 WHAT COMES OUT: One completed Pass for each reference-bin × query-bin WorkUnit.
 INVARIANT: WorkUnits execute in the plan's query-bin order within each visit; with `--query-list`, jobs follow list order inside each bin.
 

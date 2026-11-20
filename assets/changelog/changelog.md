@@ -36,6 +36,77 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.1.2] — 2026-11-20
+
+Three exact speed-ups, on by default, and four corrections that change no output. Every byte of the output
+is the same as with 0.1.1. **Where the host has the room, a run now keeps all of its packed query bins to its
+end** (hg38 × mm39: peak RSS 11.5 → 20.0 GB on one card); where it does not, it packs as before.
+
+hg38 × mm39 on one A100 80GB, production defaults, the inputs of the 0.1.1 runs, old and new interleaved on
+the same card, the same bytes in every run. "0.1.1" is this build with its three new switches off, which is
+0.1.1's work (0.1.1 itself took 334.3 and 334.7 s in its own session):
+
+| one card | 0.1.1 | 0.1.2 | |
+| --- | ---: | ---: | --- |
+| without `--time` | 334.6, 335.4 s | **323.8, 324.8 s** | −3.2% |
+| with `--time` | 350.4 s | **333.9 s** | −4.7% |
+
+Each change switched off, against all three on in the same session, without `--time`:
+
+| switched off | without it | all three on | |
+| --- | ---: | ---: | --- |
+| query bins packed once (`HSPZ_QUERY_PACK_CACHE=0`) | 327.0, 327.1 s | 322.7, 322.3 s | +4.5 s |
+| a folded batch counted by one kernel (`HSPZ_FOLD_COUNT=0`) | 326.5, 325.9 s | 322.3, 322.0 s | +4.1 s |
+| small chunks finished on the host (`HSPZ_TAIL=0`) | 325.2, 324.8 s | 322.3, 322.0 s | +2.8 s |
+
+Walls compare inside a session: with all three on a genome took 323.8 to 324.8 s in the first and 322.0 to
+322.7 s in the other two, the node's other seven cards busy throughout.
+
+Two and eight cards were not measured for this release: seven of the node's cards were in use. No other
+species pair and no other GPU class was measured.
+
+- **Small chunks are finished on the host.** After the extension a chunk's accepted HSPs were separated from
+  the rejected ones on the device: a scan of the finished flags, a round trip for its block sums, the
+  offsets, a compaction, and a copy of the result. A chunk of at most 4,096 survivors now skips all of it:
+  the survivors' records (64 KiB at most) are copied as the extension left them and the host keeps those with
+  a positive score, in their order. An accepted record holds its truncated score, which is at least the
+  threshold, and a rejected one holds 0, so with `--hspthresh` of 2 or more these are exactly the accepted
+  records; below that every chunk takes the device path. The extension itself is launched with one warp per
+  survivor, up to its usual grid, instead of the whole grid. hg38 × mm39: 136,908 of 148,430 chunks; under
+  `--time` the three kernels go from 2.43 to 0.22 s of GPU time and the stages around them from 13.7 to
+  8.2 s. `HSPZ_TAIL=0` restores 0.1.1's path.
+- **A folded batch is counted by one kernel.** A batch on the folded tables (0.1.1) was counted three times:
+  the hits per seed, their scan, and the hits per run of four seeds and reference window, with a scan of
+  their own. The fold's build now also records every k-mer's hits per window beside its table, one kernel
+  sums them per run and window in the layout the anchor writer reads, and one scan of those sums gives each
+  run its place and the batch its total. The scan saturates, so a batch past 2^32 hits is still seen as one
+  to cut and is run on the plain tables like every batch of `--max-hits` hits or more. Unit 0 on an A100:
+  215 → 124 ms of GPU for the counts; the whole genome 9.8 → 5.6 s. The anchors are the same, in the same
+  places; `HSPZ_FOLD=check` now compares the recorded counts too. `HSPZ_FOLD_COUNT=0` restores the three
+  kernels.
+- **Query bins are packed once.** Every work unit packed its query bin again (both strands, the 2-bit
+  planes), although a run visits the same few bins once per reference bin: 42 units and 6 bins for
+  hg38 × mm39. The packed bins are now kept to the end of the run where the host budget has room for all of
+  them beside everything else it counts, and packed as before where it does not. One card: packing 5.3 →
+  0.8 s on the unit's own thread and 25.6 → 3.8 s on the threads that pack ahead; peak RSS 11.5 → 20.0 GB.
+  `HSPZ_QUERY_PACK_CACHE=0` switches it off.
+- **Corrections** (no output changes):
+  - The fold was refused for a reference bin in which every k-mer needs a row of window edges (2^24 rows
+    for 12 care bases, the one count the row index holds): it is built there now. hg38's bins need at most
+    86% of the rows; a reference of uniform random sequence needs all of them from about 60 Mbp per window.
+  - A run that has dropped the fold because a quarter of its batches came back cut no longer builds it for
+    the next reference bin, where it would be built and dropped again (a card whose `--max-hits` is under the
+    species pair's mean batch).
+  - A chunk whose survivors are kept as bits no longer reserves the byte flags it does not write (a byte per
+    hit of the largest chunk, device memory that nothing used).
+  - `--time` no longer reports an empty `find_hits (none)` stage for chunks written from their seeds (0.4 s
+    of a genome's reported time).
+- **Checked.** The whole genome's digest in every run above; unit 0 at `--hspthresh 2400`; batches cut at
+  `--max-hits` of 30 and 50 million with the fold on and off and with both seeders; `HSPZ_FOLD=check` on
+  unit 0's 2.37 billion positions; the fixture's reference followed by 100 Mbp of random sequence, where
+  every 12-mer needs a row, against 0.1.1's path. `assets/tests/sieve-identity.sh` has four more arms (81),
+  and its control now keeps 0.1.1's batch tail and packing, so every arm compares the new paths as well.
+
 ## [0.1.1] — 2026-11-20
 
 Two exact speed-ups, on by default: one seed per query position against a reference table that holds each
