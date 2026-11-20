@@ -50,7 +50,7 @@ arm() {
   # as well as the sieve; an arm's own ENVV may override that. Since round 126 it also keeps the full batch tail
   # (the done scan and the compaction for every chunk) and packs its query per unit, so every arm compares the
   # host filter of small chunks and the pack cache too.
-  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop HSPZ_TAIL=0 HSPZ_QUERY_PACK_CACHE=0 ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits "${MAXH:-16711680}" "$@" \
+  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop HSPZ_TAIL=0 HSPZ_QUERY_PACK_CACHE=0 HSPZ_SETTLE_THREAD=0 ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits "${MAXH:-16711680}" "$@" \
     2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
   env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits "${MAXH:-16711680}" --time "$@" \
     2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
@@ -325,6 +325,15 @@ grep -q '^batch tail: [1-9][0-9]* chunks had their HSPs filtered on the host' "$
 grep -q '^batch tail' "$W/tail-full.1.err" && { echo "tail-full: a chunk was filtered on the host"; fail=$((fail+1)); }
 grep -q '^  scan_blocks (done)' "$W/tail-full.1.err" || { echo "tail-full: the done scan did not run"; fail=$((fail+1)); }
 grep -q 'find_hits (none)' "$W/defaults.1.err" && { echo "defaults: an empty stage was timed"; fail=$((fail+1)); }
+
+# Round 128 (0.1.3): the settle thread. The control sorts and deduplicates on the batch loop's thread, where round 121
+# put it; here the test side does too, on the fixture and on the satellite pair (the chunks with the most raw
+# HSPs), and the default arm has to report its thread.
+ENVV="$FB HSPZ_SETTLE_THREAD=0" arm settle-inline on "$R" "$Q"
+ENVV="HSPZ_SETTLE_THREAD=0" arm settle-inline-satellite on "$W/sat_ref.fa" "$W/sat_qry.fa" -C 2000
+grep -q '^settle thread: [1-9][0-9]* chunks sorted and deduplicated off the batch loop' "$W/defaults.1.err" || { echo "defaults: no chunk went to the settle thread"; fail=$((fail+1)); }
+grep -q '^settle thread' "$W/settle-inline.1.err" && { echo "settle-inline: the settle thread ran"; fail=$((fail+1)); }
+grep -q '^  host sort + dedup ' "$W/settle-inline.1.err" || { echo "settle-inline: the batch loop did not sort"; fail=$((fail+1)); }
 
 echo
 grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \

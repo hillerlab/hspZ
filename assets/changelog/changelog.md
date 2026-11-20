@@ -36,6 +36,46 @@
 
 All notable changes to `hspZ` are documented here, newest first.
 
+## [0.1.3] — 2026-11-20
+
+One exact speed-up for runs whose batches bring back many HSPs, which is what close genomes do; on by
+default. Every byte of the output is the same as with 0.1.2. A worker has one more thread, and up to two
+batches' raw HSPs can wait for it.
+
+**A pass's HSPs are sorted and deduplicated on a thread of their own** (`HSPZ_SETTLE_THREAD`, on unless
+`0`). Since 0.1.1 a batch's sort and dedup ran under the next batch's score gate, which hides it where the
+gate is the longer of the two. Between close genomes it is not: a batch over an aligned stretch brings back
+one HSP per seed (hs1 against the chimpanzee: 233 million raw HSPs for 1.4 million kept in the first work
+unit), its sort outlasts the gate and the card waits for the host. The batch loop now hands each batch's
+chunks to the thread and goes on. The thread settles them in the order they were sent, one `MAX_HITS` chunk
+at a time as before, so every interval's HSPs are the same sequence. A chunk of 262,144 HSPs or more is
+sorted on the worker's threads: two HSPs that tie in either of the two orders are the same record, so any
+sort gives the sequence the stable one gave, and whether an HSP is kept depends only on it and the input
+element before it. When two batches are waiting for the thread the loop waits for it, as it did when it
+sorted them itself. `--dump-raw` and `HSPZ_LEAN_BATCHES=0` keep the sort inside its batch.
+
+hs1 × HLpanTro7 (the T2T chimpanzee), one A100 80GB, as a primate pair is run in production
+(`--hspthresh 4500 -D`, 24 threads), the thread off and on interleaved on the same card, 12,991,981 HSPs and
+the same bytes in every run:
+
+| one card | thread off | 0.1.3 | |
+| --- | ---: | ---: | --- |
+| without `--time` | 479.2, 479.9 s | **456.8, 456.8 s** | −4.7% |
+| with `--time` | 492.4 s | **468.6 s** | −4.8% |
+
+The card's work is the same, 426 s in both; it is busy for 91.0% of the run instead of 86.5%. The sort and
+dedup took 66.6 s on the batch loop and take 54.5 s on the thread, where 517 of the 118,833 chunks were
+sorted on more than one thread. Peak RSS 22.3 → 22.5 GB.
+
+hg38 × mm39, where 0.02% of the anchors become HSPs, is unchanged, as it should be: 322.3, 322.0 s with the thread off and 322.0, 321.9 s with it, on the same
+card without `--time`, the frozen bytes in every run.
+
+Checked on the release's own tree and binary: 228 unit tests (two new: the threaded dedup against the
+serial one over mixed chunks, thread counts and thresholds, and the sort in both orders); clippy on five
+feature sets; the sieve identity suite with two new arms (83, the thread off on the fixture and on the
+satellite pair) and the paired suite, every arm byte-identical. Not measured: more than one card, any card
+other than an A100, any pair other than these two.
+
 ## [0.1.2] — 2026-11-20
 
 Three exact speed-ups, on by default, and four corrections that change no output. Every byte of the output
