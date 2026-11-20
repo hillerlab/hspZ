@@ -948,6 +948,20 @@ pub struct Engine {
     /// `--paired` bounds (see [`set_pairs`](Self::set_pairs)). `None` on every
     /// other path, which therefore launches exactly the kernels it always did.
     paired: Option<PairedBounds>,
+    /// Round 122 (the transition fold): the table set that is not in use, as
+    /// index, positions, bucket counts and bucket rows. `fold_active` says
+    /// whether the engine's own four are the folded set (every batch, unless
+    /// the caller sent plain seeds) or the plain one.
+    fold_alt: Option<Box<[DeviceBuffer<u32>; 4]>>,
+    fold_active: bool,
+    /// The next batch call is on plain seeds ([`plain_next`](Self::plain_next)).
+    plain_once: bool,
+    /// The largest chunk the card holds beside the folded tables.
+    fold_capacity: u32,
+    /// Folded batches this engine was given, and how many of them came back
+    /// to be sent again.
+    fold_seen: u32,
+    fold_again: u32,
     /// `--paired`: set by the driver before each call — whether this call's
     /// seeds span more than one pair, the only case that may stop as
     /// [`FilterOutput::oversized`].
@@ -1965,6 +1979,76 @@ pub struct EngineConfig<'a> {
     /// N8: `find_hsps` grid. `0` uses [`HSP_BLOCKS`], the ZLUDA
     /// optimum. Runtime rather than `const` so the L4 sweep needs no rebuild.
     pub hsp_blocks: u32,
+    /// Round 122: `Some` asks for the transition fold ([`FoldRequest`]). The
+    /// engine decides ([`Engine::folded`]).
+    #[cfg_attr(
+        not(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        )),
+        allow(dead_code)
+    )]
+    pub fold: Option<FoldRequest>,
+}
+
+/// Round 122, the transition fold. A query position's seeds are its k-mer and
+/// that k-mer with one care position changed by a transition; their position
+/// lists are disjoint, so one table in which every k-mer also holds its
+/// variants' positions gives a position's hits from one seed. An engine that
+/// has it (`Engine::folded`) is seeded without transitions and finds the same
+/// hits: a thirteenth of the seeds, slices thirteen times as long.
+///
+/// A batch is the same set of hits either way, but a batch of `max_hits` hits
+/// or more is cut into chunks at seeds of the plain order, and the output
+/// depends on the cut (the dedup runs per chunk). Such a batch comes back
+/// `oversized` and the caller sends its plain seeds
+/// ([`Engine::plain_next`]); the engine keeps the plain tables for it.
+// The fold needs the three features of the group line; without them a request is carried and not read.
+#[cfg_attr(
+    not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )),
+    allow(dead_code)
+)]
+#[derive(Clone, Copy, Debug)]
+pub struct FoldRequest {
+    /// Bit `t` set for every care position that admits a transition.
+    pub mask: u32,
+    /// Device bytes that one hit of capacity costs
+    /// (`plan::device_bytes_per_hit`). The folded tables are paid for with
+    /// capacity above `max_hits`, which only a batch cut into chunks can need:
+    /// the fold is built when `max_hits` still fits beside it, and dropped for
+    /// the rest of the reference the first time a chunk needs more than what
+    /// is left, or when more than a quarter of the batches come back
+    /// ([`Engine::folded`] then turns false).
+    pub bytes_per_hit: u64,
+    /// `HSPZ_FOLD=check`: the device's tables against the host's
+    /// (`seed::fold_tables`), every k-mer.
+    pub check: bool,
+}
+
+/// Round 122: from this many batches sent again, a folded engine whose
+/// batches come back more than one time in four drops its fold.
+const FOLD_AGAIN_MIN: u32 = 16;
+
+/// Round 122: what the fold did over the run.
+pub mod fold_totals {
+    use std::sync::atomic::AtomicU64;
+    #[cfg_attr(
+        not(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        )),
+        allow(dead_code)
+    )]
+    pub static BINS: AtomicU64 = AtomicU64::new(0);
+    pub static BATCHES: AtomicU64 = AtomicU64::new(0);
+    pub static REISSUED: AtomicU64 = AtomicU64::new(0);
+    pub static RELEASED: AtomicU64 = AtomicU64::new(0);
 }
 
 impl Engine {
@@ -2123,6 +2207,12 @@ impl Engine {
             hsp_blocks,
             dump_raw: false,
             paired: None,
+            fold_alt: None,
+            fold_active: false,
+            plain_once: false,
+            fold_capacity: 0,
+            fold_seen: 0,
+            fold_again: 0,
             paired_multi: false,
             buf_seed_lo: unsafe { uninitialized(&stream, 0)? },
             collect_hit_stats: false,
@@ -2274,6 +2364,14 @@ impl Engine {
             feature = "gate-sieve"
         ))]
         engine.build_bucket_tables()?;
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        if let Some(req) = cfg.fold {
+            engine.fold_tables(req, cfg.index_table, cfg.pos_table)?;
+        }
         engine.stream.synchronize()?;
         engine.copy_stream.synchronize()?;
         phases.add("upload ref/query/tables", t.elapsed());
@@ -2502,6 +2600,14 @@ impl Engine {
         }
         self.phases.add("H->D seeds", t.elapsed());
         Ok(())
+    }
+
+    /// Round 122: waits for every seed upload that has been issued. An upload
+    /// runs on its own stream and is ordered against the kernels that read its
+    /// slot, not against a kernel that writes the slot: the device seeder,
+    /// when a batch whose folded seeds were uploaded is seeded again.
+    pub fn settle_uploads(&mut self) -> Result<(), DriverError> {
+        host_trace::timed(&host_trace::BLOCKED_NS, || self.copy_stream.synchronize())
     }
 
     /// Generate one batch's exact compact seed stream on the device.
@@ -2774,6 +2880,9 @@ impl Engine {
                 .into());
         }
         let num_seeds = self.seed_len[slot];
+        // Round 122: a batch is on folded seeds unless the caller said plain.
+        let folded = !std::mem::take(&mut self.plain_once) && self.fold_alt.is_some();
+        self.use_tables(folded);
 
         // Allocation and transfer are timed apart, because the
         // remedies are different — a grown-once buffer fixes one and does
@@ -2991,6 +3100,35 @@ impl Engine {
                 });
             }
         }
+        // Round 122: a folded batch that the plain order would cut into chunks
+        // (the walk runs once per `max_hits` hits) is not this path's: the cuts
+        // fall at plain seeds. As above, nothing has been touched yet.
+        if folded {
+            let total: u64 = sums.iter().map(|&s| u64::from(s)).sum();
+            self.fold_seen += 1;
+            if total >= u64::from(self.max_hits) {
+                fold_totals::REISSUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.fold_again += 1;
+                // A batch sent again costs a count pass and its seeds
+                // generated on the device, about what the fold saves on a
+                // batch. Where most batches are cut (a small `--max-hits`)
+                // the fold only costs.
+                if self.fold_again >= FOLD_AGAIN_MIN && self.fold_again > self.fold_seen / 4 {
+                    self.release_fold("a quarter of its batches are cut at --max-hits");
+                }
+                self.phases.add("block-sum round trip", t.elapsed());
+                return Ok(FilterOutput {
+                    hsps: Vec::new(),
+                    num_hits: 0,
+                    raw_hsps: 0,
+                    raw: Vec::new(),
+                    audit: Vec::new(),
+                    oversized: true,
+                    chunks: Vec::new(),
+                });
+            }
+            fold_totals::BATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let num_hits = exclusive_scan_hit_totals(&mut sums)?;
         // SAFETY: queued before `add_block_offsets`, which reads it; `sums`
         // lives to the end of this call, past every wait on the stream.
@@ -3198,6 +3336,13 @@ impl Engine {
                 feature = "gate-sieve"
             )))]
             let from_seeds = false;
+
+            // Round 122: the folded tables were paid for with capacity. A chunk
+            // above what is left (only a batch cut into chunks has one, and
+            // those are on the plain tables) takes the memory back.
+            if !folded && self.fold_alt.is_some() && iter_num_hits > self.fold_capacity {
+                self.release_fold("a chunk needs its memory");
+            }
 
             let t = Instant::now();
             #[cfg(not(feature = "dense-anchors"))]
@@ -5358,6 +5503,59 @@ fn pack_launch(groups: usize) -> LaunchConfig {
     }
 }
 
+impl Engine {
+    /// Round 122: whether this engine's batches are seeded without transitions
+    /// ([`FoldRequest`]). It can turn false once, when a chunk takes the
+    /// folded tables' memory.
+    pub fn folded(&self) -> bool {
+        self.fold_alt.is_some()
+    }
+
+    /// Round 122: the next batch call is on plain seeds, all variants: a batch
+    /// that came back `oversized` from a folded engine, sent again.
+    pub fn plain_next(&mut self) {
+        self.plain_once = true;
+    }
+
+    /// Makes the engine's tables the folded set or the plain one. Queued
+    /// kernels hold device addresses, not these handles.
+    fn use_tables(&mut self, fold: bool) {
+        if self.fold_active == fold {
+            return;
+        }
+        let Some(alt) = self.fold_alt.as_mut() else {
+            return;
+        };
+        std::mem::swap(&mut self.index_table, &mut alt[0]);
+        std::mem::swap(&mut self.pos_table, &mut alt[1]);
+        #[cfg(all(
+            feature = "find-hits-groups",
+            feature = "ref-loc-buckets",
+            feature = "gate-sieve"
+        ))]
+        {
+            std::mem::swap(&mut self.buf_bucket_nibbles, &mut alt[2]);
+            std::mem::swap(&mut self.buf_bucket_bounds, &mut alt[3]);
+        }
+        self.fold_active = fold;
+    }
+
+    /// Frees the folded tables; the engine is plain from here on.
+    fn release_fold(&mut self, why: &str) {
+        self.use_tables(false);
+        if self.fold_alt.take().is_some() {
+            fold_totals::RELEASED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if self.timing {
+                eprintln!(
+                    "  transition fold: dropped for this reference, {why} ({} of {} batches sent \
+                     again, {} hits fit beside it)",
+                    self.fold_again, self.fold_seen, self.fold_capacity
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "gate-sieve")]
 impl Engine {
     /// Words per row of bucket edges, as a shift: the next power of two above
@@ -5370,6 +5568,244 @@ impl Engine {
     ))]
     fn bounds_row_shift(&self) -> u32 {
         (self.n_buckets + 1).next_power_of_two().trailing_zeros()
+    }
+
+    /// Round 122: builds the folded tables beside the plain ones
+    /// ([`FoldRequest`]) and makes them the engine's: every k-mer's folded
+    /// length (`fold_counts`), the scan, one pass that copies each variant's
+    /// positions window by window (`fold_fill`), and the bucket tables of the
+    /// result. A k-mer's list is in window order, which is all the bucket
+    /// tables and the group kernel need; inside a window it is variant by
+    /// variant, not ascending.
+    ///
+    /// Not built, with a line under `--time`, when the bucket order is not
+    /// written from the seeds for this reference, the folded positions do not
+    /// fit 32-bit offsets, or `max_hits` hits no longer fit beside them.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn fold_tables(
+        &mut self,
+        req: FoldRequest,
+        host_index: &[u32],
+        host_pos: &[u32],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let n_kmers = self.index_table.len() as u32;
+        let kmer_size = n_kmers.trailing_zeros() / 2;
+        let plain = self.pos_table.len() as u64;
+        let total = plain * u64::from(req.mask.count_ones() + 1);
+        // Folded positions, their ends, the counts per k-mer and at most a row
+        // of edges for every k-mer.
+        let bytes = 4 * total
+            + 8 * u64::from(n_kmers)
+            + ((4 * u64::from(n_kmers)) << self.bounds_row_shift());
+        let left =
+            u64::from(self.hit_capacity).saturating_sub(bytes.div_ceil(req.bytes_per_hit.max(1)));
+        let why_not = if req.mask == 0 {
+            Some("the seed has no transition".to_string())
+        } else if self.census.is_some() {
+            Some("the census counts by plain seed".to_string())
+        } else if self.buf_bucket_nibbles.is_empty() {
+            Some("the bucket order is not written from the seeds".to_string())
+        } else if total > u64::from(u32::MAX) {
+            Some(format!("{total} folded positions do not fit 32 bits"))
+        } else if left < u64::from(self.max_hits) {
+            Some(format!(
+                "{:.1} GiB of tables leave room for {left} hits, below --max-hits {}",
+                bytes as f64 / (1u64 << 30) as f64,
+                self.max_hits
+            ))
+        } else if (device_memory().0 as u64) < bytes + (1 << 30) {
+            Some(format!(
+                "{:.1} GiB of tables, {:.1} GiB free on the device",
+                bytes as f64 / (1u64 << 30) as f64,
+                device_memory().0 as f64 / (1u64 << 30) as f64
+            ))
+        } else {
+            None
+        };
+        if let Some(why) = why_not {
+            if self.timing {
+                eprintln!("  transition fold: off for this reference, {why}");
+            }
+            return Ok(());
+        }
+        let t = Instant::now();
+        // SAFETY: `fold_counts` writes every word.
+        let mut ends = unsafe { uninitialized::<u32>(&self.stream, n_kmers as usize)? };
+        let sblocks = n_kmers.div_ceil(SCAN_BLOCK);
+        let mut d_sums = DeviceBuffer::<u32>::zeroed(&self.stream, sblocks as usize)?;
+        let scan = LaunchConfig {
+            grid_dim: (sblocks, 1, 1),
+            block_dim: (SCAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        // SAFETY: one thread per k-mer writing its own word, then the in-block
+        // scan with its block totals.
+        unsafe {
+            self.module.fold_counts(
+                &self.stream,
+                elementwise(),
+                &self.index_table,
+                req.mask,
+                kmer_size,
+                n_kmers,
+                &mut ends,
+            )?;
+            self.module
+                .scan_blocks(&self.stream, scan, &mut ends, &mut d_sums, n_kmers)?;
+        }
+        // Once per reference, so the block totals take the host's way.
+        let mut sums = d_sums.to_host_vec(&self.stream)?;
+        let mut acc = 0u64;
+        for sum in sums.iter_mut() {
+            let here = *sum;
+            *sum = acc as u32;
+            acc += u64::from(here);
+        }
+        if acc != total {
+            return Err(format!(
+                "transition fold: {acc} folded positions counted, {total} expected"
+            )
+            .into());
+        }
+        let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
+        // SAFETY: the scan's last step; then one thread per k-mer writes the
+        // `ends[k - 1]..ends[k]` slots of the folded positions, all of them.
+        let folded = unsafe {
+            self.module
+                .add_block_offsets(&self.stream, scan, &mut ends, &d_offsets, n_kmers)?;
+            let mut folded = uninitialized::<u32>(&self.stream, total as usize)?;
+            self.module.fold_fill(
+                &self.stream,
+                elementwise(),
+                &self.index_table,
+                &self.pos_table,
+                &ends,
+                req.mask,
+                kmer_size,
+                self.seed_size,
+                self.bucket_shift,
+                self.n_buckets,
+                n_kmers,
+                &mut folded,
+            )?;
+            folded
+        };
+        self.stream.synchronize()?;
+        let built = t.elapsed();
+        if req.check {
+            self.check_fold(req.mask, kmer_size, host_index, host_pos, &ends, &folded)?;
+        }
+        // SAFETY: empty, and replaced by `build_bucket_tables` below.
+        let (nibbles, bounds) = unsafe {
+            (
+                uninitialized::<u32>(&self.stream, 0)?,
+                uninitialized::<u32>(&self.stream, 0)?,
+            )
+        };
+        self.fold_alt = Some(Box::new([ends, folded, nibbles, bounds]));
+        self.use_tables(true);
+        let t = Instant::now();
+        self.build_bucket_tables()?;
+        if self.buf_bucket_nibbles.is_empty() {
+            // Declined (it said why): back to the plain tables alone.
+            self.use_tables(false);
+            self.fold_alt = None;
+            return Ok(());
+        }
+        self.fold_capacity = left.min(u64::from(u32::MAX)) as u32;
+        // A test's way to the release: `HSPZ_FOLD_CAPACITY` lowers the figure.
+        if let Some(cap) = std::env::var("HSPZ_FOLD_CAPACITY")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+        {
+            self.fold_capacity = self.fold_capacity.min(cap);
+        }
+        fold_totals::BINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.timing {
+            eprintln!(
+                "  transition fold: {plain} positions -> {total} ({:.1} GiB), built in {:.1} ms and {:.1} ms \
+                 for its bucket tables; chunks up to {} hits beside it{}",
+                total as f64 * 4.0 / (1u64 << 30) as f64,
+                built.as_secs_f64() * 1e3,
+                t.elapsed().as_secs_f64() * 1e3,
+                self.fold_capacity,
+                if req.check {
+                    " (checked against the host's)"
+                } else {
+                    ""
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// `HSPZ_FOLD=check`: the device's folded tables against
+    /// `seed::fold_tables` on the host: the same ends, and for every k-mer the
+    /// same positions, in window order.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn check_fold(
+        &mut self,
+        mask: u32,
+        kmer_size: u32,
+        host_index: &[u32],
+        host_pos: &[u32],
+        ends: &DeviceBuffer<u32>,
+        folded: &DeviceBuffer<u32>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+        let (want_ends, want_pos) =
+            crate::seed::fold_tables(host_index, host_pos, mask, kmer_size as usize, threads)
+                .ok_or("transition fold check: the host's table does not fit 32 bits")?;
+        let got_ends = ends.to_host_vec(&self.stream)?;
+        if got_ends != want_ends {
+            let k = got_ends.iter().zip(&want_ends).position(|(a, b)| a != b);
+            return Err(
+                format!("transition fold check: the ends differ, first at k-mer {k:?}").into(),
+            );
+        }
+        let got_pos = folded.to_host_vec(&self.stream)?;
+        let (shift, top, seed_size) = (self.bucket_shift, self.n_buckets - 1, self.seed_size);
+        let bucket = |p: u32| ((p + seed_size) >> shift).min(top);
+        let n = want_ends.len();
+        let per = n.div_ceil(threads);
+        let bad = std::sync::atomic::AtomicUsize::new(usize::MAX);
+        std::thread::scope(|scope| {
+            for c in 0..threads {
+                let (got_pos, want_pos, want_ends, bad, bucket) =
+                    (&got_pos, &want_pos, &want_ends, &bad, &bucket);
+                scope.spawn(move || {
+                    let mut list = Vec::new();
+                    for k in (c * per)..((c + 1) * per).min(n) {
+                        let lo = if k > 0 { want_ends[k - 1] as usize } else { 0 };
+                        let hi = want_ends[k] as usize;
+                        let got = &got_pos[lo..hi];
+                        let in_order = got.windows(2).all(|w| bucket(w[0]) <= bucket(w[1]));
+                        list.clear();
+                        list.extend_from_slice(got);
+                        list.sort_unstable();
+                        if !in_order || list != want_pos[lo..hi] {
+                            bad.fetch_min(k, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        match bad.into_inner() {
+            usize::MAX => Ok(()),
+            k => Err(format!(
+                "transition fold check: k-mer {k} holds other positions or is out of window order"
+            )
+            .into()),
+        }
     }
 
     /// Round 119: the two tables the group line reads, once per reference: every
@@ -5447,7 +5883,13 @@ impl Engine {
             rows += here;
         }
         let row_bytes = (rows as usize * 4) << row_shift;
-        let allowed = (self.ref_len as usize / 4).max(64 << 20);
+        // Most k-mers of the folded table have a row: its memory is counted
+        // with the fold's ([`fold_tables`](Self::fold_tables)).
+        let allowed = if self.fold_active {
+            usize::MAX
+        } else {
+            (self.ref_len as usize / 4).max(64 << 20)
+        };
         if rows >= 1 << 24 || row_bytes > allowed {
             if self.timing {
                 eprintln!(
@@ -5516,12 +5958,14 @@ impl Engine {
         start_seed_index: u32,
         num_seeds: u32,
     ) -> Result<(), DriverError> {
-        // One warp of the two kernels below per run of 32 seeds.
-        let num_runs = num_seeds.div_ceil(32);
+        // One warp of the two kernels below per run of `run_len` seeds: 32,
+        // or fewer of the folded table's, which have 13 times the hits each.
+        let run_len = if self.fold_active { fold_run_len() } else { 32 };
+        let num_runs = num_seeds.div_ceil(run_len);
         let counts_len = self.n_buckets * num_runs;
         let row_shift = self.bounds_row_shift();
         let by_runs = LaunchConfig {
-            grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+            grid_dim: ((num_runs * 32).div_ceil(BLOCK_SIZE), 1, 1),
             block_dim: (BLOCK_SIZE, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -5556,6 +6000,7 @@ impl Engine {
                 self.n_buckets,
                 row_shift,
                 num_runs,
+                run_len,
                 &mut self.buf_seed_counts,
                 &mut self.buf_seed_nib,
             )?;
@@ -5626,6 +6071,7 @@ impl Engine {
                 self.n_buckets,
                 row_shift,
                 num_runs,
+                run_len,
                 start_seed_index,
                 num_seeds,
                 &mut self.buf_sorted_anchor,
@@ -6623,6 +7069,36 @@ pub fn validate_hit_config(
 /// A pinned request wins; `0` means "use the device-derived default".
 pub fn adopt_max_hits(requested: u32, derived: u32) -> u32 {
     if requested > 0 { requested } else { derived }
+}
+
+/// Round 122: how many folded seeds a warp of the bucketed group kernels
+/// holds, a power of two up to 32. A folded seed has 13 times the hits of a
+/// plain one, and with 32 of them a batch is fewer warps than an A100 holds
+/// resident: unit 0's writer took 2,026 ms with 32, 1,763 with 16, 1,473 with
+/// 8, 1,313 with 4, 1,291 with 2 and 1,653 with 1 (the count kernel 117, 104,
+/// 92, 108, 165 and 283 ms). `HSPZ_FOLD_RUN` overrides the 4.
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+fn fold_run_len() -> u32 {
+    static REQUEST: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| {
+        match std::env::var("HSPZ_FOLD_RUN")
+            .ok()
+            .map(|v| v.parse::<u32>())
+        {
+            None => 4,
+            Some(Ok(n)) if n.is_power_of_two() && n <= 32 => n,
+            Some(other) => {
+                eprintln!(
+                    "warning: HSPZ_FOLD_RUN={other:?} is not a power of two up to 32; using 4"
+                );
+                4
+            }
+        }
+    })
 }
 
 /// `max_hits` in force: `requested`, or the device-derived default when `0`.

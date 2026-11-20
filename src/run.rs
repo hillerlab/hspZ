@@ -211,6 +211,7 @@ impl Prepared {
             hit_capacity: contract.hit_capacity,
             timing: args.time,
             hsp_blocks: contract.hsp_blocks,
+            fold: None,
         }
     }
 
@@ -462,6 +463,17 @@ pub(crate) fn seed_and_filter_all(
     let mut out: Vec<(Vec<SegmentPair>, Vec<SegmentPair>)> =
         vec![(Vec::new(), Vec::new()); q.intervals.len()];
 
+    // Round 122: an engine with the transition fold is seeded without
+    // transitions (`gpu::FoldRequest`), and a folded seed stands for all of
+    // its position's seeds in the count.
+    let fold = transitions && engine.folded();
+    let seed_tr = transitions && !fold;
+    let per_pos = if fold {
+        1 + shape.transition.iter().filter(|&&t| t).count() as u64
+    } else {
+        1
+    };
+
     // Round 69: chosen at runtime, not at compile time. The device seeder wins on
     // several GPUs and loses on one, so one binary has to be able to do both.
     if engine.device_seeds {
@@ -472,16 +484,25 @@ pub(crate) fn seed_and_filter_all(
         let defer = lean_batches() && !engine.dump_raw;
         let mut pending: PendingBatch = None;
         for b in &batches {
-            let n_seeds = engine.generate_seeds(0, b.rev, b.range, shape, transitions)?;
+            // Folded seeds while the engine has its fold (it can drop it
+            // inside a pass).
+            let with = transitions && !(fold && engine.folded());
+            let n_seeds = engine.generate_seeds(0, b.rev, b.range, shape, with)?;
             #[cfg(feature = "device-seeds-check")]
             {
                 let seq = if b.rev { q.rc } else { q.fwd };
-                let expected = seed::chunk_seeds(seq, shape, transitions, b.range);
+                let expected = seed::chunk_seeds(seq, shape, with, b.range);
                 engine.check_seed_bytes(0, &expected)?;
             }
             if n_seeds > 0 {
-                pass.stats.seeds += n_seeds as u64;
-                let o = {
+                pass.stats.seeds += n_seeds as u64 * if with { 1 } else { per_pos };
+                let named = |e: Box<dyn std::error::Error>| {
+                    format!(
+                        "interval {} range {}-{} rev {}: {e}",
+                        b.interval, b.range.0, b.range.1, b.rev
+                    )
+                };
+                let mut o = {
                     let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
                         if lull == Lull::Gate {
                             settle_pending(&mut pending, &mut out, engine);
@@ -490,12 +511,15 @@ pub(crate) fn seed_and_filter_all(
                     };
                     engine.seed_and_filter_with(0, b.rev, defer, &mut work)
                 }
-                .map_err(|e| {
-                    format!(
-                        "interval {} range {}-{} rev {}: {e}",
-                        b.interval, b.range.0, b.range.1, b.rev
-                    )
-                })?;
+                .map_err(named)?;
+                if o.oversized {
+                    // Round 122: the plain order cuts this batch into chunks.
+                    engine.generate_seeds(0, b.rev, b.range, shape, true)?;
+                    engine.plain_next();
+                    o = engine
+                        .seed_and_filter_with(0, b.rev, defer, &mut |_, _| Ok(()))
+                        .map_err(named)?;
+                }
                 settle_pending(&mut pending, &mut out, engine);
                 if !o.chunks.is_empty() {
                     pending = Some((b.interval, b.rev, o.chunks));
@@ -536,7 +560,7 @@ pub(crate) fn seed_and_filter_all(
             .map(|b| b.range.1 - b.range.0)
             .max()
             .unwrap_or(0);
-        let cap = seed::max_seeds(widest, shape, transitions);
+        let cap = seed::max_seeds(widest, shape, seed_tr);
         // Pinned staging is the default, but `cuMemHostAlloc` is not universally
         // available — ZLUDA returns DriverError(801) for it at any size — so a
         // refusal falls back to a pageable `Vec` rather than failing the run.
@@ -642,7 +666,7 @@ pub(crate) fn seed_and_filter_all(
                         // The same call the serial loop made for this batch, so the
                         // seed sequence stays bit-identical.
                         let seq: &[u8] = if b.rev { rc } else { fwd };
-                        slot.fill(seq, shape, transitions, b.range, inner);
+                        slot.fill(seq, shape, seed_tr, b.range, inner);
                         if alarm.0.send(Some((i, slot, t.elapsed()))).is_err() {
                             return;
                         }
@@ -703,34 +727,58 @@ pub(crate) fn seed_and_filter_all(
                 let b = &batches[i];
                 let n_seeds = cur.seeds().len();
                 if n_seeds > 0 {
-                    pass.stats.seeds += n_seeds as u64;
-                    let o = {
-                        let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
-                            match lull {
-                                Lull::Counts => {
-                                    if lean && next.is_none() && i + 1 < batches.len() {
-                                        let slot = take(i + 1)?;
-                                        engine.upload_seeds((i + 1) % 2, slot.seeds())?;
-                                        next = Some(slot);
-                                    }
-                                }
-                                Lull::Gate => settle_pending(&mut pending, &mut out, engine),
-                            }
-                            Ok(())
-                        };
-                        engine.seed_and_filter_with(
-                            if overlap { i % 2 } else { 0 },
-                            b.rev,
-                            defer,
-                            &mut work,
-                        )
-                    }
-                    .map_err(|e| {
+                    pass.stats.seeds += n_seeds as u64 * per_pos;
+                    let at = if overlap { i % 2 } else { 0 };
+                    let named = |e: Box<dyn std::error::Error>| {
                         format!(
                             "interval {} range {}-{} rev {}: {e}",
                             b.interval, b.range.0, b.range.1, b.rev
                         )
-                    })?;
+                    };
+                    // Round 122: this batch's seeds again with their variants,
+                    // for a batch that the plain order cuts into chunks, and
+                    // for every batch left in a pass whose engine dropped its
+                    // fold (the producers go on writing folded seeds). The
+                    // device seeder writes them, the same bytes as the host's:
+                    // generated here, on the consumer's thread, and uploaded
+                    // from pageable memory they cost 19 ms a batch, sixty
+                    // times what the fold saves on one.
+                    let again = |engine: &mut Engine| -> Fallible<crate::gpu::FilterOutput> {
+                        // The folded seeds of this batch may still be on their
+                        // way into the slot the seeder is about to write (a
+                        // batch that went through its folded call has waited
+                        // for them; one of a pass that lost its fold has not).
+                        engine.settle_uploads()?;
+                        engine.generate_seeds(at, b.rev, b.range, shape, true)?;
+                        engine.plain_next();
+                        engine.seed_and_filter_with(at, b.rev, defer, &mut |_, _| Ok(()))
+                    };
+                    let o = if fold && !engine.folded() {
+                        again(engine).map_err(named)?
+                    } else {
+                        let o = {
+                            let mut work = |engine: &mut Engine, lull: Lull| -> Fallible<()> {
+                                match lull {
+                                    Lull::Counts => {
+                                        if lean && next.is_none() && i + 1 < batches.len() {
+                                            let slot = take(i + 1)?;
+                                            engine.upload_seeds((i + 1) % 2, slot.seeds())?;
+                                            next = Some(slot);
+                                        }
+                                    }
+                                    Lull::Gate => settle_pending(&mut pending, &mut out, engine),
+                                }
+                                Ok(())
+                            };
+                            engine.seed_and_filter_with(at, b.rev, defer, &mut work)
+                        }
+                        .map_err(named)?;
+                        if o.oversized {
+                            again(engine).map_err(named)?
+                        } else {
+                            o
+                        }
+                    };
                     // A call that left early never reached its lulls.
                     settle_pending(&mut pending, &mut out, engine);
                     if !o.chunks.is_empty() {
@@ -2002,6 +2050,35 @@ fn note_slow_index_load(dir: &std::path::Path, id: u32, dt: Duration, bytes: u64
 /// of a reference build. The single-query worker and the batch executor both
 /// call it inline for the first bin and from the prefetch thread for the next,
 /// so the two paths cannot drift.
+/// Round 122: what a run asks of an engine for the transition fold
+/// (`gpu::FoldRequest`), or `None` where a batch must be the plain seeds:
+/// `--dump-raw` shows their order, `--hit-stats` counts by seed (as the
+/// engine's census does, under which it refuses the fold itself), and the
+/// `counters` build counts by them. `--paired` builds its own configuration.
+fn fold_request(
+    args: &RunArgs,
+    shape: &Shape,
+    transitions: bool,
+) -> Option<crate::gpu::FoldRequest> {
+    let mode = seed::fold_request();
+    if mode == seed::Fold::Off
+        || !transitions
+        || args.dump_raw.is_some()
+        || args.hit_stats
+        || cfg!(feature = "counters")
+    {
+        return None;
+    }
+    let bytes_per_hit =
+        plan::device_bytes_per_hit(shape.kmer_size, args.step, args.wga_chunk_size, transitions)
+            .ok()?;
+    Some(crate::gpu::FoldRequest {
+        mask: shape.transition_mask(),
+        bytes_per_hit,
+        check: mode == seed::Fold::Check,
+    })
+}
+
 pub(crate) fn build_ref_bin(
     rbin: &plan::Bin,
     ref_records: &[(String, Vec<u8>)],
@@ -2177,6 +2254,7 @@ fn run_bins(
             hit_capacity: contract.hit_capacity,
             timing: args.time,
             hsp_blocks: contract.hsp_blocks,
+            fold: fold_request(args, shape, transitions),
         };
         let mut engine = Engine::new(&ctx, cfg, &mut rep.phases)?;
         rep.lifecycle.engine_creations += 1;
@@ -4942,6 +5020,19 @@ pub(crate) fn report_counts(stats: &Stats) {
         let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
         if chunks > 0 {
             eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        {
+            use crate::gpu::fold_totals as f;
+            let bins = f::BINS.load(Relaxed);
+            if bins > 0 {
+                eprintln!(
+                    "transition fold: {bins} reference tables folded, {} batches on them, {} sent again \
+                     with their plain seeds, {} tables dropped",
+                    f::BATCHES.load(Relaxed),
+                    f::REISSUED.load(Relaxed),
+                    f::RELEASED.load(Relaxed)
+                );
+            }
         }
         let (chunks, hits) = (
             t::CHECKED_CHUNKS.load(Relaxed),

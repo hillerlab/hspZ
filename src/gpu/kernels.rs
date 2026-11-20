@@ -1181,6 +1181,133 @@ pub mod device {
         w & 0xFF == 0xFF
     }
 
+    /// The positions of k-mer `k`: `pos_table[start..end]`.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[inline(always)]
+    fn kmer_span(index_table: &[u32], k: u32) -> (u32, u32) {
+        let end = index_table[k as usize];
+        let start = if k > 0 {
+            index_table[(k - 1) as usize]
+        } else {
+            0
+        };
+        (start, end)
+    }
+
+    /// Round 122: how many positions k-mer `k` and its
+    /// single-transition variants hold together. Bit `t` of `tmask` says that
+    /// care position `t` admits a transition (`seed.rs::push_seeds`).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    pub fn fold_counts(
+        index_table: &[u32],
+        tmask: u32,
+        kmer_size: u32,
+        n_kmers: u32,
+        mut counts: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let (start, end) = kmer_span(index_table, k);
+            let mut len = end - start;
+            let mut t = 0u32;
+            while t < kmer_size {
+                if (tmask >> t) & 1 != 0 {
+                    let (start, end) = kmer_span(index_table, k ^ (2 << (2 * t)));
+                    len += end - start;
+                }
+                t += 1;
+            }
+            // SAFETY: `k < n_kmers`, the length of `counts`.
+            unsafe { *counts.get_unchecked_mut(k as usize) = len };
+            k += stride;
+        }
+    }
+
+    /// Round 122: the folded positions of every k-mer, bucket by
+    /// bucket and inside a bucket variant by variant (the k-mer itself first).
+    /// `fold_ends` is the inclusive scan of [`fold_counts`]: k-mer `k` owns
+    /// `fold_pos[fold_ends[k - 1]..fold_ends[k]]`. A variant's positions of one
+    /// bucket are a slice of its own list ([`bucket_edge`]).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_fill(
+        index_table: &[u32],
+        pos_table: &[u32],
+        fold_ends: &[u32],
+        tmask: u32,
+        kmer_size: u32,
+        seed_size: u32,
+        shift: u32,
+        n_buckets: u32,
+        n_kmers: u32,
+        mut fold_pos: DisjointSlice<u32>,
+    ) {
+        let stride = thread::blockDim_x() * thread::gridDim_x();
+        let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
+        while k < n_kmers {
+            let mut out = if k > 0 {
+                fold_ends[(k - 1) as usize]
+            } else {
+                0
+            };
+            let mut b = 0u32;
+            while b < n_buckets {
+                // `t == 0` is the k-mer itself, `t` its variant at care
+                // position `t - 1`.
+                let mut t = 0u32;
+                while t <= kmer_size {
+                    if t == 0 || (tmask >> (t - 1)) & 1 != 0 {
+                        let v = if t == 0 { k } else { k ^ (2 << (2 * (t - 1))) };
+                        let (start, end) = kmer_span(index_table, v);
+                        if start < end {
+                            let lo =
+                                bucket_edge(pos_table, start, end, b, shift, seed_size, n_buckets);
+                            let hi = bucket_edge(
+                                pos_table,
+                                start,
+                                end,
+                                b + 1,
+                                shift,
+                                seed_size,
+                                n_buckets,
+                            );
+                            let mut i = lo;
+                            while i < hi {
+                                // SAFETY: `i` is inside the variant's list, and
+                                // the folded lengths count each of its
+                                // positions once for `k`.
+                                unsafe {
+                                    *fold_pos.get_unchecked_mut(out as usize) =
+                                        *pos_table.get_unchecked(i as usize);
+                                }
+                                out += 1;
+                                i += 1;
+                            }
+                        }
+                    }
+                    t += 1;
+                }
+                b += 1;
+            }
+            k += stride;
+        }
+    }
+
     /// Round 119: a k-mer's hits per bucket in four bits each, for at most
     /// eight buckets. A table of every k-mer's bucket edges would be eight or
     /// sixteen times the index table, and one random row of it per seed costs
@@ -1315,14 +1442,16 @@ pub mod device {
         n_buckets: u32,
         row_shift: u32,
         num_runs: u32,
+        run_len: u32,
         mut counts: DisjointSlice<u32>,
         mut seed_nib: DisjointSlice<u32>,
     ) {
         let tid = thread::threadIdx_x();
         let lane = tid % WARP_SIZE;
-        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
-        let run = seed_slot / WARP_SIZE;
-        let live = seed_slot < num_seeds;
+        // A run is `run_len <= 32` seeds, held by the first lanes of its warp.
+        let run = (thread::blockIdx_x() * thread::blockDim_x() + tid) / WARP_SIZE;
+        let seed_slot = run * run_len + lane;
+        let live = lane < run_len && seed_slot < num_seeds;
         // The live lanes of a warp are its first ones: a warp with one has
         // lane 0, and `run < num_runs`.
         if warp::ballot_sync(FULL_MASK, live) == 0 {
@@ -1407,15 +1536,16 @@ pub mod device {
         n_buckets: u32,
         row_shift: u32,
         num_runs: u32,
+        run_len: u32,
         start_seed_index: u32,
         num_seeds: u32,
         mut sorted_anchor: DisjointSlice<u64>,
     ) {
         let tid = thread::threadIdx_x();
         let lane = tid % WARP_SIZE;
-        let seed_slot = thread::blockIdx_x() * thread::blockDim_x() + tid;
-        let run = seed_slot / WARP_SIZE;
-        let live = seed_slot < num_seeds;
+        let run = (thread::blockIdx_x() * thread::blockDim_x() + tid) / WARP_SIZE;
+        let seed_slot = run * run_len + lane;
+        let live = lane < run_len && seed_slot < num_seeds;
         let mut query_loc = 0u32;
         let (mut w, mut row, mut lo, mut esc) = (0u32, 0usize, 0u32, false);
         if live {

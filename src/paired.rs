@@ -390,6 +390,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             hit_capacity: contract.hit_capacity,
             timing: args.time,
             hsp_blocks: contract.hsp_blocks,
+            fold: None,
         };
         let mut engine = Engine::new(&ctx, cfg, &mut phases)?;
         engine.persistent_seed_buffers = !args.no_persistent_seed_buffers;
