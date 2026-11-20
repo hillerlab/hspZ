@@ -74,8 +74,8 @@ class was measured.
     scan, and one pass that copies each variant's positions window by window. 0.13 to 0.17 s and 8.3 to
     10.3 GiB for a bin of hg38, plus 35 ms for its window counts. It is a seed table like any other, so the
     count and the kernel that writes a batch's anchors in window order from its seeds run on it as they
-    are; a batch's anchors are the same set, in another order inside a window, which nothing downstream
-    depends on.
+    are; a batch's anchors are the same, in the same places (the pass lays a k-mer's variants in the order
+    their seeds had).
   - **Four seeds per warp.** That kernel gave a warp 32 seeds. With 13 times the hits per seed a batch was
     then fewer warps than an A100 holds, and it was slower than before; with four it moves its bytes at the
     card's bandwidth (unit 0: 1,774 ms plain, 2,026 ms folded with 32 per warp, 1,313 ms with four).
