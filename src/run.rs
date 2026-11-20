@@ -380,6 +380,106 @@ fn lean_batches() -> bool {
     })
 }
 
+/// Round 128: `HSPZ_SETTLE_THREAD` unset or `1`: a pass has a thread of its
+/// own that sorts and deduplicates the batches' HSPs, so the batch loop never
+/// waits for a sort. `0`: on the loop's thread under the next batch's score
+/// gate, as in round 121.
+fn settle_thread() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| match std::env::var("HSPZ_SETTLE_THREAD").as_deref() {
+        Err(_) | Ok("1") => true,
+        Ok("0") => false,
+        Ok(other) => {
+            eprintln!("warning: HSPZ_SETTLE_THREAD={other:?} is not 0 or 1; using 1");
+            true
+        }
+    })
+}
+
+/// The HSPs of a pass: per interval, the plus and the minus strand's.
+type PassHsps = Vec<(Vec<SegmentPair>, Vec<SegmentPair>)>;
+
+/// What the batch loop hands the settle thread, in batch order.
+enum Settle {
+    /// A batch's `MAX_HITS` chunks as they came off the device.
+    Raw(usize, bool, Vec<Vec<SegmentPair>>),
+    /// HSPs that are final already.
+    Ready(usize, bool, Vec<SegmentPair>),
+}
+
+/// How many batches may wait for the settle thread before the batch loop
+/// waits for it: the loop then runs at the thread's pace, as it did when it
+/// sorted them itself, and holds no more than these batches' raw HSPs.
+const SETTLE_AHEAD: usize = 2;
+
+/// Round 128: the thread that owns a pass's HSPs. Round 121 put a batch's sort
+/// and dedup under the next batch's score gate, which hides it where the gate
+/// is the longer of the two. Between close genomes it is not: a batch over an
+/// aligned stretch brings back one HSP per seed (hs1 against the chimpanzee:
+/// 233 million raw HSPs for 1.4 million in the first unit), its sort outlasts
+/// the gate, and the card waits for the host. Here the loop sends the chunks
+/// and goes on; the thread settles them in the order they were sent, one
+/// chunk at a time as before, so every interval's HSPs are the same sequence.
+/// A chunk of [`hsp::PAR_MIN`] HSPs or more is sorted on `threads` threads.
+struct Settler {
+    tx: std::sync::mpsc::SyncSender<Settle>,
+    handle: std::thread::JoinHandle<(PassHsps, Duration)>,
+}
+
+impl Settler {
+    fn start(intervals: usize, threads: usize) -> Fallible<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<Settle>(SETTLE_AHEAD);
+        let handle = std::thread::Builder::new()
+            .name("hspz-settle".into())
+            .spawn(move || {
+                let mut out: PassHsps = vec![(Vec::new(), Vec::new()); intervals];
+                let mut busy = Duration::ZERO;
+                for msg in rx {
+                    let t = Instant::now();
+                    match msg {
+                        Settle::Raw(interval, rev, chunks) => {
+                            let dst = if rev {
+                                &mut out[interval].1
+                            } else {
+                                &mut out[interval].0
+                            };
+                            for mut chunk in chunks {
+                                hsp::dedup_and_order_with(&mut chunk, threads);
+                                dst.extend_from_slice(&chunk);
+                            }
+                        }
+                        Settle::Ready(interval, rev, hsps) => {
+                            if rev {
+                                out[interval].1.extend_from_slice(&hsps)
+                            } else {
+                                out[interval].0.extend_from_slice(&hsps)
+                            }
+                        }
+                    }
+                    busy += t.elapsed();
+                }
+                (out, busy)
+            })
+            .map_err(|e| format!("the settle thread did not start: {e}"))?;
+        Ok(Settler { tx, handle })
+    }
+
+    fn send(&self, msg: Settle) -> Fallible<()> {
+        self.tx
+            .send(msg)
+            .map_err(|_| "the settle thread stopped before the pass ended".into())
+    }
+
+    /// The pass's HSPs once everything sent has been settled, and how long
+    /// the thread worked.
+    fn finish(self) -> Fallible<(PassHsps, Duration)> {
+        drop(self.tx);
+        self.handle
+            .join()
+            .map_err(|_| "the settle thread panicked".into())
+    }
+}
+
 /// How the host seed stream is generated (round 107), as `(producers, threads
 /// per producer)`.
 ///
@@ -460,8 +560,7 @@ pub(crate) fn seed_and_filter_all(
         }
     }
 
-    let mut out: Vec<(Vec<SegmentPair>, Vec<SegmentPair>)> =
-        vec![(Vec::new(), Vec::new()); q.intervals.len()];
+    let mut out: PassHsps = vec![(Vec::new(), Vec::new()); q.intervals.len()];
 
     // Round 122: an engine with the transition fold is seeded without
     // transitions (`gpu::FoldRequest`), and a folded seed stands for all of
@@ -483,6 +582,12 @@ pub(crate) fn seed_and_filter_all(
         // batch's score gate (see the host-seed loop below).
         let defer = lean_batches() && !engine.dump_raw;
         let mut pending: PendingBatch = None;
+        // Round 128: with a settle thread nothing is ever pending here.
+        let settler = if defer && settle_thread() {
+            Some(Settler::start(q.intervals.len(), threads)?)
+        } else {
+            None
+        };
         for b in &batches {
             // Folded seeds while the engine has its fold (it can drop it
             // inside a pass).
@@ -521,16 +626,30 @@ pub(crate) fn seed_and_filter_all(
                         .map_err(named)?;
                 }
                 settle_pending(&mut pending, &mut out, engine);
-                if !o.chunks.is_empty() {
-                    pending = Some((b.interval, b.rev, o.chunks));
-                }
                 pass.stats.seed_hits += o.num_hits as u64;
                 pass.stats.raw_hsps += o.raw_hsps as u64;
-                let dst = &mut out[b.interval];
-                if b.rev {
-                    dst.1.extend_from_slice(&o.hsps);
-                } else {
-                    dst.0.extend_from_slice(&o.hsps);
+                match &settler {
+                    Some(settler) => {
+                        // The order the loop itself appends in: a batch's
+                        // final HSPs, then its chunks.
+                        if !o.hsps.is_empty() {
+                            settler.send(Settle::Ready(b.interval, b.rev, o.hsps))?;
+                        }
+                        if !o.chunks.is_empty() {
+                            settler.send(Settle::Raw(b.interval, b.rev, o.chunks))?;
+                        }
+                    }
+                    None => {
+                        if !o.chunks.is_empty() {
+                            pending = Some((b.interval, b.rev, o.chunks));
+                        }
+                        let dst = &mut out[b.interval];
+                        if b.rev {
+                            dst.1.extend_from_slice(&o.hsps);
+                        } else {
+                            dst.0.extend_from_slice(&o.hsps);
+                        }
+                    }
                 }
                 if engine.dump_raw {
                     pass.raw.push((if b.rev { '-' } else { '+' }, o.raw));
@@ -543,6 +662,13 @@ pub(crate) fn seed_and_filter_all(
             }
         }
         settle_pending(&mut pending, &mut out, engine);
+        if let Some(settler) = settler {
+            let (settled, busy) = settler.finish()?;
+            out = settled;
+            engine
+                .phases
+                .add_overlapped("host sort + dedup (thread)", busy);
+        }
         for (fw, rc) in out {
             pass.stats.hsps += (fw.len() + rc.len()) as u64;
             pass.intervals.push((fw, rc));
@@ -703,6 +829,12 @@ pub(crate) fn seed_and_filter_all(
             // The batch whose HSPs are still to be deduplicated: interval, strand,
             // and its chunks as they came off the device.
             let mut pending: PendingBatch = None;
+            // Round 128: with a settle thread nothing is ever pending here.
+            let settler = if defer && settle_thread() {
+                Some(Settler::start(out.len(), threads)?)
+            } else {
+                None
+            };
             let mut cur = take(0)?;
             // Batch 0's upload, so the loop can always be one upload ahead.
             if overlap {
@@ -781,17 +913,31 @@ pub(crate) fn seed_and_filter_all(
                     };
                     // A call that left early never reached its lulls.
                     settle_pending(&mut pending, &mut out, engine);
-                    if !o.chunks.is_empty() {
-                        pending = Some((b.interval, b.rev, o.chunks));
-                    }
                     pass.stats.seed_hits += o.num_hits as u64;
                     pass.stats.raw_hsps += o.raw_hsps as u64;
-                    let dst = &mut out[b.interval];
-                    if b.rev {
-                        dst.1.extend_from_slice(&o.hsps)
-                    } else {
-                        dst.0.extend_from_slice(&o.hsps)
-                    };
+                    match &settler {
+                        Some(settler) => {
+                            // The order the loop itself appends in: a batch's
+                            // final HSPs, then its chunks.
+                            if !o.hsps.is_empty() {
+                                settler.send(Settle::Ready(b.interval, b.rev, o.hsps))?;
+                            }
+                            if !o.chunks.is_empty() {
+                                settler.send(Settle::Raw(b.interval, b.rev, o.chunks))?;
+                            }
+                        }
+                        None => {
+                            if !o.chunks.is_empty() {
+                                pending = Some((b.interval, b.rev, o.chunks));
+                            }
+                            let dst = &mut out[b.interval];
+                            if b.rev {
+                                dst.1.extend_from_slice(&o.hsps)
+                            } else {
+                                dst.0.extend_from_slice(&o.hsps)
+                            };
+                        }
+                    }
                     if engine.dump_raw {
                         pass.raw.push((if b.rev { '-' } else { '+' }, o.raw));
                     }
@@ -824,6 +970,13 @@ pub(crate) fn seed_and_filter_all(
             }
             let _ = free_tx.send(cur);
             settle_pending(&mut pending, &mut out, engine);
+            if let Some(settler) = settler {
+                let (settled, busy) = settler.finish()?;
+                out = settled;
+                engine
+                    .phases
+                    .add_overlapped("host sort + dedup (thread)", busy);
+            }
             Ok(())
         })?;
 
@@ -5074,6 +5227,16 @@ pub(crate) fn report_counts(stats: &Stats) {
         let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
         if chunks > 0 {
             eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        {
+            use crate::hsp::settle_totals as t;
+            let (chunks, threaded) = (t::CHUNKS.load(Relaxed), t::THREADED.load(Relaxed));
+            if chunks > 0 {
+                eprintln!(
+                    "settle thread: {chunks} chunks sorted and deduplicated off the batch loop, \
+                     {threaded} of them on more than one thread"
+                );
+            }
         }
         {
             use crate::gpu::tail_totals as t;

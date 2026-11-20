@@ -125,6 +125,156 @@ pub fn dedup_and_order(hsps: &mut Vec<SegmentPair>, mut groups: Option<&mut Grou
     kept.sort_by(by_lastz);
     *hsps = kept;
 }
+/// Round 128: chunks of at least this many HSPs go through
+/// [`dedup_and_order_with`] on more than one thread. Below it one thread is as
+/// fast as the threads cost to start.
+pub const PAR_MIN: usize = 1 << 18;
+
+/// Round 128: what the settle thread did over a run, for the `--time` report:
+/// the chunks it settled and how many of them were large enough for
+/// [`dedup_and_order_with`] to use more than one thread.
+pub mod settle_totals {
+    use std::sync::atomic::AtomicU64;
+    pub static CHUNKS: AtomicU64 = AtomicU64::new(0);
+    pub static THREADED: AtomicU64 = AtomicU64::new(0);
+}
+
+/// Round 128: [`dedup_and_order`] on up to `threads` threads, for a chunk of
+/// [`PAR_MIN`] HSPs or more. The same vector comes out.
+///
+/// Both orders are total up to identical records: two HSPs that tie in
+/// [`by_diagonal`] have the same diagonal, reference start, length and score,
+/// hence the same query start, and two that tie in [`by_lastz`] have the same
+/// four fields. So any sort gives the sequence the stable one gives, and
+/// whether an HSP is kept is a question about it and the input element before
+/// it, which every position can answer on its own.
+pub fn dedup_and_order_with(hsps: &mut Vec<SegmentPair>, threads: usize) {
+    use std::sync::atomic::Ordering::Relaxed;
+    settle_totals::CHUNKS.fetch_add(1, Relaxed);
+    if threads >= 2 && hsps.len() >= PAR_MIN {
+        settle_totals::THREADED.fetch_add(1, Relaxed);
+    }
+    dedup_par(hsps, threads, PAR_MIN)
+}
+
+fn dedup_par(hsps: &mut Vec<SegmentPair>, threads: usize, min: usize) {
+    if threads < 2 || hsps.len() < min.max(2) {
+        return dedup_and_order(hsps, None);
+    }
+    par_sort(hsps, by_diagonal, threads);
+    let mut kept = par_unique(hsps, threads);
+    if kept.len() < min.max(2) {
+        kept.sort_by(by_lastz);
+    } else {
+        par_sort(&mut kept, by_lastz, threads);
+    }
+    *hsps = kept;
+}
+
+/// Sorts `v` by `cmp` on `threads` threads: every thread sorts a slice, a
+/// sample of the sorted slices gives `threads - 1` splitters, and bucket `j`
+/// (what lies between splitters `j - 1` and `j` in every slice) is merged on
+/// its own thread into its place in the output.
+fn par_sort(
+    v: &mut Vec<SegmentPair>,
+    cmp: fn(&SegmentPair, &SegmentPair) -> Ordering,
+    threads: usize,
+) {
+    let n = v.len();
+    // No slice so short that its thread costs more than its sort.
+    let threads = threads.min(n >> 14).max(1);
+    if threads < 2 {
+        return v.sort_unstable_by(cmp);
+    }
+    let per = n.div_ceil(threads);
+    std::thread::scope(|scope| {
+        for slice in v.chunks_mut(per) {
+            scope.spawn(move || slice.sort_unstable_by(cmp));
+        }
+    });
+
+    let mut sample: Vec<SegmentPair> = Vec::with_capacity(threads * 65);
+    for slice in v.chunks(per) {
+        sample.extend(slice.iter().step_by((slice.len() / 64).max(1)));
+    }
+    sample.sort_unstable_by(cmp);
+    let splitters: Vec<SegmentPair> = (1..threads)
+        .map(|j| sample[j * sample.len() / threads])
+        .collect();
+    // Where each splitter falls in each sorted slice: an HSP equal to a
+    // splitter goes to the bucket above it, in every slice.
+    let cuts: Vec<Vec<usize>> = v
+        .chunks(per)
+        .map(|slice| {
+            let mut at = Vec::with_capacity(threads + 1);
+            at.push(0);
+            for sp in &splitters {
+                at.push(slice.partition_point(|x| cmp(x, sp) == Ordering::Less));
+            }
+            at.push(slice.len());
+            at
+        })
+        .collect();
+    let sizes: Vec<usize> = (0..threads)
+        .map(|j| cuts.iter().map(|at| at[j + 1] - at[j]).sum())
+        .collect();
+
+    let mut out = vec![SegmentPair::default(); n];
+    std::thread::scope(|scope| {
+        let src: &[SegmentPair] = v;
+        let cuts = &cuts;
+        let mut rest: &mut [SegmentPair] = &mut out;
+        for (j, &size) in sizes.iter().enumerate() {
+            let (mine, tail) = rest.split_at_mut(size);
+            rest = tail;
+            scope.spawn(move || {
+                let mut at = 0usize;
+                for (slice, cut) in src.chunks(per).zip(cuts) {
+                    let part = &slice[cut[j]..cut[j + 1]];
+                    mine[at..at + part.len()].copy_from_slice(part);
+                    at += part.len();
+                }
+                // Runs that each ascend: the stable sort merges them.
+                mine.sort_by(cmp);
+            });
+        }
+    });
+    *v = out;
+}
+
+/// The dedup pass of [`dedup_and_order`] over a vector in [`by_diagonal`]
+/// order: an HSP is kept unless the input element before it contains it or is
+/// contained in it.
+fn par_unique(v: &[SegmentPair], threads: usize) -> Vec<SegmentPair> {
+    let n = v.len();
+    let per = n.div_ceil(threads.max(1)).max(1);
+    let parts: Vec<Vec<SegmentPair>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .step_by(per)
+            .map(|lo| {
+                scope.spawn(move || {
+                    let hi = (lo + per).min(n);
+                    let mut kept = Vec::new();
+                    for i in lo..hi {
+                        if i == 0 || !contained(&v[i - 1], &v[i]) {
+                            kept.push(v[i]);
+                        }
+                    }
+                    kept
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("a dedup thread panicked"))
+            .collect()
+    });
+    let mut kept = Vec::with_capacity(parts.iter().map(Vec::len).sum());
+    for part in &parts {
+        kept.extend_from_slice(part);
+    }
+    kept
+}
 
 /// Raw-HSP provenance through the production dedup.
 #[derive(Debug, Default, Clone)]
@@ -298,6 +448,135 @@ pub fn render_segments(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reproducible mix of what a chunk holds: runs of identical HSPs (one
+    /// alignment found from many seeds), HSPs contained in others on the same
+    /// diagonal, overlaps that are not containment, and unrelated ones; query
+    /// starts above the reference start too, where the diagonal wraps.
+    fn mixed_chunk(n: usize, seed: u64) -> Vec<SegmentPair> {
+        let mut x = seed | 1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut v = Vec::with_capacity(n);
+        while v.len() < n {
+            let r = next();
+            let base = SegmentPair {
+                ref_start: (r % 50_000) as u32,
+                query_start: ((r >> 20) % 50_000) as u32,
+                len: 20 + ((r >> 40) % 400) as u32,
+                score: 3000 + ((r >> 50) % 9000) as i32,
+            };
+            match r >> 61 {
+                0..=2 => {
+                    for _ in 0..1 + (next() % 40) {
+                        v.push(base);
+                    }
+                }
+                3 | 4 => {
+                    v.push(base);
+                    let inset = (next() % 10) as u32;
+                    v.push(SegmentPair {
+                        ref_start: base.ref_start + inset,
+                        query_start: base.query_start + inset,
+                        len: base.len.saturating_sub(2 * inset).max(1),
+                        score: base.score - 50,
+                    });
+                }
+                5 => {
+                    v.push(base);
+                    v.push(SegmentPair {
+                        ref_start: base.ref_start + 10,
+                        query_start: base.query_start + 10,
+                        len: base.len + 5,
+                        score: base.score + 7,
+                    });
+                }
+                _ => v.push(base),
+            }
+        }
+        v.truncate(n);
+        v
+    }
+
+    /// Round 128: the threaded dedup returns the vector of the serial one, for
+    /// every thread count, below and above its threshold, and for chunks that
+    /// are all one HSP or all distinct.
+    #[test]
+    fn threaded_dedup_is_the_serial_dedup() {
+        for (n, seed) in [
+            (0usize, 1u64),
+            (1, 2),
+            (2, 3),
+            (17, 4),
+            (40_000, 5),
+            (200_003, 6),
+        ] {
+            let chunk = mixed_chunk(n, seed);
+            let mut want = chunk.clone();
+            dedup_and_order(&mut want, None);
+            for threads in [1usize, 2, 3, 7, 24] {
+                for min in [0usize, 1 << 10, 1 << 30] {
+                    let mut got = chunk.clone();
+                    dedup_par(&mut got, threads, min);
+                    assert_eq!(got, want, "n {n} threads {threads} min {min}");
+                }
+            }
+        }
+        let one = vec![
+            SegmentPair {
+                ref_start: 9,
+                query_start: 4,
+                len: 30,
+                score: 4000
+            };
+            100_000
+        ];
+        let mut want = one.clone();
+        dedup_and_order(&mut want, None);
+        let mut got = one;
+        dedup_par(&mut got, 8, 0);
+        assert_eq!(got, want);
+        assert_eq!(got.len(), 1);
+        let distinct: Vec<SegmentPair> = (0..100_000u32)
+            .map(|i| SegmentPair {
+                ref_start: i.wrapping_mul(2_654_435_761) % 1_000_003,
+                query_start: i,
+                len: 25,
+                score: 3000,
+            })
+            .collect();
+        let mut want = distinct.clone();
+        dedup_and_order(&mut want, None);
+        let mut got = distinct;
+        dedup_par(&mut got, 8, 0);
+        assert_eq!(got, want);
+    }
+
+    /// Round 128: `par_sort` gives the sorted vector in both orders, with
+    /// fewer elements than threads would like and with every element equal to
+    /// a splitter.
+    #[test]
+    fn par_sort_sorts() {
+        for n in [0usize, 5, 16_383, 16_384, 70_000, 300_000] {
+            for cmp in [
+                by_diagonal as fn(&SegmentPair, &SegmentPair) -> Ordering,
+                by_lastz,
+            ] {
+                let v = mixed_chunk(n, 11 + n as u64);
+                let mut want = v.clone();
+                want.sort_by(cmp);
+                for threads in [1usize, 2, 5, 24] {
+                    let mut got = v.clone();
+                    par_sort(&mut got, cmp, threads);
+                    assert_eq!(got, want, "n {n} threads {threads}");
+                }
+            }
+        }
+    }
 
     fn sp(r: u32, q: u32, len: u32, score: i32) -> SegmentPair {
         SegmentPair {
