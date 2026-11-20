@@ -2049,6 +2049,9 @@ pub mod fold_totals {
     pub static BATCHES: AtomicU64 = AtomicU64::new(0);
     pub static REISSUED: AtomicU64 = AtomicU64::new(0);
     pub static RELEASED: AtomicU64 = AtomicU64::new(0);
+    /// A reference of this run dropped its fold because its batches are cut at
+    /// `--max-hits`: no later reference builds one.
+    pub static CUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 }
 
 impl Engine {
@@ -2949,8 +2952,13 @@ impl Engine {
             self.stream.wait(&self.copy_ready[slot])?;
         }
 
+        // Round 124: a folded batch that will be written from its seeds is
+        // counted by one kernel from the folded table's rows.
+        let fused = folded && self.fused_count_now();
         let stage = self.stage();
-        if let Some(p) = &self.paired {
+        if fused {
+            self.launch_fold_seed_counts(slot, num_seeds)?;
+        } else if let Some(p) = &self.paired {
             // `--paired`: count only the bucket positions inside the seed's own
             // pair, and keep where that slice starts for `find_hits_dense_paired`.
             // SAFETY: grid-stride kernel; `d_seed_lo` is grown to one slot per
@@ -3020,7 +3028,14 @@ impl Engine {
                 }
             }
         }
-        self.end_stage(stage, "find_num_hits")?;
+        self.end_stage(
+            stage,
+            if fused {
+                "fold_seed_counts"
+            } else {
+                "find_num_hits"
+            },
+        )?;
 
         let hit_counts = if self.collect_hit_stats || self.census.is_some() {
             // Diagnostic-only: raw counts are otherwise never needed on the
@@ -3041,7 +3056,16 @@ impl Engine {
         // scan plus an add-back turns them into the global inclusive scan, and
         // only the per-block sums (num_seeds/256 u32) cross the bus instead of
         // the whole array in each direction.
-        let blocks = num_seeds.div_ceil(SCAN_BLOCK);
+        // Round 124: a fused batch has no count per seed. What is scanned is its
+        // runs' counts per bucket, which the group kernel needs scanned anyway,
+        // and their block sums give the batch's hit total (saturating: see
+        // `scan_blocks_sat`).
+        let scan_len = if fused {
+            self.fused_scan_len(num_seeds)
+        } else {
+            num_seeds
+        };
+        let blocks = scan_len.div_ceil(SCAN_BLOCK);
         // SAFETY: `scan_blocks` writes one sum for every launched block.
         unsafe {
             reserve(
@@ -3051,20 +3075,26 @@ impl Engine {
                 &mut self.pipeline_syncs,
             )?;
         }
+        let scan_cfg = LaunchConfig {
+            grid_dim: (blocks, 1, 1),
+            block_dim: (SCAN_BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
         let stage = self.stage();
-        // SAFETY: one element per thread over `num_seeds`, one sum slot per block.
-        unsafe {
-            self.module.scan_blocks(
-                &self.stream,
-                LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (SCAN_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &mut self.buf_hit_num,
-                &mut self.scr_hit_sums,
-                num_seeds,
-            )?;
+        if fused {
+            self.launch_scan_sat(scan_cfg, scan_len)?;
+        } else {
+            // SAFETY: one element per thread over `num_seeds`, one sum slot per
+            // block.
+            unsafe {
+                self.module.scan_blocks(
+                    &self.stream,
+                    scan_cfg,
+                    &mut self.buf_hit_num,
+                    &mut self.scr_hit_sums,
+                    num_seeds,
+                )?;
+            }
         }
         self.end_stage(stage, "scan_blocks")?;
 
@@ -3115,6 +3145,9 @@ impl Engine {
                 // the fold only costs.
                 if self.fold_again >= FOLD_AGAIN_MIN && self.fold_again > self.fold_seen / 4 {
                     self.release_fold("a quarter of its batches are cut at --max-hits");
+                    // The cap and the pair are the run's: the next reference
+                    // would build its fold, try 16 batches twice and drop it.
+                    fold_totals::CUT.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
                 self.phases.add("block-sum round trip", t.elapsed());
                 return Ok(FilterOutput {
@@ -3143,19 +3176,20 @@ impl Engine {
         self.phases.add("block-sum round trip", t.elapsed());
 
         let stage = self.stage();
-        // SAFETY: same geometry as `scan_blocks`, so block `b` reads offset `b`.
-        unsafe {
-            self.module.add_block_offsets(
-                &self.stream,
-                LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
-                    block_dim: (SCAN_BLOCK, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &mut self.buf_hit_num,
-                &self.scr_hit_offsets,
-                num_seeds,
-            )?;
+        if fused {
+            self.launch_add_run_offsets(scan_cfg, scan_len)?;
+        } else {
+            // SAFETY: same geometry as `scan_blocks`, so block `b` reads offset
+            // `b`.
+            unsafe {
+                self.module.add_block_offsets(
+                    &self.stream,
+                    scan_cfg,
+                    &mut self.buf_hit_num,
+                    &self.scr_hit_offsets,
+                    num_seeds,
+                )?;
+            }
         }
         self.end_stage(stage, "add_block_offsets")?;
 
@@ -3336,6 +3370,13 @@ impl Engine {
                 feature = "gate-sieve"
             )))]
             let from_seeds = false;
+            if fused && !from_seeds {
+                return Err(
+                    "internal: a batch counted from the folded rows must be written from \
+                            its seeds"
+                        .into(),
+                );
+            }
 
             // Round 122: the folded tables were paid for with capacity. A chunk
             // above what is left (only a batch cut into chunks has one, and
@@ -3376,12 +3417,16 @@ impl Engine {
                         &mut self.pipeline_syncs,
                     )?;
                 }
-                reserve(
-                    &mut self.buf_flags,
-                    &self.stream,
-                    iter_num_hits as usize,
-                    &mut self.pipeline_syncs,
-                )?;
+                // One byte per hit, for the gate that writes bytes: the bucket
+                // pass and the sieve write keep bits instead.
+                if !bucket_pass && sieve_args.is_none() {
+                    reserve(
+                        &mut self.buf_flags,
+                        &self.stream,
+                        iter_num_hits as usize,
+                        &mut self.pipeline_syncs,
+                    )?;
+                }
                 // One candidate word per 32 hits, written by the batches the
                 // sieve's guard samples and under its count diagnostic.
                 #[cfg(feature = "gate-sieve")]
@@ -3396,7 +3441,10 @@ impl Engine {
             }
             self.phases.add("alloc hit buffers", t.elapsed());
 
-            let stage = self.stage();
+            // A chunk written from its seeds launches nothing here, and has no
+            // stage (it was timed as `find_hits (none)` until 0.1.2: 0.4 s of
+            // "GPU time" per genome that no kernel ran).
+            let stage = if from_seeds { None } else { Some(self.stage()) };
             // `--paired` always takes the thread kernel: the output does not
             // depend on the choice, and pair densities sit far below the warp
             // cutoff anyway.
@@ -3535,18 +3583,18 @@ impl Engine {
                     }
                 }
             }
-            self.end_stage(
-                stage,
-                if from_seeds {
-                    "find_hits (none)"
-                } else if by_groups {
-                    "find_hits (groups)"
-                } else if warp_find_hits {
-                    "find_hits (warp)"
-                } else {
-                    "find_hits"
-                },
-            )?;
+            if let Some(stage) = stage {
+                self.end_stage(
+                    stage,
+                    if by_groups {
+                        "find_hits (groups)"
+                    } else if warp_find_hits {
+                        "find_hits (warp)"
+                    } else {
+                        "find_hits"
+                    },
+                )?;
+            }
             #[cfg(feature = "find-hits-groups")]
             if groups == FindHitsGroups::Check {
                 self.check_find_hits_groups(
@@ -3635,7 +3683,7 @@ impl Engine {
                     use std::sync::atomic::Ordering::Relaxed;
                     hits_bucketed_totals::CHUNKS.fetch_add(1, Relaxed);
                     hits_bucketed_totals::HITS.fetch_add(u64::from(iter_num_hits), Relaxed);
-                    self.launch_hits_bucketed(slot, start_seed_index, iter_num_seeds)?;
+                    self.launch_hits_bucketed(slot, start_seed_index, iter_num_seeds, fused)?;
                 }
                 if !from_seeds {
                     let stage = self.stage();
@@ -4621,7 +4669,21 @@ impl Engine {
                 self.module.find_hsps(
                     &self.stream,
                     LaunchConfig {
-                        grid_dim: (self.hsp_blocks, 1, 1),
+                        // Round 126: one warp takes one survivor, so a batch's
+                        // few hundred need a few hundred warps, not the 65,536
+                        // of the full grid (a block past the survivors copies
+                        // the matrix, waits at the barrier and leaves). The
+                        // result of a survivor does not depend on the grid.
+                        grid_dim: (
+                            if tail_lean() {
+                                self.hsp_blocks
+                                    .min(materializer_hits.div_ceil(NUM_WARPS as u32).max(1))
+                            } else {
+                                self.hsp_blocks
+                            },
+                            1,
+                            1,
+                        ),
                         block_dim: (HSP_THREADS, 1, 1),
                         shared_mem_bytes: 0,
                     },
@@ -4678,6 +4740,44 @@ impl Engine {
             }
             #[cfg(feature = "counters")]
             let _ = &d_stats;
+
+            // Round 126: a chunk with few survivors does not scan, round-trip,
+            // offset and compact their accepted flags to get its HSPs: the
+            // host copies the survivors' records as `find_hsps` left them and
+            // keeps the accepted ones. An accepted record has a positive score
+            // and a rejected one a zero (`find_hsps` stores `total * entropy`
+            // truncated when that reaches the threshold, else 0; with a
+            // threshold of 2 or more the stored score is at least 1), and the
+            // records are in slot order, which is `compress_output`'s.
+            if materializer_hits <= SMALL_TAIL && self.hspthresh >= 2 && tail_lean() {
+                let t = Instant::now();
+                let mut anchors =
+                    copy_prefix(&self.buf_hsp, &self.stream, materializer_hits as usize)?;
+                self.absorb_sync()?;
+                anchors.retain(|h| h.score > 0);
+                self.phases.add("D->H survivors' records", t.elapsed());
+                tail_totals::SMALL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if anchors.is_empty() {
+                    continue;
+                }
+                out.raw_hsps += anchors.len() as u32;
+                let t = Instant::now();
+                if self.dump_raw {
+                    out.raw.extend_from_slice(&anchors);
+                }
+                if defer_dedup && cfg!(not(feature = "counters")) {
+                    out.chunks.push(anchors);
+                    continue;
+                }
+                #[cfg(feature = "counters")]
+                crate::hsp::dedup_and_order(&mut anchors, Some(&mut self.groups));
+                #[cfg(not(feature = "counters"))]
+                crate::hsp::dedup_and_order(&mut anchors, None);
+                out.hsps.extend_from_slice(&anchors);
+                self.phases.add("host sort + dedup", t.elapsed());
+                continue;
+            }
+            tail_totals::SCANNED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
             // Scan the done flags in place on the device with the
             // same two-kernel machinery already accepted for the hit counts, so
@@ -5231,6 +5331,13 @@ impl SieveGuard {
         step
     }
 
+    /// Whether [`next_batch`](Self::next_batch) would say `Plain`, without
+    /// taking the step.
+    #[cfg(all(feature = "find-hits-groups", feature = "ref-loc-buckets"))]
+    fn next_is_plain(&self) -> bool {
+        self.period != 0 && self.tick != 0 && self.hold
+    }
+
     fn observe(&mut self, candidates: u64, hits: u64) {
         use std::sync::atomic::Ordering::Relaxed;
         if hits < Self::MIN_HITS {
@@ -5511,6 +5618,188 @@ impl Engine {
         self.fold_alt.is_some()
     }
 
+    /// Round 124: whether the folded batch about to be counted will be written
+    /// in bucket order from its seeds, the tests of the chunk loop taken ahead
+    /// of it (a folded batch is one chunk). Only then does nothing downstream
+    /// need a count per seed, and `fold_seed_counts` can stand for
+    /// `find_num_hits_lo`, its scan and `run_bucket_counts`. `HSPZ_FOLD_COUNT=0`
+    /// keeps those.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn fused_count_now(&self) -> bool {
+        fold_count_fused()
+            && self.fold_active
+            && self.sieve.args.is_some()
+            && !self.sieve.guard.next_is_plain()
+            && matches!(
+                self.bucket_mode,
+                BucketMode::Forced(true) | BucketMode::Decided(true)
+            )
+            && self.survivor_slots
+            && self.bucket_match
+            && !self.dump_raw
+            && self.census.is_none()
+            && !self.collect_hit_stats
+            && order_check_limit() == 0
+            && self.paired.is_none()
+            && !self.buf_bucket_nibbles.is_empty()
+            && self.hits_bucketed == HitsBucketed::On
+    }
+
+    #[cfg(not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )))]
+    fn fused_count_now(&self) -> bool {
+        false
+    }
+
+    /// Round 124: how many counts a fused batch scans, one per run and bucket.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn fused_scan_len(&self, num_seeds: u32) -> u32 {
+        self.n_buckets * num_seeds.div_ceil(fold_run_len())
+    }
+
+    #[cfg(not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )))]
+    fn fused_scan_len(&self, num_seeds: u32) -> u32 {
+        num_seeds
+    }
+
+    /// Round 124: `fold_seed_counts` over the seeds of `slot`: the runs' counts
+    /// per bucket, and each seed's word and start for the group kernel.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn launch_fold_seed_counts(&mut self, slot: usize, num_seeds: u32) -> Result<(), DriverError> {
+        let run_len = fold_run_len();
+        let num_runs = num_seeds.div_ceil(run_len);
+        let row_shift = self.bounds_row_shift();
+        // SAFETY: the kernel writes every count of a live run and every live
+        // seed's word and start before anything reads them.
+        unsafe {
+            reserve(
+                &mut self.buf_seed_counts,
+                &self.stream,
+                (self.n_buckets * num_runs) as usize,
+                &mut self.pipeline_syncs,
+            )?;
+            reserve(
+                &mut self.buf_seed_nib,
+                &self.stream,
+                num_seeds as usize,
+                &mut self.pipeline_syncs,
+            )?;
+            reserve(
+                &mut self.buf_seed_lo,
+                &self.stream,
+                num_seeds as usize,
+                &mut self.pipeline_syncs,
+            )?;
+            self.module.fold_seed_counts(
+                &self.stream,
+                LaunchConfig {
+                    grid_dim: (num_seeds.div_ceil(BLOCK_SIZE), 1, 1),
+                    block_dim: (BLOCK_SIZE, 1, 1),
+                    shared_mem_bytes: 0,
+                },
+                &self.seed_slots[slot],
+                &self.buf_bucket_bounds,
+                num_seeds,
+                self.n_buckets,
+                row_shift,
+                num_runs,
+                run_len,
+                &mut self.buf_seed_counts,
+                &mut self.buf_seed_nib,
+                &mut self.buf_seed_lo,
+            )
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )))]
+    fn launch_fold_seed_counts(
+        &mut self,
+        _slot: usize,
+        _num_seeds: u32,
+    ) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// Round 124: the block scan of a fused batch's run counts, its sums into
+    /// `scr_hit_sums` where the hit-count scan's go.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn launch_scan_sat(&mut self, cfg: LaunchConfig, len: u32) -> Result<(), DriverError> {
+        // SAFETY: one element per thread over `len`, one sum slot per block.
+        unsafe {
+            self.module.scan_blocks_sat(
+                &self.stream,
+                cfg,
+                &mut self.buf_seed_counts,
+                &mut self.scr_hit_sums,
+                len,
+            )
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )))]
+    fn launch_scan_sat(&mut self, _cfg: LaunchConfig, _len: u32) -> Result<(), DriverError> {
+        Ok(())
+    }
+
+    /// Round 124: the last step of that scan, from the offsets the host sent.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    fn launch_add_run_offsets(&mut self, cfg: LaunchConfig, len: u32) -> Result<(), DriverError> {
+        // SAFETY: the geometry of the scan, so block `b` reads offset `b`.
+        unsafe {
+            self.module.add_block_offsets(
+                &self.stream,
+                cfg,
+                &mut self.buf_seed_counts,
+                &self.scr_hit_offsets,
+                len,
+            )
+        }
+    }
+
+    #[cfg(not(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    )))]
+    fn launch_add_run_offsets(&mut self, _cfg: LaunchConfig, _len: u32) -> Result<(), DriverError> {
+        Ok(())
+    }
+
     /// Round 122: the next batch call is on plain seeds, all variants: a batch
     /// that came back `oversized` from a folded engine, sent again.
     pub fn plain_next(&mut self) {
@@ -5605,6 +5894,11 @@ impl Engine {
             u64::from(self.hit_capacity).saturating_sub(bytes.div_ceil(req.bytes_per_hit.max(1)));
         let why_not = if req.mask == 0 {
             Some("the seed has no transition".to_string())
+        } else if fold_totals::CUT.load(std::sync::atomic::Ordering::Relaxed) {
+            Some(
+                "an earlier reference of this run dropped it, its batches being cut at --max-hits"
+                    .to_string(),
+            )
         } else if self.census.is_some() {
             Some("the census counts by plain seed".to_string())
         } else if self.buf_bucket_nibbles.is_empty() {
@@ -5674,10 +5968,15 @@ impl Engine {
         let d_offsets = DeviceBuffer::from_host(&self.stream, &sums)?;
         // SAFETY: the scan's last step; then one thread per k-mer writes the
         // `ends[k - 1]..ends[k]` slots of the folded positions, all of them.
-        let folded = unsafe {
+        // Round 124: the pass also writes the folded table's bucket tables, a
+        // row of bucket starts for every k-mer and the word that names it.
+        let row_shift = self.bounds_row_shift();
+        let (folded, nibbles, bounds) = unsafe {
             self.module
                 .add_block_offsets(&self.stream, scan, &mut ends, &d_offsets, n_kmers)?;
             let mut folded = uninitialized::<u32>(&self.stream, total as usize)?;
+            let mut nibbles = uninitialized::<u32>(&self.stream, n_kmers as usize)?;
+            let mut bounds = uninitialized::<u32>(&self.stream, (n_kmers as usize) << row_shift)?;
             self.module.fold_fill(
                 &self.stream,
                 elementwise(),
@@ -5689,33 +5988,23 @@ impl Engine {
                 self.seed_size,
                 self.bucket_shift,
                 self.n_buckets,
+                row_shift,
                 n_kmers,
                 &mut folded,
+                &mut bounds,
+                &mut nibbles,
             )?;
-            folded
+            (folded, nibbles, bounds)
         };
         self.stream.synchronize()?;
         let built = t.elapsed();
         if req.check {
-            self.check_fold(req.mask, kmer_size, host_index, host_pos, &ends, &folded)?;
+            self.check_fold(
+                req.mask, kmer_size, host_index, host_pos, &ends, &folded, &bounds,
+            )?;
         }
-        // SAFETY: empty, and replaced by `build_bucket_tables` below.
-        let (nibbles, bounds) = unsafe {
-            (
-                uninitialized::<u32>(&self.stream, 0)?,
-                uninitialized::<u32>(&self.stream, 0)?,
-            )
-        };
         self.fold_alt = Some(Box::new([ends, folded, nibbles, bounds]));
         self.use_tables(true);
-        let t = Instant::now();
-        self.build_bucket_tables()?;
-        if self.buf_bucket_nibbles.is_empty() {
-            // Declined (it said why): back to the plain tables alone.
-            self.use_tables(false);
-            self.fold_alt = None;
-            return Ok(());
-        }
         self.fold_capacity = left.min(u64::from(u32::MAX)) as u32;
         // A test's way to the release: `HSPZ_FOLD_CAPACITY` lowers the figure.
         if let Some(cap) = std::env::var("HSPZ_FOLD_CAPACITY")
@@ -5727,11 +6016,11 @@ impl Engine {
         fold_totals::BINS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if self.timing {
             eprintln!(
-                "  transition fold: {plain} positions -> {total} ({:.1} GiB), built in {:.1} ms and {:.1} ms \
-                 for its bucket tables; chunks up to {} hits beside it{}",
+                "  transition fold: {plain} positions -> {total} ({:.1} GiB) and {} MiB of bucket rows, \
+                 built in {:.1} ms; chunks up to {} hits beside it{}",
                 total as f64 * 4.0 / (1u64 << 30) as f64,
+                ((n_kmers as usize) << row_shift) >> 18,
                 built.as_secs_f64() * 1e3,
-                t.elapsed().as_secs_f64() * 1e3,
                 self.fold_capacity,
                 if req.check {
                     " (checked against the host's)"
@@ -5751,6 +6040,7 @@ impl Engine {
         feature = "ref-loc-buckets",
         feature = "gate-sieve"
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn check_fold(
         &mut self,
         mask: u32,
@@ -5759,6 +6049,7 @@ impl Engine {
         host_pos: &[u32],
         ends: &DeviceBuffer<u32>,
         folded: &DeviceBuffer<u32>,
+        bounds: &DeviceBuffer<u32>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
         let (want_ends, want_pos) =
@@ -5772,6 +6063,8 @@ impl Engine {
             );
         }
         let got_pos = folded.to_host_vec(&self.stream)?;
+        let got_rows = bounds.to_host_vec(&self.stream)?;
+        let row_shift = self.bounds_row_shift();
         let (shift, top, seed_size) = (self.bucket_shift, self.n_buckets - 1, self.seed_size);
         let bucket = |p: u32| ((p + seed_size) >> shift).min(top);
         let n = want_ends.len();
@@ -5779,8 +6072,8 @@ impl Engine {
         let bad = std::sync::atomic::AtomicUsize::new(usize::MAX);
         std::thread::scope(|scope| {
             for c in 0..threads {
-                let (got_pos, want_pos, want_ends, bad, bucket) =
-                    (&got_pos, &want_pos, &want_ends, &bad, &bucket);
+                let (got_pos, got_rows, want_pos, want_ends, bad, bucket) =
+                    (&got_pos, &got_rows, &want_pos, &want_ends, &bad, &bucket);
                 scope.spawn(move || {
                     let mut list = Vec::new();
                     for k in (c * per)..((c + 1) * per).min(n) {
@@ -5788,10 +6081,16 @@ impl Engine {
                         let hi = want_ends[k] as usize;
                         let got = &got_pos[lo..hi];
                         let in_order = got.windows(2).all(|w| bucket(w[0]) <= bucket(w[1]));
+                        // Word `w` of the k-mer's row: where its bucket `w`
+                        // starts, the list's end past the last bucket.
+                        let row = &got_rows[k << row_shift..(k + 1) << row_shift];
+                        let rows_ok = row.iter().enumerate().all(|(w, &at)| {
+                            at as usize == lo + got.partition_point(|&p| bucket(p) < w as u32)
+                        });
                         list.clear();
                         list.extend_from_slice(got);
                         list.sort_unstable();
-                        if !in_order || list != want_pos[lo..hi] {
+                        if !in_order || !rows_ok || list != want_pos[lo..hi] {
                             bad.fetch_min(k, std::sync::atomic::Ordering::Relaxed);
                             return;
                         }
@@ -5802,7 +6101,7 @@ impl Engine {
         match bad.into_inner() {
             usize::MAX => Ok(()),
             k => Err(format!(
-                "transition fold check: k-mer {k} holds other positions or is out of window order"
+                "transition fold check: k-mer {k} holds other positions, is out of window order or has a wrong row"
             )
             .into()),
         }
@@ -5890,7 +6189,7 @@ impl Engine {
         } else {
             (self.ref_len as usize / 4).max(64 << 20)
         };
-        if rows >= 1 << 24 || row_bytes > allowed {
+        if !bucket_rows_fit(rows) || row_bytes > allowed {
             if self.timing {
                 eprintln!(
                     "  bucket order from the seeds: off for this reference, {rows} k-mers need a row \
@@ -5957,6 +6256,7 @@ impl Engine {
         slot: usize,
         start_seed_index: u32,
         num_seeds: u32,
+        counted: bool,
     ) -> Result<(), DriverError> {
         // One warp of the two kernels below per run of `run_len` seeds: 32,
         // or fewer of the folded table's, which have 13 times the hits each.
@@ -5969,89 +6269,93 @@ impl Engine {
             block_dim: (BLOCK_SIZE, 1, 1),
             shared_mem_bytes: 0,
         };
-        // SAFETY: `run_bucket_counts` writes every count before the scan reads
-        // it, and every live seed's word before the group kernel reads it.
-        unsafe {
-            reserve(
-                &mut self.buf_seed_counts,
-                &self.stream,
-                counts_len as usize,
-                &mut self.pipeline_syncs,
-            )?;
-            reserve(
-                &mut self.buf_seed_nib,
-                &self.stream,
-                num_seeds as usize,
-                &mut self.pipeline_syncs,
-            )?;
-        }
-        let stage = self.stage();
-        // SAFETY: one thread per seed slot; lane 0 of run `r` writes the
-        // `n_buckets` slots `b * num_runs + r`.
-        unsafe {
-            self.module.run_bucket_counts(
-                &self.stream,
-                by_runs,
-                &self.seed_slots[slot],
-                &self.buf_bucket_nibbles,
-                &self.buf_bucket_bounds,
-                start_seed_index,
-                num_seeds,
-                self.n_buckets,
-                row_shift,
-                num_runs,
-                run_len,
-                &mut self.buf_seed_counts,
-                &mut self.buf_seed_nib,
-            )?;
-        }
-        self.end_stage(stage, "run_bucket_counts")?;
+        // Round 124: a batch counted by `fold_seed_counts` arrives with its
+        // runs' counts scanned and its seeds' words written.
+        if !counted {
+            // SAFETY: `run_bucket_counts` writes every count before the scan reads
+            // it, and every live seed's word before the group kernel reads it.
+            unsafe {
+                reserve(
+                    &mut self.buf_seed_counts,
+                    &self.stream,
+                    counts_len as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+                reserve(
+                    &mut self.buf_seed_nib,
+                    &self.stream,
+                    num_seeds as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+            }
+            let stage = self.stage();
+            // SAFETY: one thread per seed slot; lane 0 of run `r` writes the
+            // `n_buckets` slots `b * num_runs + r`.
+            unsafe {
+                self.module.run_bucket_counts(
+                    &self.stream,
+                    by_runs,
+                    &self.seed_slots[slot],
+                    &self.buf_bucket_nibbles,
+                    &self.buf_bucket_bounds,
+                    start_seed_index,
+                    num_seeds,
+                    self.n_buckets,
+                    row_shift,
+                    num_runs,
+                    run_len,
+                    &mut self.buf_seed_counts,
+                    &mut self.buf_seed_nib,
+                )?;
+            }
+            self.end_stage(stage, "run_bucket_counts")?;
 
-        let sblocks = counts_len.div_ceil(SCAN_BLOCK);
-        // SAFETY: `scan_blocks` writes one sum for every launched block.
-        unsafe {
-            reserve(
-                &mut self.scr_run_sums,
-                &self.stream,
-                sblocks as usize,
-                &mut self.pipeline_syncs,
-            )?;
+            let sblocks = counts_len.div_ceil(SCAN_BLOCK);
+            // SAFETY: `scan_blocks` writes one sum for every launched block.
+            unsafe {
+                reserve(
+                    &mut self.scr_run_sums,
+                    &self.stream,
+                    sblocks as usize,
+                    &mut self.pipeline_syncs,
+                )?;
+            }
+            let scan = LaunchConfig {
+                grid_dim: (sblocks, 1, 1),
+                block_dim: (SCAN_BLOCK, 1, 1),
+                shared_mem_bytes: 0,
+            };
+            let stage = self.stage();
+            // SAFETY: the three launches of the bucket pass's own scan, over the
+            // runs' histogram instead of the blocks'.
+            unsafe {
+                self.module.scan_blocks(
+                    &self.stream,
+                    scan,
+                    &mut self.buf_seed_counts,
+                    &mut self.scr_run_sums,
+                    counts_len,
+                )?;
+                self.module.scan_exclusive_one_block(
+                    &self.stream,
+                    LaunchConfig {
+                        grid_dim: (1, 1, 1),
+                        block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
+                        shared_mem_bytes: 0,
+                    },
+                    &mut self.scr_run_sums,
+                    sblocks,
+                )?;
+                self.module.add_block_offsets(
+                    &self.stream,
+                    scan,
+                    &mut self.buf_seed_counts,
+                    &self.scr_run_sums,
+                    counts_len,
+                )?;
+            }
+            self.end_stage(stage, "run_bucket_scan")?;
         }
-        let scan = LaunchConfig {
-            grid_dim: (sblocks, 1, 1),
-            block_dim: (SCAN_BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let stage = self.stage();
-        // SAFETY: the three launches of the bucket pass's own scan, over the
-        // runs' histogram instead of the blocks'.
-        unsafe {
-            self.module.scan_blocks(
-                &self.stream,
-                scan,
-                &mut self.buf_seed_counts,
-                &mut self.scr_run_sums,
-                counts_len,
-            )?;
-            self.module.scan_exclusive_one_block(
-                &self.stream,
-                LaunchConfig {
-                    grid_dim: (1, 1, 1),
-                    block_dim: (kernels::ONE_BLOCK_THREADS, 1, 1),
-                    shared_mem_bytes: 0,
-                },
-                &mut self.scr_run_sums,
-                sblocks,
-            )?;
-            self.module.add_block_offsets(
-                &self.stream,
-                scan,
-                &mut self.buf_seed_counts,
-                &self.scr_run_sums,
-                counts_len,
-            )?;
-        }
-        self.end_stage(stage, "run_bucket_scan")?;
 
         let stage = self.stage();
         // SAFETY: one thread per seed slot, as `find_hits_groups`; the scanned
@@ -6106,7 +6410,7 @@ impl Engine {
         // on what the scatter left there.
         let mut scratch = DeviceBuffer::<u64>::zeroed(&self.stream, n)?;
         std::mem::swap(&mut self.buf_sorted_anchor, &mut scratch);
-        let launched = self.launch_hits_bucketed(slot, start_seed_index, num_seeds);
+        let launched = self.launch_hits_bucketed(slot, start_seed_index, num_seeds, false);
         let synced = self.sync_pipeline();
         std::mem::swap(&mut self.buf_sorted_anchor, &mut scratch);
         launched?;
@@ -7071,6 +7375,52 @@ pub fn adopt_max_hits(requested: u32, derived: u32) -> u32 {
     if requested > 0 { requested } else { derived }
 }
 
+/// Whether `rows` rows of bucket edges can be named by the k-mers' words: a
+/// word is `0xFF | row << 8`, so rows 0 to 2^24 - 1, which is 2^24 of them.
+/// (The test was `rows < 1 << 24` until 0.1.2 and refused the one case that
+/// fits exactly, a table in which every 12-mer needs a row: a folded table of
+/// a reference without rare k-mers lost its fold to it.)
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+fn bucket_rows_fit(rows: u32) -> bool {
+    rows <= 1 << 24
+}
+
+/// Round 124: `HSPZ_FOLD_COUNT=0` keeps `find_num_hits_lo`, its scan and
+/// `run_bucket_counts` for folded batches; unset or `1`, `fold_seed_counts`.
+#[cfg(all(
+    feature = "find-hits-groups",
+    feature = "ref-loc-buckets",
+    feature = "gate-sieve"
+))]
+fn fold_count_fused() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| std::env::var("HSPZ_FOLD_COUNT").as_deref() != Ok("0"))
+}
+
+/// Round 126: survivors up to which a chunk's HSPs are taken out of the
+/// survivors' records on the host (64 KiB of records).
+const SMALL_TAIL: u32 = 4096;
+
+/// Round 126: `HSPZ_TAIL=0` keeps the full `find_hsps` grid and the done scan
+/// for every chunk; unset or `1`, the grid follows the survivors and a chunk
+/// of at most [`SMALL_TAIL`] survivors is filtered on the host.
+fn tail_lean() -> bool {
+    static REQUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *REQUEST.get_or_init(|| std::env::var("HSPZ_TAIL").as_deref() != Ok("0"))
+}
+
+/// Round 126: chunks whose HSPs the host filtered, and chunks that took the
+/// done scan.
+pub mod tail_totals {
+    use std::sync::atomic::AtomicU64;
+    pub static SMALL: AtomicU64 = AtomicU64::new(0);
+    pub static SCANNED: AtomicU64 = AtomicU64::new(0);
+}
+
 /// Round 122: how many folded seeds a warp of the bucketed group kernels
 /// holds, a power of two up to 32. A folded seed has 13 times the hits of a
 /// plain one, and with 32 of them a batch is fewer warps than an A100 holds
@@ -7224,6 +7574,23 @@ impl Stage {
 
 #[cfg(test)]
 mod tests {
+    /// A table in which every 12-mer needs a row of bucket edges has 2^24 rows,
+    /// and the last one's word still names it.
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[test]
+    fn every_kmer_may_need_a_row() {
+        assert!(super::bucket_rows_fit(1 << 24));
+        assert!(!super::bucket_rows_fit((1 << 24) + 1));
+        let row = (1u32 << 24) - 1;
+        let word = 0xFF | row << 8;
+        assert_eq!(word >> 8, row);
+        assert_eq!(word & 0xFF, 0xFF);
+    }
+
     /// The sieve's guard: a sample every `period` launches, the plain gate
     /// after a sample that passed more than half of its hits, the sieve again
     /// after one that did not; a tiny sample decides nothing and period 0
@@ -7232,6 +7599,7 @@ mod tests {
     #[test]
     fn sieve_guard_samples_holds_and_releases() {
         use super::{GuardStep, SieveGuard};
+
         let run = |g: &mut SieveGuard, n: usize| -> Vec<GuardStep> {
             (0..n).map(|_| g.next_batch()).collect()
         };

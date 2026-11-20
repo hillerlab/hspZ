@@ -273,6 +273,74 @@ pub mod device {
         }
     }
 
+    /// Round 124: [`scan_blocks`] with saturating sums. The fused folded count
+    /// takes a batch's hit total from the block sums of its runs' counts, and a
+    /// sum that wrapped would hide a batch of more than 2^32 hits: saturated, a
+    /// block reads `u32::MAX`, the total is at least that, and the batch is not
+    /// the folded path's (it is at least `max_hits`). Where nothing saturates
+    /// the result is `scan_blocks`'.
+    /// Block-local inclusive scan of the per-seed hit counts, in place, plus
+    /// this block's total into `block_sums`.
+    ///
+    /// Hand-rolled from `shuffle_up_sync` + shared memory rather than
+    /// cooperative-groups `block_scan`: these are the primitives already proven
+    /// to load under the pinned ZLUDA backend, and the pinned cuda-oxide has no
+    /// device-wide scan anyway.
+    #[kernel]
+    pub fn scan_blocks_sat(
+        mut counts: DisjointSlice<u32>,
+        mut block_sums: DisjointSlice<u32>,
+        n: u32,
+    ) {
+        const WARPS: usize = (SCAN_BLOCK / WARP_SIZE) as usize;
+        static mut WARP_TOTALS: SharedArray<u32, WARPS> = SharedArray::UNINIT;
+
+        let tid = thread::threadIdx_x();
+        let bid = thread::blockIdx_x();
+        let i = bid * SCAN_BLOCK + tid;
+        let lane = tid % WARP_SIZE;
+        let warp = (tid / WARP_SIZE) as usize;
+
+        // SAFETY: guarded by `i < n`; the tail block reads nothing past the end.
+        let mut v = if i < n {
+            unsafe { *counts.get_unchecked_mut(i as usize) }
+        } else {
+            0
+        };
+
+        let mut offset = 1;
+        while offset < WARP_SIZE {
+            let up = warp::shuffle_up_sync(FULL_MASK, v, offset);
+            if lane >= offset {
+                v = v.saturating_add(up);
+            }
+            offset <<= 1;
+        }
+        if lane == WARP_SIZE - 1 {
+            unsafe { WARP_TOTALS[warp] = v };
+        }
+        thread::sync_threads();
+
+        // Eight values: one thread walking them serially beats any cleverness.
+        if tid == 0 {
+            let mut acc = 0u32;
+            for k in 0..WARPS {
+                let total = unsafe { WARP_TOTALS[k] };
+                unsafe { WARP_TOTALS[k] = acc };
+                acc = acc.saturating_add(total);
+            }
+            // SAFETY: one slot per block.
+            unsafe { *block_sums.get_unchecked_mut(bid as usize) = acc };
+        }
+        thread::sync_threads();
+
+        v = v.saturating_add(unsafe { WARP_TOTALS[warp] });
+        if i < n {
+            // SAFETY: guarded by `i < n`.
+            unsafe { *counts.get_unchecked_mut(i as usize) = v };
+        }
+    }
+
     /// Counts byte survivor flags per contiguous block without expanding them
     /// to a per-hit `u32` scan.
     #[cfg(feature = "dense-anchors")]
@@ -1238,6 +1306,14 @@ pub mod device {
     /// `fold_ends` is the inclusive scan of [`fold_counts`]: k-mer `k` owns
     /// `fold_pos[fold_ends[k - 1]..fold_ends[k]]`. A variant's positions of one
     /// bucket are a slice of its own list ([`bucket_edge`]).
+    ///
+    /// Round 124: it also writes the folded table's bucket tables, which it
+    /// has in hand: row `k` of `rows` holds the index at which each bucket of
+    /// k-mer `k` starts (`1 << row_shift` words, the ones past `n_buckets` the
+    /// list's end, as [`bucket_overflow_rows`] lays a row out), and the k-mer's
+    /// word names that row. Every folded k-mer has a row: most would need one
+    /// anyway (12.3 of 16.8 million on a bin of hg38), and with all of them
+    /// [`fold_seed_counts`] reads nothing else.
     #[cfg(all(
         feature = "find-hits-groups",
         feature = "ref-loc-buckets",
@@ -1254,8 +1330,11 @@ pub mod device {
         seed_size: u32,
         shift: u32,
         n_buckets: u32,
+        row_shift: u32,
         n_kmers: u32,
         mut fold_pos: DisjointSlice<u32>,
+        mut rows: DisjointSlice<u32>,
+        mut nibbles: DisjointSlice<u32>,
     ) {
         let stride = thread::blockDim_x() * thread::gridDim_x();
         let mut k = thread::blockDim_x() * thread::blockIdx_x() + thread::threadIdx_x();
@@ -1265,8 +1344,11 @@ pub mod device {
             } else {
                 0
             };
+            let row = (k << row_shift) as usize;
             let mut b = 0u32;
             while b < n_buckets {
+                // SAFETY: word `b` of this k-mer's own row.
+                unsafe { *rows.get_unchecked_mut(row + b as usize) = out };
                 // `t == 0` is the k-mer itself, `t` its variant at care
                 // position `t - 1`.
                 let mut t = 0u32;
@@ -1304,7 +1386,91 @@ pub mod device {
                 }
                 b += 1;
             }
+            // SAFETY: the rest of the row, and this k-mer's word.
+            unsafe {
+                while b < 1 << row_shift {
+                    *rows.get_unchecked_mut(row + b as usize) = out;
+                    b += 1;
+                }
+                *nibbles.get_unchecked_mut(k as usize) = 0xFF | k << 8;
+            }
             k += stride;
+        }
+    }
+
+    /// Round 124, the fused folded count: what [`find_num_hits_lo`] and
+    /// [`run_bucket_counts`] give a folded batch, from one row per seed. A
+    /// thread per seed loads its k-mer's row of the folded table (the start of
+    /// each bucket's slice, 32 bytes for up to seven buckets); the seeds of a
+    /// run are `run_len` neighbouring lanes, so a few shuffles sum a bucket's
+    /// hits over the run and the run's first lane stores them, bucket-major and
+    /// run-minor as [`run_bucket_counts`] does. The word and the start the
+    /// group kernel reads per seed are written beside them. No count per seed
+    /// is kept: the batch's hit total is the scan of the runs' counts
+    /// ([`scan_blocks_sat`]).
+    #[cfg(all(
+        feature = "find-hits-groups",
+        feature = "ref-loc-buckets",
+        feature = "gate-sieve"
+    ))]
+    #[kernel]
+    #[allow(clippy::too_many_arguments)]
+    pub fn fold_seed_counts(
+        seed_offsets: &[u64],
+        rows: &[u32],
+        num_seeds: u32,
+        n_buckets: u32,
+        row_shift: u32,
+        num_runs: u32,
+        run_len: u32,
+        mut counts: DisjointSlice<u32>,
+        mut seed_nib: DisjointSlice<u32>,
+        mut seed_lo: DisjointSlice<u32>,
+    ) {
+        let tid = thread::threadIdx_x();
+        let lane = tid % WARP_SIZE;
+        let seed = thread::blockIdx_x() * thread::blockDim_x() + tid;
+        let live = seed < num_seeds;
+        // The live lanes of a warp are its first ones.
+        if warp::ballot_sync(FULL_MASK, live) == 0 {
+            return;
+        }
+        let (mut row, mut lo) = (0usize, 0u32);
+        if live {
+            // SAFETY: a seed of this batch; its k-mer has a row, and the seed
+            // owns slot `seed` of both outputs.
+            unsafe {
+                let k = (*seed_offsets.get_unchecked(seed as usize) >> 32) as u32;
+                row = (k << row_shift) as usize;
+                lo = *rows.get_unchecked(row);
+                *seed_nib.get_unchecked_mut(seed as usize) = 0xFF | k << 8;
+                *seed_lo.get_unchecked_mut(seed as usize) = lo;
+            }
+        }
+        // The run's first lane: `run_len` is a power of two up to 32 and a
+        // block is whole warps, so runs are aligned groups of lanes.
+        let first = live && lane & (run_len - 1) == 0;
+        let run = seed / run_len;
+        let mut b = 0u32;
+        while b < n_buckets {
+            let mut c = 0u32;
+            if live {
+                // SAFETY: edge `b + 1 <= n_buckets` of the k-mer's row.
+                let hi = unsafe { *rows.get_unchecked(row + b as usize + 1) };
+                c = hi - lo;
+                lo = hi;
+            }
+            let mut step = 1u32;
+            while step < run_len {
+                // Saturating: a run of more than four seeds could pass 2^32.
+                c = c.saturating_add(warp::shuffle_sync(FULL_MASK, c, lane ^ step));
+                step <<= 1;
+            }
+            if first {
+                // SAFETY: a live first lane's run is below `num_runs`.
+                unsafe { *counts.get_unchecked_mut((b * num_runs + run) as usize) = c };
+            }
+            b += 1;
         }
     }
 
