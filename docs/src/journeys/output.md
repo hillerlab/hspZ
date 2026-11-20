@@ -1,5 +1,6 @@
 # Accepted HSPs become LASTZ segments
 
+<!-- @source: src/gpu/mod.rs::tail_lean -->
 <!-- @source: src/hsp.rs::dedup_and_order -->
 <!-- @source: src/hsp.rs::records -->
 <!-- @source: src/hsp.rs::render_records -->
@@ -8,10 +9,10 @@
 
 ## G.1 — Compact accepted HSPs
 <!-- @id: g-compact -->
-WHAT GOES IN: Materialized SegmentPairs and their inclusive-scan done flags.
-WHAT HAPPENS: The device copies accepted records into increasing materializer order and the host receives only the active prefix.
+WHAT GOES IN: Materialized SegmentPairs and their done flags, one per survivor in survivor order.
+WHAT HAPPENS: The device scans the done flags and copies accepted records into increasing materializer order, and the host receives only the active prefix. A chunk of at most 4,096 survivors skips all of it (0.1.2): the host copies the survivors' records as E.5 left them and keeps those with a positive score, which are exactly the accepted ones (an accepted record holds its truncated score, at least the threshold; a rejected one holds 0), in the same order. With `--hspthresh` below 2 every chunk takes the device path.
 WHAT COMES OUT: A dense vector of raw accepted HSPs for one MAX_HITS chunk.
-INVARIANT: Compaction changes storage density, never the relative order of accepted records.
+INVARIANT: Compaction changes storage density, never the relative order of accepted records; both paths give the same vector.
 
 ```mermaid
 sequenceDiagram
@@ -22,6 +23,7 @@ sequenceDiagram
     H->>C: candidate records
     D->>C: inclusive accepted ranks
     C-->>R: accepted records in order
+    H-->>R: at most 4,096 survivors: copied, positive scores kept
 ```
 
 ## G.2 — Reproduce oracle deduplication

@@ -47,8 +47,10 @@ arm() {
   local name=$1 want=$2 ref=$3 qry=$4; shift 4
   # The control also expands seeds with the kernels of before round 110 (one warp or thread per seed) and buckets
   # with those of before round 114 (a vote per bucket), so an arm compares the group kernel and the bucket kernels
-  # as well as the sieve; an arm's own ENVV may override that.
-  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits "${MAXH:-16711680}" "$@" \
+  # as well as the sieve; an arm's own ENVV may override that. Since round 126 it also keeps the full batch tail
+  # (the done scan and the compaction for every chunk) and packs its query per unit, so every arm compares the
+  # host filter of small chunks and the pack cache too.
+  env HSPZ_FIND_HITS_GROUPS=0 HSPZ_BUCKET_VOTES=loop HSPZ_TAIL=0 HSPZ_QUERY_PACK_CACHE=0 ${ENVV:-} HSPZ_GATE_SIEVE=0 "$H0" run -r "$ref" -q "$qry" -o "$W/$name.0" --max-hits "${MAXH:-16711680}" "$@" \
     2> "$W/$name.0.err" || { echo "$name: control run failed"; tail -3 "$W/$name.0.err"; fail=$((fail+1)); return; }
   env ${ENVV:-} HSPZ_GATE_SIEVE_CHECK=1 "$H1" run -r "$ref" -q "$qry" -o "$W/$name.1" --max-hits "${MAXH:-16711680}" --time "$@" \
     2> "$W/$name.1.err" || { echo "$name: sieve run failed"; tail -3 "$W/$name.1.err"; fail=$((fail+1)); return; }
@@ -308,6 +310,21 @@ for a in fold-released fold-released-device-seeds; do
     || { echo "$a: the fold was not dropped for a chunk"; fail=$((fail+1)); }
 done
 grep -q 'transition fold' "$W/fold-off.1.err" && { echo "fold-off: the fold was built"; fail=$((fail+1)); }
+
+# Round 126: the switches of 0.1.2. The fused folded count against the three kernels it stands for; the batch
+# tail with the full grid and the done scan (the control's, so here the test side has it too and the arm is
+# sieve against plain gate under it); the query packed per unit.
+ENVV="$FB HSPZ_FOLD_COUNT=0" arm fold-count-classic on "$R" "$Q"
+ENVV="$FB HSPZ_FOLD_COUNT=0 HSPZ_FOLD=check" arm fold-count-classic-check on "$R" "$Q"
+ENVV="$FB HSPZ_TAIL=0" arm tail-full on "$R" "$Q"
+ENVV="$FB HSPZ_QUERY_PACK_CACHE=0" arm pack-cache-off on "$R" "$Q"
+grep -q '^  fold_seed_counts' "$W/fold-check-24.1.err" || { echo "fold-check-24: the batches were not counted by the fused kernel"; fail=$((fail+1)); }
+grep -q '^  fold_seed_counts' "$W/fold-count-classic.1.err" && { echo "fold-count-classic: the fused kernel ran"; fail=$((fail+1)); }
+grep -q '^  run_bucket_counts' "$W/fold-count-classic.1.err" || { echo "fold-count-classic: run_bucket_counts did not run"; fail=$((fail+1)); }
+grep -q '^batch tail: [1-9][0-9]* chunks had their HSPs filtered on the host' "$W/defaults.1.err" || { echo "defaults: no chunk was filtered on the host"; fail=$((fail+1)); }
+grep -q '^batch tail' "$W/tail-full.1.err" && { echo "tail-full: a chunk was filtered on the host"; fail=$((fail+1)); }
+grep -q '^  scan_blocks (done)' "$W/tail-full.1.err" || { echo "tail-full: the done scan did not run"; fail=$((fail+1)); }
+grep -q 'find_hits (none)' "$W/defaults.1.err" && { echo "defaults: an empty stage was timed"; fail=$((fail+1)); }
 
 echo
 grep -L 'find_hits by groups check: .* equal to the per-seed kernel' "$W"/find-hits-check*.1.err 2>/dev/null | grep -q . \

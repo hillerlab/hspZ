@@ -1973,6 +1973,15 @@ pub(crate) fn worker_cap_policy(env: Option<&str>) -> Result<WorkerCap, String> 
 /// its next unit's query bin on a thread while the current unit runs, if the
 /// host budget has room for one more packed bin per worker; `0` packs every bin
 /// when its unit starts (rollback, and the control arm of a measurement).
+/// Round 126: the query bins of a run, each packed once ([`PackedBin`], both
+/// strands in both alphabets) and shared by every unit and worker that runs
+/// it, indexed by query bin. Before it a bin was packed again for every
+/// reference visit: 42 packs of mm39's six bins against hg38, the first of
+/// each visit with the card idle (5.3 s of a one-card genome). Held to the end
+/// of the run, so it is on only where the host has room for all the bins
+/// (`HSPZ_QUERY_PACK_CACHE=0` turns it off).
+pub(crate) type PackCache = Vec<std::sync::OnceLock<std::sync::Arc<PackedBin>>>;
+
 pub(crate) fn pack_ahead_policy(env: Option<&str>) -> Result<bool, String> {
     match env {
         None | Some("1") => Ok(true),
@@ -2172,6 +2181,8 @@ fn run_bins(
     prefetch: bool,
     // Round 107: pack the next unit's query bin on a thread while this unit runs.
     pack_ahead: bool,
+    // Round 126: the run's query bins, packed once and kept ([`PackCache`]).
+    pack_cache: Option<&PackCache>,
     threads: usize,
     // Round 69: the device seeder is worth -20.3% of 2-GPU wall and a loss on one GPU,
     // so the executor decides per run rather than the build deciding once.
@@ -2317,19 +2328,29 @@ fn run_bins(
             // the next unit's bin is packed on a thread while this unit runs, so
             // only the first pack of a visit stays exposed; one more packed query
             // bin is alive meanwhile, which the host budget counts.
-            let pack_query = |slot: usize| -> (PackedBin, Duration) {
+            let pack_query = |slot: usize| -> (std::sync::Arc<PackedBin>, Duration) {
                 let entry = &slots[visit.bin][slot];
                 let job_input = &jobs[entry.job];
                 let qbin = &job_input.plan.query_bins[entry.unit.query_bin as usize];
                 let t = Instant::now();
-                let packed = PackedBin::build(
-                    qbin.record_ids.iter().map(|&id| {
-                        let (n, s) = &job_input.qry_records[id as usize];
-                        (n.as_str(), s.as_slice())
-                    }),
-                    &args.query_prefix,
-                    true,
-                );
+                let build = || {
+                    std::sync::Arc::new(PackedBin::build(
+                        qbin.record_ids.iter().map(|&id| {
+                            let (n, s) = &job_input.qry_records[id as usize];
+                            (n.as_str(), s.as_slice())
+                        }),
+                        &args.query_prefix,
+                        true,
+                    ))
+                };
+                // A pack depends on the query bin alone, and every reference
+                // visit runs the same query bins: with the cache each is
+                // packed once in the run, by whoever asks first (a second
+                // asker waits for that pack instead of making its own).
+                let packed = match pack_cache.and_then(|c| c.get(entry.unit.query_bin as usize)) {
+                    Some(cell) => cell.get_or_init(build).clone(),
+                    None => build(),
+                };
                 (packed, t.elapsed())
             };
             let mut packed_ahead = None;
@@ -2343,7 +2364,10 @@ fn run_bins(
                 let t = Instant::now();
                 let packed_q = match packed_ahead.take() {
                     Some(ahead) => {
-                        let ahead: std::thread::ScopedJoinHandle<'_, (PackedBin, Duration)> = ahead;
+                        let ahead: std::thread::ScopedJoinHandle<
+                            '_,
+                            (std::sync::Arc<PackedBin>, Duration),
+                        > = ahead;
                         let (packed, standalone) = ahead.join().expect("query pack panicked");
                         rep.phases
                             .add_overlapped("query pack (standalone)", standalone);
@@ -3097,7 +3121,34 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
         pack_ahead,
         host_budget,
     ));
+    // Round 126: every query bin packed once and kept, where the host has room
+    // for all of them beside everything above (each counted at the largest
+    // bin's size, and on top of the bins the workers are already counted with).
+    let pack_cache_bytes = plan.query_bins.len() as u64 * est.query_ahead;
+    let pack_cache: Option<PackCache> = (pack_ahead
+        && std::env::var("HSPZ_QUERY_PACK_CACHE").as_deref() != Ok("0")
+        && host_budget.is_none_or(|a| {
+            plan::host_peak(&est, &visit_bins, prefetch)
+                + plan::host_query_ahead_bytes(&est, &visit_bins)
+                + if pairs_at_once {
+                    plan::host_pairs_at_once_bytes(&est, &visit_bins)
+                } else {
+                    0
+                }
+                + pack_cache_bytes
+                <= a
+        }))
+    .then(|| {
+        (0..plan.query_bins.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect()
+    });
     let host_peak_est = plan::host_peak(&est, &visit_bins, prefetch)
+        + if pack_cache.is_some() {
+            pack_cache_bytes
+        } else {
+            0
+        }
         + if pack_ahead {
             plan::host_query_ahead_bytes(&est, &visit_bins)
         } else {
@@ -3175,6 +3226,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
             );
             // `Box<dyn Error>` is not `Send`, so a worker reports failure as a
             // string and the caller turns it back into an error.
+            let pack_cache = pack_cache.as_ref();
             handles.push(scope.spawn(move || {
                 run_bins(
                     w % devices,
@@ -3190,6 +3242,7 @@ pub(crate) fn run(args: &RunArgs, pre_main_ms: f64, started: Instant) -> Fallibl
                     args,
                     prefetch,
                     pack_ahead,
+                    pack_cache,
                     per_worker,
                     device_seeds,
                     contract,
@@ -4542,6 +4595,7 @@ fn run_batch(
                     args,
                     prefetch,
                     pack_ahead,
+                    None,
                     per_worker,
                     device_seeds,
                     contract,
@@ -5020,6 +5074,16 @@ pub(crate) fn report_counts(stats: &Stats) {
         let (chunks, hits) = (t::CHUNKS.load(Relaxed), t::HITS.load(Relaxed));
         if chunks > 0 {
             eprintln!("bucket order from the seeds: {chunks} chunks, {hits} hits");
+        }
+        {
+            use crate::gpu::tail_totals as t;
+            let (small, scanned) = (t::SMALL.load(Relaxed), t::SCANNED.load(Relaxed));
+            if small > 0 {
+                eprintln!(
+                    "batch tail: {small} chunks had their HSPs filtered on the host, {scanned} took the \
+                     done scan"
+                );
+            }
         }
         {
             use crate::gpu::fold_totals as f;
