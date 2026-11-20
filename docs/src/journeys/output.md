@@ -2,6 +2,8 @@
 
 <!-- @source: src/gpu/mod.rs::tail_lean -->
 <!-- @source: src/hsp.rs::dedup_and_order -->
+<!-- @source: src/hsp.rs::dedup_and_order_with -->
+<!-- @source: src/run.rs::Settler -->
 <!-- @source: src/hsp.rs::records -->
 <!-- @source: src/hsp.rs::render_records -->
 <!-- @source: src/run.rs::Emitter::emit_unit -->
@@ -29,9 +31,9 @@ sequenceDiagram
 ## G.2 — Reproduce oracle deduplication
 <!-- @id: g-dedup -->
 WHAT GOES IN: Raw accepted HSPs from one chunk and strand.
-WHAT HAPPENS: A stable diagonal sort makes equivalent runs adjacent; unique-copy compares each record with the previous input record.
+WHAT HAPPENS: A stable diagonal sort makes equivalent runs adjacent; unique-copy compares each record with the previous input record. Since 0.1.3 a pass does this on a thread of its own: the batch loop hands it each batch's chunks and goes on, and the thread settles them in the order they were sent, one chunk at a time. A chunk of 262,144 HSPs or more is sorted on several threads, which gives the same sequence because two HSPs that tie in either order are the same record.
 WHAT COMES OUT: One survivor for each oracle equivalence run.
-INVARIANT: Comparing with the last kept record instead would be wrong because containment is not transitive.
+INVARIANT: Comparing with the last kept record instead would be wrong because containment is not transitive; where the sort runs, and on how many threads, changes no record and no order.
 
 ```mermaid
 sequenceDiagram
