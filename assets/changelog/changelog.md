@@ -38,22 +38,70 @@ All notable changes to `hspZ` are documented here, newest first.
 
 ## [0.1.1] — 2026-11-20
 
-One exact speed-up of the batch loop. Host code only: the kernels are those of 0.1.0 and every byte of the
-output is the same.
+Two exact speed-ups, on by default: one seed per query position against a reference table that holds each
+k-mer's transition variants, and a batch loop without per-batch allocations or idle host work. Every byte of
+the output is the same as with 0.1.0. **On a card with the room, a reference bin's tables now take 8 to
+10 GiB of device memory more** (for hg38; 13 times the position table), paid for with hit capacity the run
+does not use; where that does not fit, the run is as before.
 
 hg38 × mm39 on A100 80GB cards, production defaults, the inputs of the 0.1.0 runs, old and new interleaved on
 the same cards, the same bytes in every run:
 
 | cards | 0.1.0 | 0.1.1 | |
 | ---: | ---: | ---: | --- |
-| 1, without `--time` | 396.9, 397.8 s | **376.9, 376.0 s** | −5.3% |
-| 1, with `--time` | 422.4, 422.2 s | **400.2, 399.3 s** | −5.3% |
-| 2, with `--time` | 220.3, 220.2 s | **208.7, 208.9 s** | −5.2% |
+| 1, without `--time` | 396.9, 397.8 s | **334.7, 334.3 s** | −15.8% |
+| 1, with `--time` | 422.4, 422.2 s | **352.6, 352.6 s** | −16.5% |
+| 2, with `--time` | 220.3, 220.2 s | **184.1, 184.4 s** | −16.4% |
 
-The rows with `--time` come from two sessions joined by a build measured in both (406.1 to 406.5 s on one
-card, 210.5 to 210.7 s on two, in each); the row without it is one session. Eight cards were not measured for
-this release: six of the node's cards were in use.
+| change | one card, without `--time` | two cards, with `--time` |
+| --- | --- | --- |
+| nothing allocated per batch | 397.4 → 381.8 s | 220.3 → 210.6 s |
+| host work under queued kernels | 381.8 → 376.5 s | 210.7 → 208.8 s |
+| one seed per query position (the transition fold) | 376.2 → 334.5 s | 208.5 → 184.2 s |
 
+The rows join three sessions through builds measured in two of them each (376.0 to 376.9 s on one card
+without `--time`, 208.5 to 208.9 s on two with it, for the build before the fold). Eight cards were not
+measured for this release: six of the node's cards were in use. No other species pair and no other GPU
+class was measured.
+
+- **One seed per query position: the transition fold.** With transitions a query position has 13 seeds for
+  12of19: its k-mer, and that k-mer with one care position changed by a transition. Those 13 are distinct
+  k-mers and a reference position has one k-mer, so their 13 position lists are disjoint and together they
+  are the position's hits, each once. A table in which every k-mer also holds its variants' positions gives
+  them from one seed: a thirteenth of the seeds to count and look up, and slices thirteen times as long to
+  read (41 consecutive hits per query position and reference window, where a seed had three).
+  - **The table** is built on the device from the plain one, per reference bin: a k-mer's folded length, a
+    scan, and one pass that copies each variant's positions window by window. 0.13 to 0.17 s and 8.3 to
+    10.3 GiB for a bin of hg38, plus 35 ms for its window counts. It is a seed table like any other, so the
+    count and the kernel that writes a batch's anchors in window order from its seeds run on it as they
+    are; a batch's anchors are the same set, in another order inside a window, which nothing downstream
+    depends on.
+  - **Four seeds per warp.** That kernel gave a warp 32 seeds. With 13 times the hits per seed a batch was
+    then fewer warps than an A100 holds, and it was slower than before; with four it moves its bytes at the
+    card's bandwidth (unit 0: 1,774 ms plain, 2,026 ms folded with 32 per warp, 1,313 ms with four).
+  - **A batch that is cut stays plain.** A batch of `--max-hits` hits or more is cut into chunks at seeds of
+    the plain order, and the output depends on where (the HSPs of a chunk are deduplicated together). Such a
+    batch is not run folded: it comes back, its plain seeds are generated on the device, and it runs on the
+    plain tables, which the engine keeps. hg38 × mm39 on an A100 has no such batch; with `--max-hits`
+    lowered to 50 million 174 of unit 0's 3,249 batches are, and the bytes are those of a run without the
+    fold (which they are not at the default, where nothing is cut).
+  - **Memory.** The hit capacity a run is given fills the device budget and is several times `--max-hits`
+    (1.31 billion hits against 332 million on an A100); only a batch that is cut can use the part above
+    `--max-hits`. The fold is built when `--max-hits` still fits beside it, by the planner's own bytes per
+    hit, and a gibibyte is free beyond that; it is dropped for the rest of a reference the first time a
+    chunk needs the memory, and also when more than a quarter of the batches come back cut (from 16), where
+    it would only cost. The plan, its bins and the layout do not depend on it. On an A100 the peak device
+    memory of a one-card genome goes from 3.9 to 14.9 GiB.
+  - **Where it is off:** `--notransition`, `--paired`, `--dump-raw`, `--hit-stats` and the census (they
+    show or count plain seeds), seeds of more than 12 care bases, a reference bin of more than eight
+    windows or with more than 330 million indexed positions, `HSPZ_HITS_BUCKETED=0`, and a card without the
+    room (`--time` prints which). `HSPZ_FOLD=0` switches it off; `=check` compares every table the device
+    built with one built on the host, k-mer by k-mer (on an A100 it passed on all 2.37 billion positions of
+    unit 0). The seed count a run reports is the plain one.
+  - **Measured.** Unit 0 on an A100: `find_num_hits` 285 → 56 ms, the seed counts 316 → 108 ms, the writer
+    1,774 → 1,313 ms, GPU time 7.10 → 6.15 s, wall without `--time` 10.16 → 9.24 s. The whole genome
+    376.2 → 334.5 s on one card (400.0 → 352.5 s with `--time`) and 208.5 → 184.2 s on two. At
+    `--hspthresh 2400` unit 0's GPU time goes 7.39 → 6.42 s, the same bytes.
 - **Nothing is allocated per batch.** Between its kernels every batch allocated and freed nine small device
   buffers: the block sums and the offsets of the hit-count scan, of the survivor count and of the scan of
   finished extensions, the sums of the bucket scan, a statistics word that only a diagnostic build reads, and
